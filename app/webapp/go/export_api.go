@@ -128,7 +128,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		posts = kept
 
-		plan := newSignaturePlan()
+		plan := newSignaturePlan(len(posts) + 1)
 		plan.addProfile(author)
 		for _, post := range posts {
 			plan.add(author, post.ImageID)

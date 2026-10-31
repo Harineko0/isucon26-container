@@ -159,7 +159,7 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 			reactions = append(reactions, reaction)
 		}
 		hasMore := len(rows) > 50
-		plan := newSignaturePlan()
+		plan := newSignaturePlan(2 * len(reactions))
 		for _, reaction := range reactions {
 			plan.add(reaction.Reactor, reaction.ImageID)
 			plan.addProfile(reaction.Reactor)

@@ -118,7 +118,7 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 			comments = append(comments, comment)
 		}
 		hasMore := len(rows) > 50
-		plan := newSignaturePlan()
+		plan := newSignaturePlan(len(comments))
 		for _, comment := range comments {
 			plan.addProfile(comment.Author)
 		}

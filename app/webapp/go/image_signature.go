@@ -101,8 +101,12 @@ type signaturePlan struct {
 	requests []signatureRequest
 }
 
-func newSignaturePlan() *signaturePlan {
-	return &signaturePlan{exp: currentImageExp()}
+func newSignaturePlan(capacity ...int) *signaturePlan {
+	p := &signaturePlan{exp: currentImageExp()}
+	if len(capacity) > 0 {
+		p.requests = make([]signatureRequest, 0, capacity[0])
+	}
+	return p
 }
 
 func (p *signaturePlan) add(user User, imageID string) {
@@ -121,9 +125,11 @@ func (p *signaturePlan) run() {
 
 func signedImageURL(user User, imageID string) string {
 	exp := currentImageExp()
-	query := url.Values{
-		"exp": {strconv.FormatInt(exp, 10)},
-		"sig": {base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))},
-	}
-	return "/api/images/" + url.PathEscape(imageID) + "?" + query.Encode()
+	return signedImageURLParts(imageID, exp, imageSignature(user.ImageKey, imageID, exp))
+}
+
+func signedImageURLParts(imageID string, exp int64, signature []byte) string {
+	// Integers and RawURLEncoding contain no characters requiring query escaping.
+	return "/api/images/" + url.PathEscape(imageID) + "?exp=" + strconv.FormatInt(exp, 10) +
+		"&sig=" + base64.RawURLEncoding.EncodeToString(signature)
 }

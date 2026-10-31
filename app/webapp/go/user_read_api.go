@@ -103,7 +103,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		if hasMore {
 			matchedUsers = matchedUsers[:50]
 		}
-		plan := newSignaturePlan()
+		plan := newSignaturePlan(len(matchedUsers))
 		for i := range matchedUsers {
 			if err := matchedUsers[i].setImageKey(); err != nil {
 				return err

@@ -90,7 +90,7 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		if hasMore {
 			posts = posts[:50]
 		}
-		plan := newSignaturePlan()
+		plan := newSignaturePlan(2 * len(posts))
 		for i := range posts {
 			if err := posts[i].Author.setImageKey(); err != nil {
 				return err

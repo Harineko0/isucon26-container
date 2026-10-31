@@ -91,7 +91,7 @@ func getRelationshipsHandler(h *HandlerContext) echo.HandlerFunc {
 		if hasMore {
 			records = records[:50]
 		}
-		plan := newSignaturePlan()
+		plan := newSignaturePlan(len(records))
 		for i := range records {
 			if records[i].Found {
 				if err := records[i].User.setImageKey(); err != nil {
