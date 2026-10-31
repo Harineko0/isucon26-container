@@ -28,6 +28,22 @@ func setupShardedStore(t *testing.T) {
 	}
 }
 
+// Both local initialize and the peer reset endpoint call resetImageStore.
+func TestResetImageStoreDropsCommittedPostGeneration(t *testing.T) {
+	setupShardedStore(t)
+	old := committedPostImages.Load()
+	old.Store("before", postImageProof{postID: "p1", ownerID: "u1"})
+	if err := resetImageStore(); err != nil {
+		t.Fatal(err)
+	}
+	old.Store("late", postImageProof{postID: "p2", ownerID: "u2"})
+	for _, id := range []string{"before", "late"} {
+		if _, ok := committedPostImages.Load().Load(id); ok {
+			t.Fatalf("old proof survived initialize: %s", id)
+		}
+	}
+}
+
 func TestTimeOrderedImagesUseDistributedStoreDirectories(t *testing.T) {
 	setupShardedStore(t)
 	dirs := map[string]int{}

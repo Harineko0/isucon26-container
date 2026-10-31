@@ -92,7 +92,7 @@ func TestRoundTripHandlersOnPostgresWindowNotifications(t *testing.T) {
 
 	h := &HandlerContext{DB: db, Config: &Config{Region: "europe"}, Windows: w}
 	e := echo.New()
-	e.POST("/api/admin/posting-window", openPostingWindowHandler(h))
+	e.POST("/api/admin/posting-window", openPostingWindowHandler(h.DB, h.DB))
 	e.GET("/api/notifications", getNotificationsHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	server := httptest.NewServer(e)
 	defer server.Close()

@@ -1,9 +1,12 @@
 package isureal
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -17,19 +20,56 @@ type createFriendRequestResponse struct {
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
+// Region is checked inside the lateral subquery before the mutation; a wrong
+// region returns the session row without calling isureal_relationship.
+const friendRequestSQL = `
+	SELECT u.region AS sess_region, r.* FROM login_sessions s
+	JOIN users u ON u.id = s.user_id AND u.status = 'active'
+	LEFT JOIN LATERAL (
+		SELECT * FROM isureal_relationship('friend_request', s.user_id, $1, $2)
+		WHERE u.region = $4 OFFSET 0
+	) r ON true WHERE s.token_hash = $3 AND s.active`
+
 func createFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
+	return createFriendRequestHandlerWithQueue(h, &writeQueue[relationshipResult]{db: h.DB, sql: friendRequestSQL})
+}
+
+func createFriendRequestHandlerWithQueue(h *HandlerContext, writes *writeQueue[relationshipResult]) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input createFriendRequestRequest
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		row, err := runRelationship(c, h, "friend_request", input.RecipientID)
+		row, err := createFriendRequest(c, h, writes, input.RecipientID)
 		if err != nil {
 			return err
 		}
-		request := FriendRequest{ID: *row.ID, Status: *row.Status, UpdatedAt: *row.UpdatedAt}
+		// The pipeline receives text timestamps in the DB session's zone. Match
+		// the local zone used by pgx for a prepared binary timestamptz.
+		request := FriendRequest{ID: *row.ID, Status: *row.Status, UpdatedAt: row.UpdatedAt.Local()}
 		return c.JSON(http.StatusCreated, createFriendRequestResponse{RelationID: request.ID, Status: request.Status, UpdatedAt: request.UpdatedAt})
 	}
+}
+
+func createFriendRequest(c *echo.Context, h *HandlerContext, writes *writeQueue[relationshipResult], recipient string) (relationshipResult, error) {
+	token, deferred := deferredSession(c)
+	if !deferred || recipient == "" || recipient == GetSession(c).UserID {
+		return runRelationship(c, h, "friend_request", recipient)
+	}
+	row, err := writes.execute(c.Request().Context(), "", [4]string{recipient, uuid.NewString(), token, h.Config.Region})
+	if errors.Is(err, sql.ErrNoRows) {
+		return row, rejectDeferredSession(c, h, token, false, "")
+	}
+	if err != nil {
+		return row, err
+	}
+	if err := rejectDeferredSession(c, h, token, true, *row.SessRegion); err != nil {
+		return row, err
+	}
+	if row.Result == nil {
+		return row, errors.New("relationship function returned no result")
+	}
+	return row, relationshipResultError(*row.Result)
 }
 
 type transitionFriendRequestRequest struct {

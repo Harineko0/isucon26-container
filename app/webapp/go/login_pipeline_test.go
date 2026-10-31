@@ -51,9 +51,9 @@ func TestLoginPipelineTransactions(t *testing.T) {
 		{[4]string{"user2", key2, "session2", "second"}, "u2"},
 		{[4]string{"user1", key1, "session3", "third"}, "u1"},
 	}
-	var calls []*loginCall
+	var calls []*writeCall[sessionUserRow]
 	for _, input := range inputs {
-		calls = append(calls, &loginCall{args: input.args, reply: make(chan loginResult, 1)})
+		calls = append(calls, &writeCall[sessionUserRow]{args: input.args, reply: make(chan writeResult[sessionUserRow], 1)})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -62,7 +62,8 @@ func TestLoginPipelineTransactions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	pipelineLogins(ctx, conn, calls)
+	q := writeQueue[sessionUserRow]{sql: loginSQL}
+	q.pipeline(ctx, conn, calls)
 	for i, call := range calls {
 		result := <-call.reply
 		var pgErr *pgconn.PgError
@@ -95,7 +96,7 @@ func TestLoginQueueRechecksBanAndCancellation(t *testing.T) {
 	}
 	defer conn.Close()
 	bans := newIPBanList()
-	q := &loginQueue{h: &HandlerContext{DB: db, IPBans: bans}}
+	q := &writeQueue[sessionUserRow]{db: db, bans: bans, sql: loginSQL}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	waiting, cancelWaiting := context.WithCancel(ctx)
@@ -105,7 +106,7 @@ func TestLoginQueueRechecksBanAndCancellation(t *testing.T) {
 		t.Helper()
 		done := make(chan error, 1)
 		go func() {
-			_, err := q.login(ctx, ip, [4]string{"user1", key, "s" + ip, "t" + ip})
+			_, err := q.execute(ctx, ip, [4]string{"user1", key, "s" + ip, "t" + ip})
 			done <- err
 		}()
 		for {

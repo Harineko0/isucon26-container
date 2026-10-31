@@ -42,7 +42,7 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	db, err := openRequestDB(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"))
+	db, control, err := openRequestDBs(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"))
 	if err != nil {
 		panic("failed to open application DB pool: " + err.Error())
 	}
@@ -68,8 +68,8 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans:  ipBans,
 		Windows: newPostingWindowWatcher(primary, config.Region),
 	}
-	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, requests []imageReadRequest) []imageReadResult {
-		return loadImageReadBatch(ctx, handlerContext, rel, requests)
+	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
+		return loadImageReadBatch(ctx, handlerContext, rel, takeRequests)
 	}}
 	e.Pre(InternalMiddleware(handlerContext))
 	go ipBans.abuse.writeLoop(db)
@@ -84,13 +84,13 @@ func NewServer(config *Config) *echo.Echo {
 		go prewarmDB(db, "startup")
 	}
 
-	registerRoutes(e, handlerContext)
+	registerRoutes(e, handlerContext, control)
 
 	return e
 }
 
 // registerRoutes は API のルートを登録する。テスト (roundtrip_routes_test.go) も同じ表を使う。
-func registerRoutes(e *echo.Echo, h *HandlerContext) {
+func registerRoutes(e *echo.Echo, h *HandlerContext, control *sqlx.DB) {
 	e.POST("/api/initialize", initializeHandler(h))
 	e.POST("/api/auth/register", registerHandler(h))
 	e.POST("/api/auth/login", loginHandler(h))
@@ -132,5 +132,5 @@ func registerRoutes(e *echo.Echo, h *HandlerContext) {
 	e.POST("/api/admin/auth/logout", adminLogoutHandler(h), AdminSessionMiddleware(h, true))
 	e.PUT("/api/admin/users/:userId/certification", certifyUserHandler(h), AdminSessionMiddleware(h, true))
 	e.DELETE("/api/admin/users/:userId/certification", deleteUserCertificationHandler(h), AdminSessionMiddleware(h, true))
-	e.POST("/api/admin/posting-window", openPostingWindowHandler(h), AdminSessionMiddleware(h, true))
+	registerAdminPostingWindow(e, control, h.DB)
 }

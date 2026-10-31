@@ -154,6 +154,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			discardUploadedImage(imageID, storedRegion)
 			return err
 		}
+		proofs := committedPostImages.Load()
 		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 			imageID, postID, dbImageData, input.Caption, input.Visibility,
 			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion)
@@ -186,6 +187,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			PostLocation: PostLocation{Kind: location.Kind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: row.Locality},
 			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
+		// The same committed SQL statement created the JPEG object and its post.
+		proofs.Store(imageID, postImageProof{postID: postID, ownerID: user.ID})
 		imageDataStore.put(imageID, imageData)
 		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))

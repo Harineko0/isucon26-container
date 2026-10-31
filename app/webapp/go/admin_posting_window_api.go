@@ -37,7 +37,11 @@ type openedPostingWindow struct {
 	OnTimeDeadline time.Time `db:"on_time_deadline"`
 }
 
-func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
+func registerAdminPostingWindow(e *echo.Echo, control, notifications *sqlx.DB) {
+	e.POST("/api/admin/posting-window", openPostingWindowHandler(control, notifications), checkAdminSession(control, true))
+}
+
+func openPostingWindowHandler(control, notifications *sqlx.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input openPostingWindowRequest
 		if err := c.Bind(&input); err != nil {
@@ -60,7 +64,7 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		// SSE は notifications 表を読まず、期間と利用者から同じ id を組み立てる (#27) ので、
 		// 2 を待たせる必要がない。1 のトランザクションが短くなる分、リージョンの排他ロック
 		// (create_post の共有 advisory lock と競合する) を持つ時間も短くなる。
-		tx, err := h.DB.BeginTxx(ctx, nil)
+		tx, err := control.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
 		}
@@ -126,7 +130,7 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		// 平均 760ms・最大 7.5 秒で、アジア最終日の開始が 8.4 秒遅れ、グランプリ (20 点) の達成が
 		// 420 人中 12 人に留まっていた (#97)。
 		go func() {
-			if err := insertPostingWindowNotifications(ctx, h.DB, region, windowID, opened.StartsAt); err != nil {
+			if err := insertPostingWindowNotifications(ctx, notifications, region, windowID, opened.StartsAt); err != nil {
 				log.Printf("failed to insert notifications for window %s: %v", windowID, err)
 			}
 		}()
