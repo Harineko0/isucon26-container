@@ -239,12 +239,33 @@ func buildFeedPublicQuery(regionParam, tokenParam int) string {
 }
 
 // friends: 著者が友達なら public / friends / friends_of_friends のどれも閲覧できる。
+// 開いている期間の投稿を全件（ベンチ中は数百件）取り出してから友達で絞る代わりに、
+// 「開いている期間 × 友達」ごとに posts_author_window (author_id, posting_window_id) を 1 回引く。
+// 友達の投稿は期間ごとに高々 1 件なので、ふつうの閲覧者（友達 10 人前後）なら数十回の索引の探索で済む。
+// 投稿の副問い合わせは OFFSET 0 で平坦化を防ぎ、(著者, 期間) の両方を索引の条件にする
+// （著者だけで posts_author_window を引くと著者の全投稿（平均約 120 件）を読む計画になりうる）。
+// 条件は open_posts + feedCandidateBase と同じ（期間中・未削除・本人以外・閲覧者が投稿済み・ブロック外・active な著者）。
+// 友達は DISTINCT にするので、投稿は（期間 id と著者 id が一意に決まるので）1 回ずつしか出ない。
 func buildFeedFriendsQuery(regionParam, tokenParam int) string {
 	return `
-  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
-      AND (p.author_id IN (SELECT id FROM friends)) IS TRUE
-      AND p.visibility IN ('public', 'friends', 'friends_of_friends')
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
+  candidates AS (
+    SELECT p.*, u.* FROM posting_windows w
+    CROSS JOIN (SELECT DISTINCT id FROM friends) f
+    CROSS JOIN LATERAL (
+      SELECT ` + postColumns + `
+      FROM posts p
+      WHERE p.author_id = f.id AND p.posting_window_id = w.id
+        AND p.deleted_at IS NULL AND p.author_id <> $1
+        AND p.visibility IN ('public', 'friends', 'friends_of_friends')
+      OFFSET 0
+    ) p
+    CROSS JOIN LATERAL (
+      SELECT ` + userColumnsAs("u", "author") + ` FROM users u
+      WHERE u.id = p.author_id AND u.status = 'active' OFFSET 0
+    ) u
+    WHERE w.ended_at IS NULL AND COALESCE((SELECT has_posted_today FROM viewer), false)
+      AND f.id NOT IN (SELECT id FROM blocked)
   )` + feedUnrankedTail
 }
 
