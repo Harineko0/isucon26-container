@@ -44,14 +44,14 @@ const (
 var prewarmCandidates = []string{
 	// セッション・利用者・関係 (毎リクエスト)
 	"users", "users_pkey", "users_username_key", "users_region_active",
-	"login_sessions", "login_sessions_pkey", "login_sessions_token_hash", "login_sessions_user_id_active",
+	"login_sessions", "login_sessions_pkey", "login_sessions_active_token", "login_sessions_user_id_active",
 	"administrator_sessions", "administrator_sessions_pkey", "administrator_sessions_token_hash",
-	"posting_windows", "posting_windows_pkey", "posting_windows_one_active_region", "posting_windows_local_date",
+	"posting_windows", "posting_windows_pkey", "posting_windows_one_active_region", "posting_windows_date_details",
 	"posting_windows_region_local_date_key",
 	"friendships", "friendships_pkey", "friendships_high_low", "friendships_user_low_id_user_high_id_key",
 	"follows", "follows_pkey", "follows_follower_id_followee_id_key", "follows_followee_id",
 	"block_relations", "block_relations_pkey", "block_relations_blocker_id_blocked_id_key", "block_relations_blocked_id",
-	"friend_requests", "friend_requests_pkey", "friend_requests_recipient_status", "friend_requests_requester_status",
+	"friend_requests", "friend_requests_pkey", "friend_requests_pending_incoming", "friend_requests_pending_outgoing",
 	"user_search_norms", "user_search_norms_pkey", "user_search_norms_username_trgm", "user_search_norms_display_name_trgm",
 	"user_search_dirty", "user_search_dirty_pkey",
 	// 投稿 (フィード・Memories・閲覧可否・当日投稿済み判定)
