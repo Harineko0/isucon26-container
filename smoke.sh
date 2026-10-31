@@ -17,9 +17,11 @@ RQ=$(j -XPOST $R/api/friend-requests $H -H "Authorization: Bearer $TA" -d "{\"re
 echo "accept $(code -XPOST $R/api/friend-requests/$RQ/accept $H -H "Authorization: Bearer $TB")"
 RQ=$(j -XPOST $R/api/friend-requests $H -H "Authorization: Bearer $TB" -d "{\"recipientId\":\"$CID\"}" | jq -r .relationId)
 echo "accept $(code -XPOST $R/api/friend-requests/$RQ/accept $H -H "Authorization: Bearer $TC")"
+SSE=/tmp/smoke_sse_$S; (curl -s -N -m 6 $R/api/notifications $H -H "Authorization: Bearer $TC" > $SSE &) ; sleep 1.5
 AT=$(j -XPOST $R/api/admin/auth/login -d '{"username":"admin","password":"password1234"}' | jq -r .token)
 j -XPOST $R/api/admin/posting-window -H "Authorization: Bearer $AT" -d '{"region":"europe","localDate":"2026-12-01","onTimeSeconds":60}' >/dev/null
 post() { curl -s -XPOST $R/api/posts $H -H "Authorization: Bearer $1" -F image=@$IMG -F caption=c -F visibility=$2 -F location_kind=none | jq -r .id; }
+sleep 1; echo "SSE: $(cat $SSE)"
 PA=$(post $TA friends_of_friends); PB=$(post $TB friends); PC=$(post $TC public)
 echo "posts $PA $PB $PC"
 for f in friends friends-of-friends public following; do echo "C feed $f: $(curl -s $R/api/feeds/$f $H -H "Authorization: Bearer $TC" | jq -c '[.items[].author.username]')"; done
