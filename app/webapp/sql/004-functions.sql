@@ -136,7 +136,7 @@ END $$;
 -- 関係の変更が users 行から読むのは status(active か)と account_type だけで、status を変えるのは退会だけなので、
 -- 利用者ごとの advisory lock を共有モードでとり、退会(isureal_delete_account)は同じ鍵を排他モードでとる。
 -- 関係の表(friend_requests / friendships / follows / block_relations)を書くのは、2 人組のロックを持つ
--- isureal_relationship と isureal_transition_friend_request だけ。
+-- isureal_relationship と isureal_transition_friend_request(_authorized、005)だけ。
 -- ロックの順序: 利用者ごと(id 順) → 2 人組 → 行。コメント・RealMoji は行 → 2 人組だが、利用者ごとのロックはとらない。
 CREATE OR REPLACE FUNCTION isureal_user_lock_key(p_user text) RETURNS bigint
 LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:user:' || p_user, 0) $$;
@@ -145,12 +145,16 @@ CREATE OR REPLACE FUNCTION isureal_pair_lock_key(p_a text, p_b text) RETURNS big
 LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:pair:' || least(p_a, p_b) || ':' || greatest(p_a, p_b), 0) $$;
 
 -- 2 人をロックし、2 人とも active なら true を返す。
+-- 3 つのロックは 1 文でとる(#154 のベンチで PERFORM 1 文が平均 2ms かかっていた。CPU が飽和した DB では文の数が効く)。
+-- 選択リストは左から順に評価されるので、順序は 利用者ごと(id 順) → 2 人組 のまま。
+-- isureal_relationship(friend_request)と isureal_transition_friend_request_authorized は、この関数を呼ばずに
+-- 同じ 1 文を直接書き、続く読み取りを 1 文にまとめている(ロックの順序とロックの後で読むことは同じ)。
 CREATE OR REPLACE FUNCTION isureal_lock_pair(p_a text, p_b text) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(least(p_a, p_b)));
-  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(greatest(p_a, p_b)));
-  PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_a, p_b));
+  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(least(p_a, p_b))),
+          pg_advisory_xact_lock_shared(isureal_user_lock_key(greatest(p_a, p_b))),
+          pg_advisory_xact_lock(isureal_pair_lock_key(p_a, p_b));
   -- ロックをとった後の文なので、待っている間にコミットされた退会や関係の変更も見える
   -- (READ COMMITTED では VOLATILE な関数の文ごとに新しいスナップショットをとる)。
   RETURN (SELECT count(*) FROM users WHERE id IN (p_a, p_b) AND status = 'active') = 2;
@@ -168,29 +172,46 @@ DECLARE
   v_type text;
   v_req friend_requests%ROWTYPE;
   v_count int;
+  v_active boolean;
+  v_conflict boolean;
+  v_pending_id text;
+  v_pending_requester text;
 BEGIN
-  IF NOT isureal_lock_pair(p_actor, p_target) THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
-
   IF p_action = 'friend_request' THEN
-    IF EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
-       OR EXISTS(SELECT 1 FROM friendships WHERE user_low_id = v_low AND user_high_id = v_high) THEN
-      o_result := 'conflict'; RETURN NEXT; RETURN;
-    END IF;
-    SELECT * INTO v_req FROM friend_requests WHERE status = 'pending' AND
-      ((requester_id = p_actor AND recipient_id = p_target) OR (requester_id = p_target AND recipient_id = p_actor))
-    LIMIT 1;
-    IF FOUND THEN
-      IF v_req.requester_id = p_actor THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
-      UPDATE friend_requests SET status = 'accepted', updated_at = clock_timestamp() WHERE id = v_req.id RETURNING * INTO v_req;
+    -- isureal_lock_pair と同じロックを同じ順序でとり、その後の 1 文で「2 人とも active か」「ブロック・友達か」
+    -- 「2 人の間の pending の申請」をまとめて読む(以前は lock_pair の 4 文 + 2 文。判定の順序と結果は同じ)。
+    -- 3 つの表を書くのは 2 人組のロックを持つ関数だけなので、文を 1 つにまとめても読む値は変わらない。
+    PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(v_low)),
+            pg_advisory_xact_lock_shared(isureal_user_lock_key(v_high)),
+            pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_target));
+    SELECT x.active, x.conflict, fr.id, fr.requester_id INTO v_active, v_conflict, v_pending_id, v_pending_requester
+    FROM (SELECT (SELECT count(*) FROM users WHERE id IN (p_actor, p_target) AND status = 'active') = 2 AS active,
+                 EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
+                 OR EXISTS(SELECT 1 FROM friendships WHERE user_low_id = v_low AND user_high_id = v_high) AS conflict) x
+    LEFT JOIN LATERAL (
+      SELECT id, requester_id FROM friend_requests WHERE status = 'pending' AND
+        ((requester_id = p_actor AND recipient_id = p_target) OR (requester_id = p_target AND recipient_id = p_actor))
+      LIMIT 1
+    ) fr ON true;
+    IF NOT v_active THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
+    IF v_conflict THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
+    IF v_pending_id IS NOT NULL THEN
+      IF v_pending_requester = p_actor THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
+      UPDATE friend_requests SET status = 'accepted', updated_at = clock_timestamp() WHERE id = v_pending_id RETURNING * INTO v_req;
       INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
       VALUES (gen_random_uuid()::text, least(v_req.requester_id, v_req.recipient_id), greatest(v_req.requester_id, v_req.recipient_id), v_req.id);
     ELSE
       INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
       VALUES (p_new_id, p_actor, p_target, 'pending', clock_timestamp(), clock_timestamp()) RETURNING * INTO v_req;
     END IF;
-    RETURN QUERY SELECT 'ok'::text, v_req.id::text, v_req.status, v_req.updated_at;
+    o_result := 'ok'; o_id := v_req.id; o_status := v_req.status; o_updated_at := v_req.updated_at;
+    RETURN NEXT;
     RETURN;
-  ELSIF p_action = 'follow' THEN
+  END IF;
+
+  IF NOT isureal_lock_pair(p_actor, p_target) THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
+
+  IF p_action = 'follow' THEN
     SELECT account_type INTO v_type FROM users WHERE id = p_target AND status = 'active';
     IF v_type IS DISTINCT FROM 'certified_public'
        OR EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
