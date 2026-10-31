@@ -322,33 +322,49 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 				return NewAPIError(http.StatusBadRequest, "invalid_post")
 			}
 		}
-		ctx := c.Request().Context()
+		// 更新と更新後の投稿・投稿者の取得を、セッションとリージョンの確認と同じ 1 文で行う (#17)。
+		// 以前は callWithSession(isureal_update_post) → getPostWithAuthor の 2 往復だった。
 		var row struct {
 			SessRegion *string `db:"sess_region"`
-			Result     *string `db:"result"`
+			Result     string  `db:"result"`
+			PostWithAuthor
 		}
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_update_post({user}, $1, $2, $3) AS result)`, input.PostID, input.Caption, input.Visibility); err != nil {
+		if err := callWithSessionColumns(c, h, &row, func() *string { return row.SessRegion }, updatePostReturningColumns,
+			`isureal_update_post_returning({user}, $1, $2, $3)`, input.PostID, input.Caption, input.Visibility); err != nil {
 			return err
 		}
-		result := ""
-		if row.Result != nil {
-			result = *row.Result
-		}
-		switch result {
+		switch row.Result {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		default:
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
-		updated, err := getPostWithAuthor(ctx, h.DB, input.PostID)
-		if err != nil {
+		if row.ID == "" {
+			// 更新できたのに投稿者が active でない (以前の getPostWithAuthor の sql.ErrNoRows と同じく 500)。
+			return sql.ErrNoRows
+		}
+		if err := row.Author.setImageKey(); err != nil {
 			return err
 		}
-		post, user := updated.Post, updated.Author
-		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(post, user)))
+		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(row.Post, row.Author)))
 	}
 }
+
+// updatePostReturningColumns は isureal_update_post_returning の o_* を PostWithAuthor の列名で受ける選択リスト。
+// リージョン違いや 'ok' 以外では列が NULL になるので、NOT NULL の列は COALESCE で埋める (値は使わない)。
+const updatePostReturningColumns = `COALESCE(r.o_result, '') AS result,
+  COALESCE(r.o_id, '') AS id, COALESCE(r.o_author_id, '') AS author_id,
+  COALESCE(r.o_posting_window_id, '') AS posting_window_id, COALESCE(r.o_image_id, '') AS image_id,
+  COALESCE(r.o_caption, '') AS caption, COALESCE(r.o_visibility, '') AS visibility,
+  COALESCE(r.o_location_kind, '') AS location_kind, r.o_latitude AS latitude, r.o_longitude AS longitude,
+  r.o_locality AS locality, COALESCE(r.o_posted_at, 'epoch') AS posted_at,
+  COALESCE(r.o_on_time_deadline, 'epoch') AS on_time_deadline, r.o_window_ended_at AS window_ended_at,
+  COALESCE(r.o_user_id, '') AS "author.id", COALESCE(r.o_username, '') AS "author.username",
+  COALESCE(r.o_secret_key_hash, '') AS "author.secret_key_hash", COALESCE(r.o_display_name, '') AS "author.display_name",
+  COALESCE(r.o_bio, '') AS "author.bio", r.o_profile_image_id AS "author.profile_image_id",
+  COALESCE(r.o_region, '') AS "author.region", COALESCE(r.o_account_type, '') AS "author.account_type",
+  COALESCE(r.o_status, '') AS "author.status"`
 
 type deletePostRequest struct {
 	PostID string `param:"postId" json:"-"`
