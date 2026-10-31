@@ -50,8 +50,34 @@ func dbMaxConns(region string) int {
 // (1〜2ms)。EU/US は往復 100ms なので既定のまま。
 const asiaStatementCacheCapacity = 64
 
-func openDB(config *Config) (*sqlx.DB, error) {
+// dbPlanCacheMode はアプリの接続だけに設定する plan_cache_mode (#153)。pgx は既定
+// (QueryExecModeCacheStatement) で文を接続ごとに prepare するので効く。auto では接続ごとに各文の最初の 5 回を
+// custom plan で計画し直し、計画のたびに文中の表の索引をすべてロックする (頻出の文で 20〜38 リレーション)。
+// fast-path の枠 (16) を超えた分は共有のロック表に行き、asia2 の待ちの 26% が LWLock:LockManager だった。
+// generic plan はキャッシュした計画を使い、実行時に使う索引だけをロックする (画像の葉の文で 18 → 8)。
+// 温まった接続では auto でも generic plan になっていたので、定常時のプランは変わらない。
+const dbPlanCacheMode = "force_generic_plan"
+
+// dbConnConfig は接続の設定。PostgreSQL に直接つなぐときは plan_cache_mode を起動パケットで送る (往復は増えない)。
+// PgBouncer は知らない起動パラメータを送るクライアントを拒むので、PgBouncer 宛てには送らず、
+// PgBouncer がサーバー接続を張るときの connect_query で設定する (infra/hosts/asia1/etc/isureal/pgbouncer.ini)。
+func dbConnConfig(config *Config, direct bool) (*pgx.ConnConfig, error) {
 	connConfig, err := pgx.ParseConfig(config.DatabaseDSN())
+	if err != nil {
+		return nil, err
+	}
+	if direct {
+		connConfig.RuntimeParams["plan_cache_mode"] = dbPlanCacheMode
+	}
+	return connConfig, nil
+}
+
+func openDB(config *Config) (*sqlx.DB, error) {
+	return openPostgresDB(config, true)
+}
+
+func openPostgresDB(config *Config, direct bool) (*sqlx.DB, error) {
+	connConfig, err := dbConnConfig(config, direct)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +106,7 @@ func openRequestDB(config *Config, primary *sqlx.DB, address string) (*sqlx.DB, 
 	if err != nil {
 		return nil, fmt.Errorf("invalid application DB pool address: %w", err)
 	}
-	db, err := openDB(&pooled)
+	db, err := openPostgresDB(&pooled, false)
 	if err != nil {
 		return nil, err
 	}
