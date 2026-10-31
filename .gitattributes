@@ -1,0 +1,5 @@
+# サーバや GitHub Actions の runner（Linux）で動かすファイルは、Windows で checkout しても LF に保つ。
+# CRLF のままだと `ssh host bash -s < alp.sh` などが `head -40\r` のように壊れる（#37）。
+*.sh text eol=lf
+*.py text eol=lf
+*.sql text eol=lf

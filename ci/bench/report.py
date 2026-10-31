@@ -4,7 +4,7 @@
   report.py render   # markdown を stdout へ
   report.py record   # results.jsonl に追記する JSON 1 行を stdout へ
 
-env: STATE_DIR（meta.json, stage, job.json, integrity.txt, foreign.txt）, HISTORY（results.jsonl）
+env: STATE_DIR（meta.json, stage, job.json, integrity.txt, foreign.txt, init_time, measure/summary.md）, HISTORY（results.jsonl）
 """
 import json
 import os
@@ -20,7 +20,7 @@ MARK = "<!-- isucon-bench -->"
 
 def read(name, default=""):
     try:
-        with open(os.path.join(STATE, name)) as f:
+        with open(os.path.join(STATE, name), encoding="utf-8", errors="replace") as f:
             return f.read().strip()
     except FileNotFoundError:
         return default
@@ -170,6 +170,16 @@ def render():
         lines += ["", "> [!WARNING]",
                   f"> CI 以外から投げられたベンチがあります: {foreign}。サーバの状態が CI の想定と違う可能性があります。"]
 
+    init_time = read("init_time")
+    if init_time:
+        lines.append(f"\n<sub>CI の initialize（デプロイ直後の 1 回目）: {init_time} 秒</sub>")
+    measure = read("measure/summary.md")
+    if measure:
+        if len(measure) > 20000:  # コメントは 65536 字まで。切ったらコードブロックを閉じる
+            measure = measure[:20000] + "\n```\n（長いので省略。全体は run のログ）"
+        lines += ["", "<details><summary>計測（vmstat / DB wait / pg_stat_statements / alp）</summary>", "",
+                  measure, "", "</details>"]
+
     if job and (job.get("result") or {}).get("stdout"):
         lines += ["", "<details><summary>benchmarker stdout</summary>", "", "```",
                   job["result"]["stdout"][-6000:], "```", "</details>"]
@@ -196,7 +206,15 @@ def record():
         "finished_at": datetime.fromtimestamp(job.get("finished_at") or 0, JST).isoformat(),
         "integrity_ok": not integrity,
         "foreign_jobs": foreign,
+        "init_sec": init_sec(),
     }, ensure_ascii=False)
+
+
+def init_sec():
+    try:
+        return float(read("init_time"))
+    except ValueError:
+        return None
 
 
 def status():

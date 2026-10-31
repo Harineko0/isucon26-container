@@ -44,13 +44,17 @@ if grep -E '\] ERROR|"passed": false' "$STATE_DIR/deploy-infra.log"; then false;
 
 step=initialize
 for i in 1 2 3 4 5 6; do
-  code=$(curl -s -o "$STATE_DIR/init.json" -w '%{http_code}' -m 60 -XPOST "$ROUTER/api/initialize" || true)
+  out=$(curl -s -o "$STATE_DIR/init.json" -w '%{http_code} %{time_total}' -m 60 -XPOST "$ROUTER/api/initialize" || true)
+  code=${out%% *}
   [ "$code" = 200 ] && break
-  echo "initialize: HTTP $code (retry $i)"
+  echo "initialize: HTTP $out (retry $i)"
   sleep 5
 done
 [ "$code" = 200 ] || { cat "$STATE_DIR/init.json"; false; }
 cat "$STATE_DIR/init.json"; echo
+# デプロイ直後（app 再起動直後、002〜005 を流す最初の回）の所要時間。索引追加の目安に使う（ci/README.md #40）
+echo "${out#* }" >"$STATE_DIR/init_time"
+echo "initialize: $(cat "$STATE_DIR/init_time")s"
 
 step=fingerprint
 "$B/fingerprint.sh" | tee "$STATE_DIR/fp-before.txt"
@@ -60,6 +64,11 @@ n=$(awk -v sha="${APP_SHA:0:12}" '$2 == sha' "$STATE_DIR/fp-before.txt" | wc -l)
 
 step=enqueue
 wait_portal_idle
+# 計測（#37）: 統計とアクセスログをこの run の版だけにしてから、ベンチ中の vmstat / DB wait を記録する。
+# 計測の失敗ではベンチを止めない（measure.sh は常に exit 0。念のため || true）。
+M=$STATE_DIR/measure
+bash "$B/measure.sh" reset || true
+bash "$B/measure.sh" start "$M" || true
 job_id=$(python3 "$B/portal.py" enqueue)
 echo "$job_id" >"$STATE_DIR/job_id"
 echo "enqueued job #$job_id"
@@ -68,6 +77,7 @@ echo "enqueued job #$job_id"
 step=benchmark
 python3 "$B/portal.py" wait "$job_id" >"$STATE_DIR/job.json"
 jq '{id, status, score, result: (.result | {passed, reason, messages})}' "$STATE_DIR/job.json"
+bash "$B/measure.sh" stop "$M" || true
 
 step=integrity
 "$B/fingerprint.sh" >"$STATE_DIR/fp-after.txt"
@@ -76,5 +86,8 @@ step=integrity
   infra/deploy.sh -n | grep -v 'no changes$' | sed 's/^/config drift: /' || true
 } >"$STATE_DIR/integrity.txt"
 cat "$STATE_DIR/integrity.txt"
+
+step=measure
+timeout 240 bash "$B/measure.sh" collect "$M" || true
 
 echo done >"$STATE_DIR/stage"
