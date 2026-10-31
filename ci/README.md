@@ -10,8 +10,7 @@ PR は isucon26-container に作る。このリポジトリは monorepo なの�
 | やりたいこと | 方法 | 何がデプロイされるか |
 |---|---|---|
 | PR の変更を測る（push 後の測り直しも） | PR に `/bench [メモ]` とコメント（PR の open では走らない） | その時点の PR の head（`app/` も `infra/` も） |
-| main（基準値）を更新する | 自動: main に `app/**`・`infra/**`・`deploy.sh` を変える commit が入ったとき（PR のマージ）。文書や `ci/` だけの変更では走らない | main の head |
-| main を手で測る | `gh workflow run bench.yml -R Harineko0/isucon26-container` | 同上 |
+| main（基準値）を測る | `gh workflow run bench.yml -R Harineko0/isucon26-container`（または Actions の Run workflow ボタン）。マージしても自動では走らない | main の head |
 | 任意の commit | `gh workflow run bench.yml -R Harineko0/isucon26-container -f container_ref=<ref>` | 指定した commit |
 
 - 3 台とも `app/webapp` を配る。`app-europe` `app-america` は `app` への symlink で、配らない。
