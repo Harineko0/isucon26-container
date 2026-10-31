@@ -251,7 +251,7 @@ func TestUpdatePostIsOneStatement(t *testing.T) {
 }
 
 func TestGetPostUsesOneStatementOnOneConnection(t *testing.T) {
-	columns := append([]string{"sess_region", "allowed"}, updatePostReturningColumnNames[2:]...)
+	columns := append([]string{"sess_region", "found"}, updatePostReturningColumnNames[2:]...)
 	row := func(sessRegion any, allowed bool) []driver.Value {
 		values := updatePostReturningRow(sessRegion, nil, "hello")
 		return append([]driver.Value{sessRegion, allowed}, values[2:]...)

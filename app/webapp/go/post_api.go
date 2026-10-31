@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"errors"
 	"image/jpeg"
 	"mime/multipart"
 	"net/http"
@@ -217,25 +216,32 @@ type getMyCurrentPostResponse createPostResponse
 
 func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		var posts []PostWithAuthor
-		err := h.DB.SelectContext(ctx, &posts, `
-   SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
-   FROM posts p
-   JOIN posting_windows w ON w.id = p.posting_window_id
-   JOIN users u ON u.id = p.author_id AND u.status = 'active'
-   JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
-                              AND current.local_date = w.local_date
-   WHERE p.author_id = $1 AND p.deleted_at IS NULL
-  `, userID)
-		if err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Found      bool    `db:"found"`
+			PostWithAuthor
+		}
+		if err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, `
+   SELECT s.sess_region, r.id IS NOT NULL AS found,
+          `+postWithAuthorColumnsCoalesced("r")+`
+   FROM {session}
+   LEFT JOIN LATERAL (
+     SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+     FROM posts p
+     JOIN posting_windows w ON w.id = p.posting_window_id
+     JOIN users u ON u.id = p.author_id AND u.status = 'active'
+     JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                                AND current.local_date = w.local_date
+     WHERE p.author_id = s.sess_user_id AND p.deleted_at IS NULL
+     LIMIT 1
+   ) r ON true
+  `); err != nil {
 			return err
 		}
-		if len(posts) == 0 {
+		if !row.Found {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
-		post, user := posts[0].Post, posts[0].Author
+		post, user := row.Post, row.Author
 		if err := user.setImageKey(); err != nil {
 			return err
 		}
@@ -249,47 +255,32 @@ type getPostRequest struct {
 
 type getPostResponse createPostResponse
 
-// getPostQuery は getWithSession に渡す GET /api/posts/:postId の 1 文。閲覧できないときも
-// 番兵の 1 行 (allowed = false、投稿の列は COALESCE の空値) を返す。
-var getPostQuery = `
-  SELECT s.sess_region, a.can_view AS allowed,
-         COALESCE(r.id, '') AS id, COALESCE(r.author_id, '') AS author_id,
-         COALESCE(r.posting_window_id, '') AS posting_window_id, COALESCE(r.image_id, '') AS image_id,
-         COALESCE(r.caption, '') AS caption, COALESCE(r.visibility, '') AS visibility,
-         COALESCE(r.location_kind, '') AS location_kind, r.latitude, r.longitude, r.locality,
-         COALESCE(r.posted_at, 'epoch') AS posted_at, COALESCE(r.on_time_deadline, 'epoch') AS on_time_deadline,
-         r.window_ended_at, ` + userColumnsCoalesced("r", "author") + `
-  FROM {session}
-  CROSS JOIN LATERAL isureal_post_access(s.sess_user_id, $1) a
-  LEFT JOIN LATERAL (
-    SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
-    FROM ` + postsWithWindowFrom + `
-    JOIN users u ON u.id = p.author_id AND u.status = 'active'
-    WHERE a.can_view AND p.id = $1 AND p.deleted_at IS NULL
-  ) r ON true`
-
 func getPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input getPostRequest
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		// セッションの確認・閲覧可否 (isureal_post_access = viewerContext.canView と同じ判定)・投稿と投稿者の
-		// 取得を 1 文・接続 1 本で行う (#17)。以前は投稿と閲覧者の文脈 (友達の友達のペア全部) を別々の接続で
-		// 並行に取り、EU/US では投機的なセッション確認と合わせて GET 1 回で接続を 3 本使っていた。
 		var row struct {
 			SessRegion *string `db:"sess_region"`
-			Allowed    bool    `db:"allowed"`
+			Found      bool    `db:"found"`
 			PostWithAuthor
 		}
-		err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, getPostQuery, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "post_not_found")
-		}
-		if err != nil {
+		if err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, `
+   SELECT s.sess_region, r.id IS NOT NULL AS found,
+          `+postWithAuthorColumnsCoalesced("r")+`
+   FROM {session}
+   LEFT JOIN LATERAL (
+     SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+     FROM isureal_post_access(s.sess_user_id, $1) a
+     JOIN posts p ON a.can_view AND p.id = $1 AND p.deleted_at IS NULL
+     JOIN posting_windows w ON w.id = p.posting_window_id
+     JOIN users u ON u.id = p.author_id AND u.status = 'active'
+   ) r ON true
+  `, input.PostID); err != nil {
 			return err
 		}
-		if !row.Allowed || row.ID == "" {
+		if !row.Found {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		if err := row.Author.setImageKey(); err != nil {
@@ -326,8 +317,8 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 				return NewAPIError(http.StatusBadRequest, "invalid_post")
 			}
 		}
-		// セッションとリージョンの確認・更新・更新後の投稿と投稿者の取得を 1 文で行う (#17)。
-		// 以前は「セッション確認 → isureal_update_post → getPostWithAuthor」の 3 往復だった。
+		// 更新と更新後の投稿・投稿者の取得を、セッションとリージョンの確認と同じ 1 文で行う (#17)。
+		// 以前は callWithSession(isureal_update_post) → getPostWithAuthor の 2 往復だった。
 		var row struct {
 			SessRegion *string `db:"sess_region"`
 			Result     string  `db:"result"`
@@ -380,12 +371,18 @@ func deletePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		// セッションとリージョンの確認と同じ 1 文で呼ぶ (#17)。
-		var row resultRow
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
 		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_post({user}, $1) AS result)`, input.PostID); err != nil {
 			return err
 		}
-		switch row.result() {
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
+		}
+		switch result {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")

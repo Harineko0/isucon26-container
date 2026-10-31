@@ -141,19 +141,25 @@ func deleteCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		// セッションとリージョンの確認と同じ 1 文で呼ぶ (#17)。
-		var row resultRow
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
 		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_comment({user}, $1) AS result)`, input.CommentID); err != nil {
 			return err
 		}
-		switch row.result() {
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
+		}
+		switch result {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "interaction_not_found")
 		case "forbidden":
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		default:
-			return fmt.Errorf("unexpected delete comment result: %s", row.result())
+			return fmt.Errorf("unexpected delete comment result: %s", result)
 		}
 		return c.NoContent(http.StatusNoContent)
 	}

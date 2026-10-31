@@ -282,6 +282,8 @@ func init() {
 	deferredSessionRoutes["GET /api/relationships/:kind"] = true
 	deferredSessionRoutes["GET /api/posts/:postId/comments"] = true
 	deferredSessionRoutes["GET /api/posts/:postId/realmojis"] = true
+	deferredSessionRoutes["GET /api/memories"] = true
+	deferredSessionRoutes["GET /api/memories/:date"] = true
 }
 
 // deferredSessionCheckedKey は、deferred 経路でハンドラがセッションを確認する SQL を実行したことを示す。
@@ -301,6 +303,10 @@ func verifyDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string,
 	region := ""
 	if session != nil {
 		region = session.Region
+		if anyRegionDeferredRoutes[c.Request().Method+" "+c.RouteInfo().Path] {
+			// RegionMiddleware の無いルートなので、リージョンが違っても 403 にしない。
+			region = h.Config.Region
+		}
 	}
 	if err := rejectDeferredSession(c, h, tokenHash, session != nil, region); err != nil {
 		return err

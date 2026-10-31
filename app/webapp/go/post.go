@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -61,6 +62,17 @@ func getPost(ctx context.Context, db sqlx.QueryerContext, postID string) (Post, 
 type PostWithAuthor struct {
 	Post
 	Author User `db:"author"`
+}
+
+// postWithAuthorColumnsCoalesced は LEFT JOIN LATERAL の番兵の行 (全列 NULL) を PostWithAuthor にそのまま読めるよう、
+// NOT NULL の列を空文字や epoch で埋めた選択リストを返す。
+func postWithAuthorColumnsCoalesced(alias string) string {
+	return fmt.Sprintf(`COALESCE(%[1]s.id, '') AS id, COALESCE(%[1]s.author_id, '') AS author_id,
+		COALESCE(%[1]s.posting_window_id, '') AS posting_window_id, COALESCE(%[1]s.image_id, '') AS image_id,
+		COALESCE(%[1]s.caption, '') AS caption, COALESCE(%[1]s.visibility, '') AS visibility,
+		COALESCE(%[1]s.location_kind, '') AS location_kind, %[1]s.latitude, %[1]s.longitude, %[1]s.locality,
+		COALESCE(%[1]s.posted_at, 'epoch') AS posted_at, COALESCE(%[1]s.on_time_deadline, 'epoch') AS on_time_deadline,
+		%[1]s.window_ended_at, `, alias) + userColumnsCoalesced(alias, "author")
 }
 
 const postsWithWindowFrom = `posts p JOIN posting_windows w ON w.id = p.posting_window_id`
