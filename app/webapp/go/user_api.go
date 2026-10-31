@@ -142,9 +142,15 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		hash := sha256.Sum256([]byte(input.SecretKey))
 		token := uuid.NewString()
 		tokenHash := sha256.Sum256([]byte(token))
+		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
+		if err != nil {
+			return err
+		}
 		var row sessionUserRow
-		if err := h.DB.GetContext(ctx, &row, `SELECT * FROM isureal_login($1, $2, $3, $4)`,
-			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hex.EncodeToString(tokenHash[:])); err != nil {
+		err = conn.GetContext(ctx, &row, `SELECT * FROM isureal_login($1, $2, $3, $4)`,
+			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hex.EncodeToString(tokenHash[:]))
+		conn.Close()
+		if err != nil {
 			return err
 		}
 		if row.Result != "ok" {
