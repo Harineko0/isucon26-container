@@ -56,6 +56,9 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		//   - 一致の枝: trigram 索引で引いた正規化の行 sn と、その利用者 u。stale / matched は以前と同じ式。
 		//   - dirty の枝: 正規化が無い・今の表示名と違う利用者のうち、一致の枝に出ないもの (sn が無いか、sn が一致しない)。
 		//     sn.display_name IS DISTINCT FROM u.display_name なので stale は真、matched は偽 (以前の式でも同じ値)。
+		// 返すのは「一致か stale の行」を (username, id) 順に並べた列の、51 件目の一致までの前半部分で、その長さは
+		// 51 + (stale の件数) 以下。なので window の前に一致か stale の行 (f) を LIMIT 51 + (f の stale の件数) で
+		// 絞っても結果は同じ (n は前の行だけで決まる)。数千件が候補になる短い語で全件を並べて window に掛けない。
 		var rows []struct {
 			SessRegion *string `db:"sess_region"`
 			Found      bool    `db:"found"`
@@ -85,17 +88,20 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
       LEFT JOIN user_search_norms sn ON sn.user_id = d.user_id
       WHERE sn.display_name IS DISTINCT FROM u.display_name
         AND NOT COALESCE(sn.username_norm LIKE $4 OR sn.display_name_norm LIKE $4, false)
-    )
-    SELECT `+strings.Join(userColumns, ", ")+`, stale, matched FROM (
-      SELECT c.*, count(*) FILTER (WHERE c.matched) OVER (ORDER BY c.username, c.id) AS n
-      FROM cand c
-      WHERE (s.sess_region IS NULL OR s.sess_region = $5)
+    ), f AS (
+      SELECT c.* FROM cand c
+      WHERE (c.matched OR c.stale)
+        AND (s.sess_region IS NULL OR s.sess_region = $5)
         AND c.status = 'active' AND c.id <> s.sess_user_id AND ($1 = '' OR (c.username, c.id) > ($1, $2))
         AND NOT EXISTS (SELECT 1 FROM block_relations b
                         WHERE b.blocker_id = s.sess_user_id AND b.blocked_id = c.id
                         UNION ALL
                         SELECT 1 FROM block_relations b
                         WHERE b.blocked_id = s.sess_user_id AND b.blocker_id = c.id)
+    )
+    SELECT `+strings.Join(userColumns, ", ")+`, stale, matched FROM (
+      SELECT t.*, count(*) FILTER (WHERE t.matched) OVER (ORDER BY t.username, t.id) AS n
+      FROM (SELECT * FROM f ORDER BY username, id LIMIT 51 + (SELECT count(*) FROM f WHERE f.stale)) t
     ) x
     WHERE (matched AND n <= 51) OR (stale AND n < 51)
     ORDER BY username, id
