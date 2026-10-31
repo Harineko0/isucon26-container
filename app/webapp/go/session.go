@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
@@ -429,9 +430,16 @@ func getWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion fun
 // query は `{session} LEFT JOIN LATERAL (...) r ON true` の形にして、セッションが有効なら一覧が空でも
 // 必ず 1 行 (r.* が NULL の番兵) を返すこと。rows は行数と先頭行の sess_region を返す。
 // 0 行は deferred のときだけ起こり、セッションが無効 (401)。
+// args の先頭に pgx.QueryExecMode を置くと、その文だけ実行モードを変える (セッションの $n の番号には数えない)。
 func selectWithSession(c *echo.Context, h *HandlerContext, dest any, rows func() (int, *string), query string, args ...any) error {
+	var options []any
+	if len(args) > 0 {
+		if mode, ok := args[0].(pgx.QueryExecMode); ok {
+			options, args = []any{mode}, args[1:]
+		}
+	}
 	source, args, tokenHash, deferred := sessionSource(c, args)
-	if err := h.DB.SelectContext(c.Request().Context(), dest, strings.ReplaceAll(query, "{session}", source), args...); err != nil {
+	if err := h.DB.SelectContext(c.Request().Context(), dest, strings.ReplaceAll(query, "{session}", source), append(options, args...)...); err != nil {
 		return err
 	}
 	n, sessRegion := rows()

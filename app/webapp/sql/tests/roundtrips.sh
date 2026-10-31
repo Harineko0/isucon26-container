@@ -20,4 +20,4 @@ done
 
 cd ../go
 ISUREAL_TEST_DSN="postgres://postgres:pw@127.0.0.1:$PORT/postgres?sslmode=disable" \
-	go test -count=1 -run 'TestRoundTripHandlersOnPostgres|TestGenericPlanTakesFewerLocksOnPostgres' -v . 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS)|roundtrip|relation locks'
+	go test -count=1 -run 'TestRoundTripHandlersOnPostgres|TestGenericPlanTakesFewerLocksOnPostgres|TestSearchShortQueriesOnPostgres' -v . 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS)|roundtrip|relation locks|plan .*median|threshold|search_plan_pg_test'
