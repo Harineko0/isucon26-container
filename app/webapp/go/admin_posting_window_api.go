@@ -65,6 +65,20 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
+		// 直前の期間の行ロック (FOR UPDATE) を、投稿 (create_post の FOR SHARE) に追い越させないため、
+		// 先に posting_windows の表ロックを EXCLUSIVE で取る (#97)。
+		// 行の共有ロック (FOR SHARE) は、行が共有ロックだけで持たれていれば、待っている FOR UPDATE が
+		// あっても待たずに取れる。投稿が途切れずに続くと FOR UPDATE は投稿が 0 件になる瞬間まで待ち続け、
+		// 人数の多い asia の切り替えで 1 秒ほどかかっていた (pg_stat_statements の最大 1,019ms)。
+		// 表ロックは待ち行列が公平なので、この要求より後に来た FOR SHARE (表には ROW SHARE を取る) は
+		// この後ろに並ぶ。待つのは要求の時点で FOR SHARE を持っている投稿 (画像の INSERT を済ませた後の
+		// 残りの数文) だけになる。
+		// EXCLUSIVE は ACCESS SHARE (ふつうの SELECT: フィード、現在の期間、SSE の watcher) とは
+		// 競合しないので、読み取りは止めない。止まるのは全リージョンの create_post の FOR SHARE と
+		// posting_windows への書き込みだけで、その時間はこのトランザクションの長さ (数十 ms) になる。
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE posting_windows IN EXCLUSIVE MODE`); err != nil {
+			return err
+		}
 		var conflict bool
 		if err := tx.GetContext(ctx, &conflict, `SELECT EXISTS(SELECT 1 FROM posting_windows WHERE region = $1 AND local_date >= $2)`, region, localDate); err != nil {
 			return err
@@ -72,6 +86,8 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		if conflict {
 			return NewAPIError(http.StatusConflict, "posting_window_conflict")
 		}
+		// 表ロックを取った時点で FOR SHARE を持つ投稿はもう無いので、下の FOR UPDATE は待たない
+		// (表ロックを外しても正しさが保てるよう、行ロックはそのまま残す)。
 		// 直前の投稿期間の終了時刻は、投稿(create_post の FOR SHARE)が終わるのを待って行ロックを取った後に決める。
 		// 待つ前の時刻で閉じると、待っている間に旧期間へ入った投稿の posted_at が ended_at より後になる。
 		// UPDATE ... SET ended_at = clock_timestamp() だけだと値はロック待ちの前に計算されるので、
