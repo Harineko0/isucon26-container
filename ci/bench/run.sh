@@ -30,6 +30,8 @@ wait_portal_idle
 "${FREEZE_CHECK:-$B/freeze.sh}" || exit 1
 
 # CI の記録にない portal ジョブ = 誰かが手で投げたベンチ
+"${BENCH_GATE:-$B/gate.sh}"
+
 step=foreign-check
 last_ci=$(tail -n1 "$HISTORY" 2>/dev/null | jq -r '.job_id // 0' || echo 0)
 python3 "$B/portal.py" list 50 | jq -r --argjson last "${last_ci:-0}" 'select(.id > $last) | "#\(.id)"' |

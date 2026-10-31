@@ -102,3 +102,15 @@ gh secret set DEPLOY_SSH_PASSPHRASE -R Harineko0/isucon26-container
 Variables（任意）: `BENCH_FREEZE_AT`（ISO 8601）、`PORTAL_TARGET_ID`（既定 1707 = asia1。ポータルのジョブ詳細の target と同じ）。
 
 ポータルの Cookie が切れると `portal.py` が `csrf: HTTP 302` などで落ちる。そのときは `PORTAL_COOKIE` を入れ直す。
+
+## ベンチ ON/OFF（#272）
+
+`bench-control` ブランチの `bench-control.json` が運用フラグ。
+`{"enabled":true,"allowed_run_id":""}` で通常運転、false で新しいデプロイを待機させる。
+OFF は実行中のデプロイ・ベンチを中断しない。OFF 後、既存 run とポータルの完了を確認してから再起動する。
+待機は job の180分タイムアウトまで。取得失敗や不正JSONは安全側に失敗する。
+`allowed_run_id` に指定した1本だけは OFF 中も通る。これは最終試験用で、他のrunが
+サーバに触れていないことを確認してから設定する。指定runは停止中のFIFOを追い越す。
+試験は同じ main SHA の通常時PASS → 4台をAWS CLIで再起動 → initialize前に投稿・画像を照合
+→ 再起動後PASSの順。試験後は allowed_run_id を空に戻し、OFFを維持する。
+導入前から走っているrunには適用されないため、導入時にすべて完了するまで待つ。
