@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -58,12 +57,16 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > 512 || cfg.Height > 512 {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
-		if _, _, err := jpegcheck.ValidateBytes(data); err != nil {
+		// 検証は CPU を使い切る処理なので、同時に走る本数をコア数に絞る (cpu_admission.go)。
+		if _, _, err := validateJPEGBytes(c.Request().Context(), data); err != nil {
+			if c.Request().Context().Err() != nil {
+				return err
+			}
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 
 		id, imageID := newTimeID(), newImageID(h.Config.Region)
-		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		// 本体はこのサーバーのディスクに書いて (fsync は要求の外で imageSyncer が行う)、DB にはメタデータだけを入れる (image_store.go)。
 		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
 		var row interactionRow
 		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_replace_realmoji({user}, $1, $2, $3, $4, $5, $6)`,
