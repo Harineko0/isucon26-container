@@ -1,11 +1,18 @@
 -- リージョン間は 1 往復 100ms かかるので、複数文のトランザクションを関数にして 1 往復にする。
 -- 中身はアプリにあった処理と同じ順序・同じロックで実行する。
 
-CREATE OR REPLACE FUNCTION isureal_create_post(
+-- 投稿時刻 (posted_at) はアプリの時計ではなく、この関数の中で DB の時計 (clock_timestamp()) から決めて返す。
+-- 投稿期間の starts_at / ended_at / on_time_deadline も DB の時計なので、ホスト間の時計ずれが
+-- onTime 判定や「p_posted_at < starts_at → 409」に影響しない。
+-- 引数と戻り値が変わったので、古い定義 (p_posted_at 付き) は消してから作る (CREATE OR REPLACE では戻り値を変えられない)。
+DROP FUNCTION IF EXISTS isureal_create_post(text, text, text, bytea, text, text, text, numeric, numeric, text, timestamptz);
+DROP FUNCTION IF EXISTS isureal_create_post(text, text, text, bytea, text, text, text, numeric, numeric, text);
+
+CREATE FUNCTION isureal_create_post(
   p_user_id text, p_image_id text, p_post_id text, p_data bytea, p_caption text, p_visibility text,
-  p_location_kind text, p_latitude numeric, p_longitude numeric, p_locality text, p_posted_at timestamptz
+  p_location_kind text, p_latitude numeric, p_longitude numeric, p_locality text
 ) RETURNS TABLE (
-  o_result text, o_window_id text, o_on_time_deadline timestamptz,
+  o_result text, o_window_id text, o_on_time_deadline timestamptz, o_posted_at timestamptz,
   o_latitude double precision, o_longitude double precision, o_locality text,
   o_id text, o_username text, o_secret_key_hash text, o_display_name text, o_bio text,
   o_profile_image_id text, o_region text, o_account_type text, o_status text
@@ -16,14 +23,21 @@ DECLARE
   n_active int;
   n_deleted int;
   v_fail text;
+  v_image_at timestamptz;
+  v_posted_at timestamptz;
 BEGIN
   -- 画像の INSERT (数百 KB、数百 ms) はロックを取る前に済ませ、ロックの保持時間を短くする。
   -- 失敗の結果を返すときは IR001 を投げてこのブロック(サブトランザクション)ごと巻き戻すので、
   -- 画像が孤児として残ることはない(関数は正常終了してコミットされるため、巻き戻しが必要)。
+  -- 画像の created_at は投稿時刻と同じ値にする (画像取得で (id, created_at) からパーティションを絞る手がかり)。
+  -- まず今の時刻で画像を入れ、ロックを取った後に投稿期間の切り替わりをまたいでいたと分かった場合だけ、
+  -- 投稿時刻を取り直して画像の created_at も揃える (下を参照)。
   BEGIN
+    v_image_at := clock_timestamp();
+    v_posted_at := v_image_at;
     -- 利用者が存在しなければ外部キー違反(23503) → 'no_user'(従来と同じ結果)。
     INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
-    VALUES (p_image_id, p_user_id, p_data, 'image/jpeg', p_posted_at);
+    VALUES (p_image_id, p_user_id, p_data, 'image/jpeg', v_image_at);
     PERFORM 1 FROM users WHERE id = p_user_id FOR NO KEY UPDATE;
     IF NOT FOUND THEN
       v_fail := 'no_user'; RAISE SQLSTATE 'IR001';
@@ -44,8 +58,17 @@ BEGIN
     INTO n_active, n_deleted
     FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
     WHERE p.author_id = p_user_id AND pw.local_date = w.local_date;
-    IF n_active <> 0 OR n_deleted >= 2 OR p_posted_at < w.starts_at THEN
+    IF n_active <> 0 OR n_deleted >= 2 THEN
       v_fail := 'slot_unavailable'; RAISE SQLSTATE 'IR001';
+    END IF;
+    -- 画像を入れてからロックを取るまでの間に投稿期間が切り替わった (旧期間の ended_at = 新期間の starts_at は
+    -- 切替側が FOR UPDATE を取った後に刻むので、v_posted_at がそれより前になる) 場合は、
+    -- 今ロックを取っている新期間の中の時刻として投稿時刻を取り直す。切替は(新期間の)ロック取得より前に
+    -- コミット済みなので、ここで取る clock_timestamp() は必ず starts_at 以降になる。
+    -- 以前はここで 409 (slot_unavailable) にしていたが、切替待ちの間に届いた投稿を落とすだけだった。
+    IF v_posted_at < w.starts_at THEN
+      v_posted_at := clock_timestamp();
+      UPDATE image_objects SET created_at = v_posted_at WHERE id = p_image_id AND created_at = v_image_at;
     END IF;
   EXCEPTION
     WHEN SQLSTATE 'IR001' THEN
@@ -56,10 +79,10 @@ BEGIN
   INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                      location_kind, latitude, longitude, locality, posted_at)
   VALUES (p_post_id, p_user_id, w.id, p_image_id, p_caption, p_visibility,
-          p_location_kind, p_latitude, p_longitude, p_locality, p_posted_at);
-  SELECT 'ok', w.id, w.on_time_deadline, p.latitude::double precision, p.longitude::double precision, p.locality,
+          p_location_kind, p_latitude, p_longitude, p_locality, v_posted_at);
+  SELECT 'ok', w.id, w.on_time_deadline, p.posted_at, p.latitude::double precision, p.longitude::double precision, p.locality,
          u.id, u.username, u.secret_key_hash, u.display_name, u.bio, u.profile_image_id, u.region, u.account_type, u.status
-  INTO o_result, o_window_id, o_on_time_deadline, o_latitude, o_longitude, o_locality,
+  INTO o_result, o_window_id, o_on_time_deadline, o_posted_at, o_latitude, o_longitude, o_locality,
        o_id, o_username, o_secret_key_hash, o_display_name, o_bio, o_profile_image_id, o_region, o_account_type, o_status
   FROM posts p WHERE p.id = p_post_id;
   RETURN NEXT;

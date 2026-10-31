@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
@@ -76,15 +77,18 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		img, err := jpeg.Decode(bytes.NewReader(imageData))
-		if err != nil {
+		// Both checks give the same 400, so reject oversized images from the
+		// header before validating the whole entropy-coded stream.
+		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if img.Bounds().Dx() > 4096 || img.Bounds().Dy() > 4096 {
+		if _, _, err := jpegcheck.Validate(bytes.NewReader(imageData)); err != nil {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
-		postedAt := time.Now().UTC().Truncate(time.Microsecond)
+		// 投稿時刻 (posted_at) は isureal_create_post の中で DB の時計から決まり、o_posted_at で返る
+		// (投稿期間の starts_at / ended_at と同じ時計にそろえる。アプリの時計で先に決めると、
+		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
 		imageID := uuid.NewString()
 		postID := uuid.NewString()
 		var row struct {
@@ -92,6 +96,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			Result         string     `db:"o_result"`
 			WindowID       *string    `db:"o_window_id"`
 			OnTimeDeadline *time.Time `db:"o_on_time_deadline"`
+			PostedAt       *time.Time `db:"o_posted_at"`
 			Latitude       *float64   `db:"o_latitude"`
 			Longitude      *float64   `db:"o_longitude"`
 			Locality       *string    `db:"o_locality"`
@@ -105,9 +110,9 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			AccountType    *string    `db:"o_account_type"`
 			Status         *string    `db:"o_status"`
 		}
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			imageID, postID, imageData, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt); err != nil {
+			location.Kind, location.Latitude, location.Longitude, location.Locality); err != nil {
 			return err
 		}
 		switch row.Result {
@@ -128,7 +133,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			ID: postID, AuthorID: user.ID, PostingWindowID: *row.WindowID, ImageID: imageID,
 			Caption: input.Caption, Visibility: input.Visibility,
 			PostLocation: PostLocation{Kind: location.Kind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: row.Locality},
-			PostedAt: postedAt, OnTimeDeadline: *row.OnTimeDeadline,
+			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		imageDataStore.put(imageID, imageData)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))

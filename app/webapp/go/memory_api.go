@@ -140,23 +140,16 @@ func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, postIDs
 	if len(postIDs) == 0 {
 		return nil, nil, nil
 	}
-	reactionQuery, reactionArgs, err := sqlx.In(`AND r.post_id IN (?) ORDER BY r.created_at DESC, r.id DESC`, postIDs)
-	if err != nil {
-		return nil, nil, err
-	}
-	commentQuery, commentArgs, err := sqlx.In(`AND c.post_id IN (?) ORDER BY c.created_at, c.id`, postIDs)
-	if err != nil {
-		return nil, nil, err
-	}
 	// RealMoji とコメントは独立なので並行に取る。
+	// 投稿数(1〜50)ごとに文が変わると接続ごとに Prepare の往復が増えるので、= ANY($1) の固定の SQL にする。
 	var comments []CommentWithAuthor
 	var commentsErr error
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		comments, commentsErr = selectCommentsWithAuthor(ctx, db, sqlx.Rebind(sqlx.DOLLAR, commentQuery), commentArgs...)
+		comments, commentsErr = selectCommentsWithAuthor(ctx, db, `AND c.post_id = ANY($1) ORDER BY c.created_at, c.id`, postIDs)
 	}()
-	reactions, err := selectCurrentRealMojis(ctx, db, sqlx.Rebind(sqlx.DOLLAR, reactionQuery), reactionArgs...)
+	reactions, err := selectCurrentRealMojis(ctx, db, `AND r.post_id = ANY($1) ORDER BY r.created_at DESC, r.id DESC`, postIDs)
 	<-done
 	if err != nil {
 		return nil, nil, err
