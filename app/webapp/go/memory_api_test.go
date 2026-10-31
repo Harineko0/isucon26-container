@@ -165,6 +165,10 @@ func TestMemoriesMatchesLegacy(t *testing.T) {
 		})
 	}
 	t.Run("read after write", func(t *testing.T) {
+		// Values that require escaping in JSON still round-trip verbatim, and
+		// the binary timestamptz field preserves all six fractional digits.
+		db.MustExec(`UPDATE comments SET body=$1, created_at=$2 WHERE id='c002'`,
+			"改行\n\"引用\"\\🦭", time.Date(2026, 10, 1, 1, 2, 3, 456789000, time.FixedZone("test", 9*3600)))
 		db.MustExec(`UPDATE users SET display_name='updated', profile_image_id='new-profile' WHERE id='u1';
    UPDATE users SET display_name='new reactor', profile_image_id='new-reactor-profile' WHERE id='u66';
    UPDATE comments SET deleted_at=now() WHERE id='c001';
