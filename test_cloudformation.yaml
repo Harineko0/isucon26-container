@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation for ISUCON2026 Environment Checks
+Resources:
+  GetAvailabilityZoneFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: GetAvailabilityZoneFunctionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+  GetAvailabilityZoneFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          def handler(event, context):
+            if event['RequestType'] == "Create":
+              ec2 = boto3.client('ec2')
+              response = ec2.describe_availability_zones(
+                ZoneIds = ['apne1-az2']
+              )
+              ZoneName = response['AvailabilityZones'][0]['ZoneName']
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {"ZoneName" : ZoneName})
+            elif event['RequestType'] == "Update":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            elif event['RequestType'] == "Delete":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 30
+      Role: !GetAtt GetAvailabilityZoneFunctionExecutionRole.Arn
+  GetAvailabilityZone:
+    Type: Custom::PythonLambdaExecution
+    Properties:
+      ServiceToken: !GetAtt GetAvailabilityZoneFunction.Arn
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "192.168.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: "192.168.0.0/24"
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: False
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: "0.0.0.0/0"
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: IsuconEC2InstancePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref InstanceRole
+
+
+  EnvcheckInstance001:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07cdef6f6807f2b35
+      InstanceType: c7i.large
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      IamInstanceProfile:
+        !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: isucon2026-envcheck-001
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            owner: root:root
+            permissions: '0644'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6IkI2VlRuWnhkM0R4TEIzRFEzaHhEMHdwQlVLcGd1M255MlgwVHNiT1F2cDB4RC04a0lrNnBBbjFHNHc1U0cyMVU6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16UXdPRFF3TUgwIn0='
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=B6VTnZxd3DxLB3DQ3hxD0wpBUKpgu3ny2X0TsbOQvp0xD-8kIk6pAn1G4w5SG21U:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzQwODQwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+  EnvcheckInstance001IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EnvcheckInstance001
+
+  EnvcheckInstance002:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07cdef6f6807f2b35
+      InstanceType: c7i.large
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      IamInstanceProfile:
+        !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: isucon2026-envcheck-002
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            owner: root:root
+            permissions: '0644'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6IkI2VlRuWnhkM0R4TEIzRFEzaHhEMHdwQlVLcGd1M255MlgwVHNiT1F2cDB4RC04a0lrNnBBbjFHNHc1U0cyMVU6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16UXdPRFF3TUgwIn0='
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=B6VTnZxd3DxLB3DQ3hxD0wpBUKpgu3ny2X0TsbOQvp0xD-8kIk6pAn1G4w5SG21U:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzQwODQwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+  EnvcheckInstance002IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EnvcheckInstance002
+
+  EnvcheckInstance003:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07cdef6f6807f2b35
+      InstanceType: c7i.large
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      IamInstanceProfile:
+        !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: isucon2026-envcheck-003
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            owner: root:root
+            permissions: '0644'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6IkI2VlRuWnhkM0R4TEIzRFEzaHhEMHdwQlVLcGd1M255MlgwVHNiT1F2cDB4RC04a0lrNnBBbjFHNHc1U0cyMVU6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16UXdPRFF3TUgwIn0='
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=B6VTnZxd3DxLB3DQ3hxD0wpBUKpgu3ny2X0TsbOQvp0xD-8kIk6pAn1G4w5SG21U:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzQwODQwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+  EnvcheckInstance003IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EnvcheckInstance003
+
+  EnvcheckInstance004:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07cdef6f6807f2b35
+      InstanceType: c6in.large
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      IamInstanceProfile:
+        !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: isucon2026-envcheck-004
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            owner: root:root
+            permissions: '0644'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6IkI2VlRuWnhkM0R4TEIzRFEzaHhEMHdwQlVLcGd1M255MlgwVHNiT1F2cDB4RC04a0lrNnBBbjFHNHc1U0cyMVU6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16UXdPRFF3TUgwIn0='
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=B6VTnZxd3DxLB3DQ3hxD0wpBUKpgu3ny2X0TsbOQvp0xD-8kIk6pAn1G4w5SG21U:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzQwODQwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+  EnvcheckInstance004IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EnvcheckInstance004
+
+  EnvcheckInstance005:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07cdef6f6807f2b35
+      InstanceType: c6in.large
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      IamInstanceProfile:
+        !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: isucon2026-envcheck-005
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            owner: root:root
+            permissions: '0644'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6IkI2VlRuWnhkM0R4TEIzRFEzaHhEMHdwQlVLcGd1M255MlgwVHNiT1F2cDB4RC04a0lrNnBBbjFHNHc1U0cyMVU6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16UXdPRFF3TUgwIn0='
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=B6VTnZxd3DxLB3DQ3hxD0wpBUKpgu3ny2X0TsbOQvp0xD-8kIk6pAn1G4w5SG21U:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzQwODQwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+  EnvcheckInstance005IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EnvcheckInstance005
+
+Outputs:
+
+  EnvcheckInstance001PublicIP:
+    Description: Public IPv4 address for isucon2026-envcheck-001
+    Value: !Ref EnvcheckInstance001IP
+
+  EnvcheckInstance002PublicIP:
+    Description: Public IPv4 address for isucon2026-envcheck-002
+    Value: !Ref EnvcheckInstance002IP
+
+  EnvcheckInstance003PublicIP:
+    Description: Public IPv4 address for isucon2026-envcheck-003
+    Value: !Ref EnvcheckInstance003IP
+
+  EnvcheckInstance004PublicIP:
+    Description: Public IPv4 address for isucon2026-envcheck-004
+    Value: !Ref EnvcheckInstance004IP
+
+  EnvcheckInstance005PublicIP:
+    Description: Public IPv4 address for isucon2026-envcheck-005
+    Value: !Ref EnvcheckInstance005IP

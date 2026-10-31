@@ -1,0 +1,1177 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation for ISUCON2026 Contest
+Resources:
+  EnvcheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EnvironmentInspection
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:DescribeVolumes, ec2:DescribeSecurityGroups, ec2:DescribeRouteTables, ec2:DescribeNetworkAcls]
+                Resource: '*'
+  EnvcheckInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EnvcheckRole]
+  GetAvailabilityZoneFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: GetAvailabilityZoneFunctionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+  GetAvailabilityZoneFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          def handler(event, context):
+            if event['RequestType'] in ("Create", "Update"):
+              ec2 = boto3.client('ec2')
+              response = ec2.describe_availability_zones(
+                ZoneIds = ['apne1-az2']
+              )
+              ZoneName = response['AvailabilityZones'][0]['ZoneName']
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {"ZoneName" : ZoneName})
+            elif event['RequestType'] == "Delete":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 30
+      Role: !GetAtt GetAvailabilityZoneFunctionExecutionRole.Arn
+  GetAvailabilityZone:
+    Type: Custom::PythonLambdaExecution
+    Properties:
+      ServiceToken: !GetAtt GetAvailabilityZoneFunction.Arn
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "192.168.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  ServiceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeInitializationRate: 300
+              DeleteOnTermination: true
+  DatabaseLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeInitializationRate: 300
+              Iops: 6000
+              Throughput: 200
+              DeleteOnTermination: true
+  RouterPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: 192.168.11.0/24
+  RouterDataSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: 192.168.10.0/24
+  PublicRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRoutes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  RouterPublicRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref RouterPublicSubnet
+      RouteTableId: !Ref PublicRoutes
+  RouterPublicSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Benchmark ingress to the Router
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  RouterDataSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Forward traffic between contest servers
+      SecurityGroupIngress:
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.1.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.2.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.3.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.4.0/24
+
+  RouterPublicInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref RouterPublicSubnet
+      PrivateIpAddress: 192.168.11.10
+      GroupSet: [!Ref RouterPublicSecurityGroup]
+  RouterDataInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref RouterDataSubnet
+      PrivateIpAddress: 192.168.10.10
+      SourceDestCheck: false
+      GroupSet: [!Ref RouterDataSecurityGroup]
+
+
+  App1Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: 192.168.1.0/24
+  App1Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  App1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref App1Subnet
+      RouteTableId: !Ref App1Routes
+  App1DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref App1Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  App1ToApp2:
+    Type: AWS::EC2::Route
+    DependsOn: [App2Subnet, Router]
+    Properties:
+      RouteTableId: !Ref App1Routes
+      DestinationCidrBlock: 192.168.2.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App1ToApp3:
+    Type: AWS::EC2::Route
+    DependsOn: [App3Subnet, Router]
+    Properties:
+      RouteTableId: !Ref App1Routes
+      DestinationCidrBlock: 192.168.3.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App1ToDatabase:
+    Type: AWS::EC2::Route
+    DependsOn: [DatabaseSubnet, Router]
+    Properties:
+      RouteTableId: !Ref App1Routes
+      DestinationCidrBlock: 192.168.4.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App1SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Contest server SSH and routed traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: '-1'
+          CidrIp: 192.168.10.10/32
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.2.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.3.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.4.0/24
+
+  App1:
+    Type: AWS::EC2::Instance
+    DependsOn: [App1DefaultRoute, App1RouteAssociation, App1ToApp2, App1ToApp3, App1ToDatabase]
+    Properties:
+      IamInstanceProfile: !Ref EnvcheckInstanceProfile
+      ImageId: ami-046bb2179ba4818ab
+      InstanceType: c5.large
+      SubnetId: !Ref App1Subnet
+      PrivateIpAddress: 192.168.1.10
+      SecurityGroupIds: [!Ref App1SecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceLaunchTemplate
+        Version: !GetAtt ServiceLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: isucon2026-contest-1
+        - Key: IsuconTeamID
+          Value: '120107'
+        - Key: IsuconInstanceNum
+          Value: '1'
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /etc/isucon/envcheck.json
+            permissions: '0600'
+            content: '{"service_ami":"ami-046bb2179ba4818ab","router_ami":"ami-0d74406faa8e09fa6","types":["c5.large","c7i.large","c7i.large","c5.large","c6in.large"]}'
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6InN6RDJUUzBTZjVJNG9rN2poQkhCaUU5WC1NQmpzSTE3SWMxUEp0VzA0NGVLRWVPYkN2eWNfNmpMRER2ZWxZWGs6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16VXlNell3TUgwIn0='
+          - path: /etc/isucon/registration.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJudW1iZXIiOjEsInRva2VuIjoic3pEMlRTMFNmNUk0b2s3amhCSEJpRTlYLU1CanNJMTdJYzFQSnRXMDQ0ZUtFZU9iQ3Z5Y182akxERHZlbFlYazpleUowWldGdFgybGtJam94TWpBeE1EY3NJbVY0Y0dseWVTSTZNVGM1TXpVeU16WXdNSDAifQ=='
+          - path: /opt/isucon-registration/register.py
+            permissions: '0700'
+            encoding: gz+b64
+            content: 'H4sIAAAAAAAA/4xVzW7cNhC+6ykm7EWELdF27QBdQKei98BIgQKGIXDFkcVGIlXOaF0jyLsX1M9qtbYb72VFzsw3/x9/+aQGCmpvnUJ3gP6FG+9+TYQQ9/hkiTEAN5bAOmLtKgTvYO8950KIJLFd7wPD3+RdUgffQa+5ae0eZsEXzc0kGELb2n0e8J8BiRf5/XS8jGLfo0uSxGANHbI2mnUqdwkAwF4TQgGiYe53Sl1//i2/ubvN53/VakZiJUbdZ8vNApeON/E3O1ovjrAXIHRvFftv6MTlRt4hN94U4sufX88kDWqDgYrv4q9MP1OG1U22BJ2NUBlzmxFW3hkSOxCfr8SPFUOun2w79AMXd9OVBE0QkHrvCHerVsSE4ijJA2qTytxg5Q2mMhk1Y+2ekNPYBbkav12Sd8tyWpqYVBazUgIuxu5efiB5sZsC/rHBldsaniX+P8nHX0Aegns3/5w42H6pw6z8hDwPVJhnOa28q+3TZRQts+XNCxTw/ehNLClMug/z+XENU7ih22M4UZkvTnWWhSmtEbuxK8erzBpxUgzRB3vQjKXtD7elNiYg0WLT+kq3WZRsTYZ9a6s3LSbRxmTqg61fxQtFAXdroTtdQQEO/z2biE5Xm3Ptw6hr3eTSIT/78E1ZxxhqXSGpTlekhMypby231iGlcoNh65/YwsXo4wKEwYOtMJuDljFocS3WqTl+xV4+vF3ORyhGf5sYPuJ8bQCduNzk9XD1OI/dRG7F670aqYt2akReutB4YvEYnahIQceJmaY1aLbe0QnzxAUrItfmZuh6SmO6Mkc3rcCqty7o794xOs6+vvQYWUj3fWurEVhFoIWT5GvqDAs1L3t6fffOetp6XUtizQPBpwJurm7PNlhbQrgfXAT8IwQf1o2A05Sh1rZFI2SSJLaGsnS6w7Ic216WnbauLMWEPVUSivEFyluvDaXxzUmFQq6UpaHyTp2C52PacuSPkuOkSzk374wi1kdIJv8FAAD//6gaQ1wmBwAA'
+
+          - path: /etc/systemd/system/isucon-register.service
+            permissions: '0644'
+            content: |
+              [Unit]
+              Description=Register the contest instance with the portal on every boot
+              Wants=network-online.target
+              After=network-online.target cloud-final.service
+              StartLimitIntervalSec=0
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/python3 /opt/isucon-registration/register.py
+              Restart=on-failure
+              RestartSec=20s
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=cloud-init.target
+
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=szD2TS0Sf5I4ok7jhBHBiE9X-MBjsI17Ic1PJtW044eKEeObCvyc_6jLDDvelYXk:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzUyMzYwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+
+            - sed -i -e 's/^ISUREAL_REGION=.*/ISUREAL_REGION=asia/' -e 's/^ISUREAL_DB_HOST=.*/ISUREAL_DB_HOST=192.168.4.10/' /home/isucon/env.sh
+            - systemctl enable --now isureal-go nginx
+            - systemctl enable --now isureal-guard
+
+            - systemctl daemon-reload
+            - systemctl enable --now --no-block isucon-register.service
+            - systemctl enable --now --no-block envcheck.service
+  App1IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref App1
+
+  App2Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: 192.168.2.0/24
+  App2Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  App2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref App2Subnet
+      RouteTableId: !Ref App2Routes
+  App2DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref App2Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  App2ToApp1:
+    Type: AWS::EC2::Route
+    DependsOn: [App1Subnet, Router]
+    Properties:
+      RouteTableId: !Ref App2Routes
+      DestinationCidrBlock: 192.168.1.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App2ToApp3:
+    Type: AWS::EC2::Route
+    DependsOn: [App3Subnet, Router]
+    Properties:
+      RouteTableId: !Ref App2Routes
+      DestinationCidrBlock: 192.168.3.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App2ToDatabase:
+    Type: AWS::EC2::Route
+    DependsOn: [DatabaseSubnet, Router]
+    Properties:
+      RouteTableId: !Ref App2Routes
+      DestinationCidrBlock: 192.168.4.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Contest server SSH and routed traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: '-1'
+          CidrIp: 192.168.10.10/32
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.1.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.3.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.4.0/24
+
+  App2:
+    Type: AWS::EC2::Instance
+    DependsOn: [App2DefaultRoute, App2RouteAssociation, App2ToApp1, App2ToApp3, App2ToDatabase]
+    Properties:
+      IamInstanceProfile: !Ref EnvcheckInstanceProfile
+      ImageId: ami-046bb2179ba4818ab
+      InstanceType: c7i.large
+      SubnetId: !Ref App2Subnet
+      PrivateIpAddress: 192.168.2.10
+      SecurityGroupIds: [!Ref App2SecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceLaunchTemplate
+        Version: !GetAtt ServiceLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: isucon2026-contest-2
+        - Key: IsuconTeamID
+          Value: '120107'
+        - Key: IsuconInstanceNum
+          Value: '2'
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /etc/isucon/envcheck.json
+            permissions: '0600'
+            content: '{"service_ami":"ami-046bb2179ba4818ab","router_ami":"ami-0d74406faa8e09fa6","types":["c5.large","c7i.large","c7i.large","c5.large","c6in.large"]}'
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6InN6RDJUUzBTZjVJNG9rN2poQkhCaUU5WC1NQmpzSTE3SWMxUEp0VzA0NGVLRWVPYkN2eWNfNmpMRER2ZWxZWGs6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16VXlNell3TUgwIn0='
+          - path: /etc/isucon/registration.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJudW1iZXIiOjIsInRva2VuIjoic3pEMlRTMFNmNUk0b2s3amhCSEJpRTlYLU1CanNJMTdJYzFQSnRXMDQ0ZUtFZU9iQ3Z5Y182akxERHZlbFlYazpleUowWldGdFgybGtJam94TWpBeE1EY3NJbVY0Y0dseWVTSTZNVGM1TXpVeU16WXdNSDAifQ=='
+          - path: /opt/isucon-registration/register.py
+            permissions: '0700'
+            encoding: gz+b64
+            content: 'H4sIAAAAAAAA/4xVzW7cNhC+6ykm7EWELdF27QBdQKei98BIgQKGIXDFkcVGIlXOaF0jyLsX1M9qtbYb72VFzsw3/x9/+aQGCmpvnUJ3gP6FG+9+TYQQ9/hkiTEAN5bAOmLtKgTvYO8950KIJLFd7wPD3+RdUgffQa+5ae0eZsEXzc0kGELb2n0e8J8BiRf5/XS8jGLfo0uSxGANHbI2mnUqdwkAwF4TQgGiYe53Sl1//i2/ubvN53/VakZiJUbdZ8vNApeON/E3O1ovjrAXIHRvFftv6MTlRt4hN94U4sufX88kDWqDgYrv4q9MP1OG1U22BJ2NUBlzmxFW3hkSOxCfr8SPFUOun2w79AMXd9OVBE0QkHrvCHerVsSE4ijJA2qTytxg5Q2mMhk1Y+2ekNPYBbkav12Sd8tyWpqYVBazUgIuxu5efiB5sZsC/rHBldsaniX+P8nHX0Aegns3/5w42H6pw6z8hDwPVJhnOa28q+3TZRQts+XNCxTw/ehNLClMug/z+XENU7ih22M4UZkvTnWWhSmtEbuxK8erzBpxUgzRB3vQjKXtD7elNiYg0WLT+kq3WZRsTYZ9a6s3LSbRxmTqg61fxQtFAXdroTtdQQEO/z2biE5Xm3Ptw6hr3eTSIT/78E1ZxxhqXSGpTlekhMypby231iGlcoNh65/YwsXo4wKEwYOtMJuDljFocS3WqTl+xV4+vF3ORyhGf5sYPuJ8bQCduNzk9XD1OI/dRG7F670aqYt2akReutB4YvEYnahIQceJmaY1aLbe0QnzxAUrItfmZuh6SmO6Mkc3rcCqty7o794xOs6+vvQYWUj3fWurEVhFoIWT5GvqDAs1L3t6fffOetp6XUtizQPBpwJurm7PNlhbQrgfXAT8IwQf1o2A05Sh1rZFI2SSJLaGsnS6w7Ic216WnbauLMWEPVUSivEFyluvDaXxzUmFQq6UpaHyTp2C52PacuSPkuOkSzk374wi1kdIJv8FAAD//6gaQ1wmBwAA'
+
+          - path: /etc/systemd/system/isucon-register.service
+            permissions: '0644'
+            content: |
+              [Unit]
+              Description=Register the contest instance with the portal on every boot
+              Wants=network-online.target
+              After=network-online.target cloud-final.service
+              StartLimitIntervalSec=0
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/python3 /opt/isucon-registration/register.py
+              Restart=on-failure
+              RestartSec=20s
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=cloud-init.target
+
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=szD2TS0Sf5I4ok7jhBHBiE9X-MBjsI17Ic1PJtW044eKEeObCvyc_6jLDDvelYXk:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzUyMzYwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+
+            - sed -i -e 's/^ISUREAL_REGION=.*/ISUREAL_REGION=europe/' -e 's/^ISUREAL_DB_HOST=.*/ISUREAL_DB_HOST=192.168.4.10/' /home/isucon/env.sh
+            - systemctl enable --now isureal-go nginx
+            - systemctl enable --now isureal-guard
+
+            - systemctl daemon-reload
+            - systemctl enable --now --no-block isucon-register.service
+            - systemctl enable --now --no-block envcheck.service
+  App2IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref App2
+
+  App3Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: 192.168.3.0/24
+  App3Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  App3RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref App3Subnet
+      RouteTableId: !Ref App3Routes
+  App3DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref App3Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  App3ToApp1:
+    Type: AWS::EC2::Route
+    DependsOn: [App1Subnet, Router]
+    Properties:
+      RouteTableId: !Ref App3Routes
+      DestinationCidrBlock: 192.168.1.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App3ToApp2:
+    Type: AWS::EC2::Route
+    DependsOn: [App2Subnet, Router]
+    Properties:
+      RouteTableId: !Ref App3Routes
+      DestinationCidrBlock: 192.168.2.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App3ToDatabase:
+    Type: AWS::EC2::Route
+    DependsOn: [DatabaseSubnet, Router]
+    Properties:
+      RouteTableId: !Ref App3Routes
+      DestinationCidrBlock: 192.168.4.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  App3SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Contest server SSH and routed traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: '-1'
+          CidrIp: 192.168.10.10/32
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.1.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.2.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.4.0/24
+
+  App3:
+    Type: AWS::EC2::Instance
+    DependsOn: [App3DefaultRoute, App3RouteAssociation, App3ToApp1, App3ToApp2, App3ToDatabase]
+    Properties:
+      IamInstanceProfile: !Ref EnvcheckInstanceProfile
+      ImageId: ami-046bb2179ba4818ab
+      InstanceType: c7i.large
+      SubnetId: !Ref App3Subnet
+      PrivateIpAddress: 192.168.3.10
+      SecurityGroupIds: [!Ref App3SecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceLaunchTemplate
+        Version: !GetAtt ServiceLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: isucon2026-contest-3
+        - Key: IsuconTeamID
+          Value: '120107'
+        - Key: IsuconInstanceNum
+          Value: '3'
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /etc/isucon/envcheck.json
+            permissions: '0600'
+            content: '{"service_ami":"ami-046bb2179ba4818ab","router_ami":"ami-0d74406faa8e09fa6","types":["c5.large","c7i.large","c7i.large","c5.large","c6in.large"]}'
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6InN6RDJUUzBTZjVJNG9rN2poQkhCaUU5WC1NQmpzSTE3SWMxUEp0VzA0NGVLRWVPYkN2eWNfNmpMRER2ZWxZWGs6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16VXlNell3TUgwIn0='
+          - path: /etc/isucon/registration.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJudW1iZXIiOjMsInRva2VuIjoic3pEMlRTMFNmNUk0b2s3amhCSEJpRTlYLU1CanNJMTdJYzFQSnRXMDQ0ZUtFZU9iQ3Z5Y182akxERHZlbFlYazpleUowWldGdFgybGtJam94TWpBeE1EY3NJbVY0Y0dseWVTSTZNVGM1TXpVeU16WXdNSDAifQ=='
+          - path: /opt/isucon-registration/register.py
+            permissions: '0700'
+            encoding: gz+b64
+            content: 'H4sIAAAAAAAA/4xVzW7cNhC+6ykm7EWELdF27QBdQKei98BIgQKGIXDFkcVGIlXOaF0jyLsX1M9qtbYb72VFzsw3/x9/+aQGCmpvnUJ3gP6FG+9+TYQQ9/hkiTEAN5bAOmLtKgTvYO8950KIJLFd7wPD3+RdUgffQa+5ae0eZsEXzc0kGELb2n0e8J8BiRf5/XS8jGLfo0uSxGANHbI2mnUqdwkAwF4TQgGiYe53Sl1//i2/ubvN53/VakZiJUbdZ8vNApeON/E3O1ovjrAXIHRvFftv6MTlRt4hN94U4sufX88kDWqDgYrv4q9MP1OG1U22BJ2NUBlzmxFW3hkSOxCfr8SPFUOun2w79AMXd9OVBE0QkHrvCHerVsSE4ijJA2qTytxg5Q2mMhk1Y+2ekNPYBbkav12Sd8tyWpqYVBazUgIuxu5efiB5sZsC/rHBldsaniX+P8nHX0Aegns3/5w42H6pw6z8hDwPVJhnOa28q+3TZRQts+XNCxTw/ehNLClMug/z+XENU7ih22M4UZkvTnWWhSmtEbuxK8erzBpxUgzRB3vQjKXtD7elNiYg0WLT+kq3WZRsTYZ9a6s3LSbRxmTqg61fxQtFAXdroTtdQQEO/z2biE5Xm3Ptw6hr3eTSIT/78E1ZxxhqXSGpTlekhMypby231iGlcoNh65/YwsXo4wKEwYOtMJuDljFocS3WqTl+xV4+vF3ORyhGf5sYPuJ8bQCduNzk9XD1OI/dRG7F670aqYt2akReutB4YvEYnahIQceJmaY1aLbe0QnzxAUrItfmZuh6SmO6Mkc3rcCqty7o794xOs6+vvQYWUj3fWurEVhFoIWT5GvqDAs1L3t6fffOetp6XUtizQPBpwJurm7PNlhbQrgfXAT8IwQf1o2A05Sh1rZFI2SSJLaGsnS6w7Ic216WnbauLMWEPVUSivEFyluvDaXxzUmFQq6UpaHyTp2C52PacuSPkuOkSzk374wi1kdIJv8FAAD//6gaQ1wmBwAA'
+
+          - path: /etc/systemd/system/isucon-register.service
+            permissions: '0644'
+            content: |
+              [Unit]
+              Description=Register the contest instance with the portal on every boot
+              Wants=network-online.target
+              After=network-online.target cloud-final.service
+              StartLimitIntervalSec=0
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/python3 /opt/isucon-registration/register.py
+              Restart=on-failure
+              RestartSec=20s
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=cloud-init.target
+
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=szD2TS0Sf5I4ok7jhBHBiE9X-MBjsI17Ic1PJtW044eKEeObCvyc_6jLDDvelYXk:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzUyMzYwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+
+            - sed -i -e 's/^ISUREAL_REGION=.*/ISUREAL_REGION=america/' -e 's/^ISUREAL_DB_HOST=.*/ISUREAL_DB_HOST=192.168.4.10/' /home/isucon/env.sh
+            - systemctl enable --now isureal-go nginx
+            - systemctl enable --now isureal-guard
+
+            - systemctl daemon-reload
+            - systemctl enable --now --no-block isucon-register.service
+            - systemctl enable --now --no-block envcheck.service
+  App3IP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref App3
+
+  DatabaseSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !GetAtt GetAvailabilityZone.ZoneName
+      CidrBlock: 192.168.4.0/24
+  DatabaseRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  DatabaseRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnet
+      RouteTableId: !Ref DatabaseRoutes
+  DatabaseDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref DatabaseRoutes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  DatabaseToApp1:
+    Type: AWS::EC2::Route
+    DependsOn: [App1Subnet, Router]
+    Properties:
+      RouteTableId: !Ref DatabaseRoutes
+      DestinationCidrBlock: 192.168.1.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  DatabaseToApp2:
+    Type: AWS::EC2::Route
+    DependsOn: [App2Subnet, Router]
+    Properties:
+      RouteTableId: !Ref DatabaseRoutes
+      DestinationCidrBlock: 192.168.2.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  DatabaseToApp3:
+    Type: AWS::EC2::Route
+    DependsOn: [App3Subnet, Router]
+    Properties:
+      RouteTableId: !Ref DatabaseRoutes
+      DestinationCidrBlock: 192.168.3.0/24
+      NetworkInterfaceId: !Ref RouterDataInterface
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Contest server SSH and routed traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: '-1'
+          CidrIp: 192.168.10.10/32
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.1.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.2.0/24
+
+        - IpProtocol: '-1'
+          CidrIp: 192.168.3.0/24
+
+  Database:
+    Type: AWS::EC2::Instance
+    DependsOn: [DatabaseDefaultRoute, DatabaseRouteAssociation, DatabaseToApp1, DatabaseToApp2, DatabaseToApp3]
+    Properties:
+      IamInstanceProfile: !Ref EnvcheckInstanceProfile
+      ImageId: ami-046bb2179ba4818ab
+      InstanceType: c5.large
+      SubnetId: !Ref DatabaseSubnet
+      PrivateIpAddress: 192.168.4.10
+      SecurityGroupIds: [!Ref DatabaseSecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DatabaseLaunchTemplate
+        Version: !GetAtt DatabaseLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: isucon2026-contest-4
+        - Key: IsuconTeamID
+          Value: '120107'
+        - Key: IsuconInstanceNum
+          Value: '4'
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          write_files:
+          - path: /etc/isucon/envcheck.json
+            permissions: '0600'
+            content: '{"service_ami":"ami-046bb2179ba4818ab","router_ami":"ami-0d74406faa8e09fa6","types":["c5.large","c7i.large","c7i.large","c5.large","c6in.large"]}'
+          - path: /opt/isucon-env-checker/portal_credentials.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJkZXYiOmZhbHNlLCJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJ0b2tlbiI6InN6RDJUUzBTZjVJNG9rN2poQkhCaUU5WC1NQmpzSTE3SWMxUEp0VzA0NGVLRWVPYkN2eWNfNmpMRER2ZWxZWGs6ZXlKMFpXRnRYMmxrSWpveE1qQXhNRGNzSW1WNGNHbHllU0k2TVRjNU16VXlNell3TUgwIn0='
+          - path: /etc/isucon/registration.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJudW1iZXIiOjQsInRva2VuIjoic3pEMlRTMFNmNUk0b2s3amhCSEJpRTlYLU1CanNJMTdJYzFQSnRXMDQ0ZUtFZU9iQ3Z5Y182akxERHZlbFlYazpleUowWldGdFgybGtJam94TWpBeE1EY3NJbVY0Y0dseWVTSTZNVGM1TXpVeU16WXdNSDAifQ=='
+          - path: /opt/isucon-registration/register.py
+            permissions: '0700'
+            encoding: gz+b64
+            content: 'H4sIAAAAAAAA/4xVzW7cNhC+6ykm7EWELdF27QBdQKei98BIgQKGIXDFkcVGIlXOaF0jyLsX1M9qtbYb72VFzsw3/x9/+aQGCmpvnUJ3gP6FG+9+TYQQ9/hkiTEAN5bAOmLtKgTvYO8950KIJLFd7wPD3+RdUgffQa+5ae0eZsEXzc0kGELb2n0e8J8BiRf5/XS8jGLfo0uSxGANHbI2mnUqdwkAwF4TQgGiYe53Sl1//i2/ubvN53/VakZiJUbdZ8vNApeON/E3O1ovjrAXIHRvFftv6MTlRt4hN94U4sufX88kDWqDgYrv4q9MP1OG1U22BJ2NUBlzmxFW3hkSOxCfr8SPFUOun2w79AMXd9OVBE0QkHrvCHerVsSE4ijJA2qTytxg5Q2mMhk1Y+2ekNPYBbkav12Sd8tyWpqYVBazUgIuxu5efiB5sZsC/rHBldsaniX+P8nHX0Aegns3/5w42H6pw6z8hDwPVJhnOa28q+3TZRQts+XNCxTw/ehNLClMug/z+XENU7ih22M4UZkvTnWWhSmtEbuxK8erzBpxUgzRB3vQjKXtD7elNiYg0WLT+kq3WZRsTYZ9a6s3LSbRxmTqg61fxQtFAXdroTtdQQEO/z2biE5Xm3Ptw6hr3eTSIT/78E1ZxxhqXSGpTlekhMypby231iGlcoNh65/YwsXo4wKEwYOtMJuDljFocS3WqTl+xV4+vF3ORyhGf5sYPuJ8bQCduNzk9XD1OI/dRG7F670aqYt2akReutB4YvEYnahIQceJmaY1aLbe0QnzxAUrItfmZuh6SmO6Mkc3rcCqty7o794xOs6+vvQYWUj3fWurEVhFoIWT5GvqDAs1L3t6fffOetp6XUtizQPBpwJurm7PNlhbQrgfXAT8IwQf1o2A05Sh1rZFI2SSJLaGsnS6w7Ic216WnbauLMWEPVUSivEFyluvDaXxzUmFQq6UpaHyTp2C52PacuSPkuOkSzk374wi1kdIJv8FAAD//6gaQ1wmBwAA'
+
+          - path: /etc/systemd/system/isucon-register.service
+            permissions: '0644'
+            content: |
+              [Unit]
+              Description=Register the contest instance with the portal on every boot
+              Wants=network-online.target
+              After=network-online.target cloud-final.service
+              StartLimitIntervalSec=0
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/python3 /opt/isucon-registration/register.py
+              Restart=on-failure
+              RestartSec=20s
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=cloud-init.target
+
+          runcmd:
+            - |
+              (
+              set -eu
+              umask 077
+              keydir=/home/isucon/.ssh
+              install -d -m 0700 -o isucon -g isucon "$keydir"
+              downloaded=$(mktemp "$keydir/.downloaded.XXXXXX")
+              candidate=$(mktemp "$keydir/.candidate.XXXXXX")
+              trap 'rm -f "$downloaded" "$candidate"' EXIT HUP INT TERM
+              valid_keys() {
+                count=0
+                while IFS= read -r key || [ -n "$key" ]; do
+                  [ -n "$key" ] || continue
+                  printf '%s\n' "$key" > "$candidate"
+                  ssh-keygen -l -f "$candidate" >/dev/null 2>&1 || return 1
+                  count=$((count + 1))
+                done < "$downloaded"
+                [ "$count" -gt 0 ]
+              }
+              attempt=1
+              while [ "$attempt" -le 12 ]; do
+                if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --output "$downloaded" 'https://portal.isucon.net/api/ssh_public_keys?token=szD2TS0Sf5I4ok7jhBHBiE9X-MBjsI17Ic1PJtW044eKEeObCvyc_6jLDDvelYXk:eyJ0ZWFtX2lkIjoxMjAxMDcsImV4cGlyeSI6MTc5MzUyMzYwMH0' && valid_keys; then
+                  chmod 0600 "$downloaded"
+                  chown isucon:isucon "$downloaded"
+                  mv -f "$downloaded" "$keydir/authorized_keys"
+                  exit 0
+                fi
+                echo "SSH key download or validation failed (attempt $attempt/12); existing keys retained" >&2
+                if [ "$attempt" -lt 12 ]; then sleep 10; fi
+                attempt=$((attempt + 1))
+              done
+              echo "Could not install SSH keys; check portal key registration and rerun this cloud-init command" >&2
+              exit 1
+              )
+
+
+            - systemctl enable --now postgresql
+
+            - systemctl daemon-reload
+            - systemctl enable --now --no-block isucon-register.service
+            - systemctl enable --now --no-block envcheck.service
+  DatabaseIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Database
+
+  ServerACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+  ServerACLIngress:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref ServerACL
+      RuleNumber: 1000
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+  ServerACLBlockRouterPublicIP:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref ServerACL
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: deny
+      Egress: true
+      CidrBlock: !Sub '${RouterIP}/32'
+  ServerACLBlockRouterPublicSubnet:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref ServerACL
+      RuleNumber: 110
+      Protocol: -1
+      RuleAction: deny
+      Egress: true
+      CidrBlock: 192.168.11.0/24
+  ServerACLEgress:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref ServerACL
+      RuleNumber: 1000
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+
+  App1ACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref App1Subnet
+      NetworkAclId: !Ref ServerACL
+
+  App2ACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref App2Subnet
+      NetworkAclId: !Ref ServerACL
+
+  App3ACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref App3Subnet
+      NetworkAclId: !Ref ServerACL
+
+  DatabaseACLAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnet
+      NetworkAclId: !Ref ServerACL
+
+  Router:
+    Type: AWS::EC2::Instance
+    DependsOn: [PublicDefaultRoute, RouterPublicRoutes]
+    Properties:
+      IamInstanceProfile: !Ref EnvcheckInstanceProfile
+      ImageId: ami-0d74406faa8e09fa6
+      InstanceType: c6in.large
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          NetworkInterfaceId: !Ref RouterPublicInterface
+        - DeviceIndex: '1'
+          NetworkInterfaceId: !Ref RouterDataInterface
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: isucon2026-contest-router
+        - Key: IsuconTeamID
+          Value: '120107'
+        - Key: IsuconInstanceNum
+          Value: '5'
+      UserData:
+        Fn::Base64: |
+          #cloud-config
+          users:
+            - default
+            - name: isuadmin
+              shell: /bin/bash
+              lock_passwd: true
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              ssh_authorized_keys: ['ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDTk28UNHecmOxDarWVXwqlBYih6jd+S4Vq5T6sYWa7DfVBiCKy7SVPKgppo9OS1yp830hrqz/w685RtXKlIt7CCZp6Ij7I6+w0wZd+XE3YvklPfbCVVI5ndGvIDNHwuhJhnjfeW7Lpedp7gylJiiFaCOqHL+QwCeSvn8SPVAKA6tlV3zzsozz24wbgQw8Kxps4f1JQaQGMYH0cDELZ7gDWpVl7fGELs8yZ1AXCLP750CYfxjZiLshMcBbAshBkODJdEJ+dw9CPNE6Ju0bAzONk4uvjHYOFVe6R3bOIEYF3RQigpSDnQYXH2pZ8FZR8qCcESQhci8m9FqubOt6K2BUxwLV05eBqZISS1o+pjYwF2tt9FaTqu1v4xXnC+MoXh3iw6N2zPcMyzKxjfmahg6gHcjByR9mJPloTWxBaaUdDQm4Ut8HXb7e4TN1a3nYd8Z0cQxT+G8LRT9mZ3cEoRZvQTJd0Dxs4qW3BidN7sgs2j3HHWcMDzNLF/N4ngleyLWM=']
+
+          bootcmd:
+            - [dpkg, --purge, ec2-instance-connect]
+            - [systemctl, daemon-reload]
+            - [systemctl, try-restart, ssh.service]
+          write_files:
+          - path: /etc/isucon/envcheck.json
+            permissions: '0600'
+            content: '{"service_ami":"ami-046bb2179ba4818ab","router_ami":"ami-0d74406faa8e09fa6","types":["c5.large","c7i.large","c7i.large","c5.large","c6in.large"]}'
+          - path: /etc/isucon/registration.json
+            permissions: '0600'
+            encoding: b64
+            content: 'eyJob3N0IjoicG9ydGFsLmlzdWNvbi5uZXQiLCJudW1iZXIiOjUsInRva2VuIjoic3pEMlRTMFNmNUk0b2s3amhCSEJpRTlYLU1CanNJMTdJYzFQSnRXMDQ0ZUtFZU9iQ3Z5Y182akxERHZlbFlYazpleUowWldGdFgybGtJam94TWpBeE1EY3NJbVY0Y0dseWVTSTZNVGM1TXpVeU16WXdNSDAifQ=='
+          - path: /opt/isucon-registration/register.py
+            permissions: '0700'
+            encoding: gz+b64
+            content: 'H4sIAAAAAAAA/4xVzW7cNhC+6ykm7EWELdF27QBdQKei98BIgQKGIXDFkcVGIlXOaF0jyLsX1M9qtbYb72VFzsw3/x9/+aQGCmpvnUJ3gP6FG+9+TYQQ9/hkiTEAN5bAOmLtKgTvYO8950KIJLFd7wPD3+RdUgffQa+5ae0eZsEXzc0kGELb2n0e8J8BiRf5/XS8jGLfo0uSxGANHbI2mnUqdwkAwF4TQgGiYe53Sl1//i2/ubvN53/VakZiJUbdZ8vNApeON/E3O1ovjrAXIHRvFftv6MTlRt4hN94U4sufX88kDWqDgYrv4q9MP1OG1U22BJ2NUBlzmxFW3hkSOxCfr8SPFUOun2w79AMXd9OVBE0QkHrvCHerVsSE4ijJA2qTytxg5Q2mMhk1Y+2ekNPYBbkav12Sd8tyWpqYVBazUgIuxu5efiB5sZsC/rHBldsaniX+P8nHX0Aegns3/5w42H6pw6z8hDwPVJhnOa28q+3TZRQts+XNCxTw/ehNLClMug/z+XENU7ih22M4UZkvTnWWhSmtEbuxK8erzBpxUgzRB3vQjKXtD7elNiYg0WLT+kq3WZRsTYZ9a6s3LSbRxmTqg61fxQtFAXdroTtdQQEO/z2biE5Xm3Ptw6hr3eTSIT/78E1ZxxhqXSGpTlekhMypby231iGlcoNh65/YwsXo4wKEwYOtMJuDljFocS3WqTl+xV4+vF3ORyhGf5sYPuJ8bQCduNzk9XD1OI/dRG7F670aqYt2akReutB4YvEYnahIQceJmaY1aLbe0QnzxAUrItfmZuh6SmO6Mkc3rcCqty7o794xOs6+vvQYWUj3fWurEVhFoIWT5GvqDAs1L3t6fffOetp6XUtizQPBpwJurm7PNlhbQrgfXAT8IwQf1o2A05Sh1rZFI2SSJLaGsnS6w7Ic216WnbauLMWEPVUSivEFyluvDaXxzUmFQq6UpaHyTp2C52PacuSPkuOkSzk374wi1kdIJv8FAAD//6gaQ1wmBwAA'
+          - path: /opt/isucon-registration/router-bootstrap.py
+            permissions: '0700'
+            encoding: gz+b64
+            content: 'H4sIAAAAAAAA/4RVXa+jRgx951e47gtoEyB3P9SLmqdqK/WlqlZ9y0ZoAibMLsygGZP0KuK/VzN83vZWzQMi9vj4YB97fvwh6a1JLlIlpG7QvXCt1fsAEX/RqpLX3hBwTWCp0KqEz7//BheqtCGwLAxLdfXuQismy/BF90wmRsQgkG2nDcM3q1VQGd1CJ7hu5AUmxx+C6/mQ7S+d0QVZO1tYtjS/v4i2GSEMXaVlMjNGSyxKwSIIgpIqR2PkHF6JoywAAHDuvBUFHEHRXxx6o/u1ooiNZSO7EBOMFnuljfOBVHAlDlER37X5nkjFZCpRkE1aUdgEo9h2jeRGKrLhGi+r/4mDdx7/HWBJN1nQXvXthQxGcDwCHtAjRQt5OMJjAcdWcFFjBg9sRSHK0pC1mC1fOezWo5Z4r0RLmAE6f4obZ1kX3QfM4FfRWNrYW+4xg+c0PWyMUx5ymU54eH6KD59+ig9pfEiTpw943hw1TgH+3GJzvweyxgyqJfihhtgH7wBvUjiOW1wcfB+U64IR6krhYQcf1yJPKQf/vJIiI5hKOHpVhZgQF4ki7hqhko/pvmh0X+6lkhw7MU3dnjoER6+w2IqK8kaLMlwAY0OizNnpJhpj1m56QXmA09xrPJ+QuCajiC2eg1lOrgs7uImmJ/dBjbQcrkCxZGptGE2CnTQUvqqfQ/DyGBv5yqfNCB172Y0C2cFjiGbDopMdIEZxo+9kQq+2WTazbcHdcPE6pGbz5SfH5vy69PHdSKaxVGs1y77twqk4UwHXiKJudRmm+lOaji4W5kr8dhOf0720faHVtoFjwDb1wvofHB5Li9zo3MhYqRVm8LSDTcecbyzwOFHDMESbaZzS/Yv3hq4X2viMi+oal8nz80R870fD7Ccizo3Rm9xnrhk8xo2WQSmtuDRUDl9V35WCyWbwWI/da1IZnC5a817RfS+VZaEKOg/DV7VdKOuijU2vQq9cV18nDdF1zQued1DUVHw//ml6+u8gl7jgxsUZWvau+zsW8A0YNwn5OtDv043IxrUBR39dxG4I7esB2HDwuLnuues5PKHsXNb9N//0+8SDuRdb67unRLcNs43KtwP3eGM5vbmEBvj5CA8zTldpGSN/zPhj/juG19NjiHujFpO72mLbEHXhYWRghLQEX3rlXJ+N0SbE8Sodb4CpOsIQKM3gltILRkEQyAry3E1jnvvtkOetkCrPcSSw3ofzRenW2N8BAAD//988G/X0BwAA'
+          - path: /etc/isucon/router.env
+            owner: root:isureal-router
+            permissions: '0640'
+            content: |
+              ROUTER_PORTAL_ENDPOINT=http://127.0.0.1:18082
+              ROUTER_TEAM_NUMBER=120107
+              ROUTER_STATUS_LISTEN_ADDRESS=192.168.11.10:18081
+              ROUTER_HTTP_LISTEN_ADDRESS=0.0.0.0:8080
+              ROUTER_HTTPS_LISTEN_ADDRESS=0.0.0.0:443
+              ROUTER_TLS_CERTIFICATE=/etc/isucon/haproxy/tls/server.pem
+              ROUTER_UPSTREAM_PORT=80
+
+              ROUTER_APP1_SUBNET=192.168.1.0/24
+              ROUTER_APP1_REGION_LOCAL_IP=192.168.10.10
+              ROUTER_APP1_IP=192.168.1.10
+
+              ROUTER_APP2_SUBNET=192.168.2.0/24
+              ROUTER_APP2_REGION_LOCAL_IP=192.168.10.10
+              ROUTER_APP2_IP=192.168.2.10
+
+              ROUTER_APP3_SUBNET=192.168.3.0/24
+              ROUTER_APP3_REGION_LOCAL_IP=192.168.10.10
+              ROUTER_APP3_IP=192.168.3.10
+
+              ROUTER_DB1_SUBNET=192.168.4.0/24
+              ROUTER_DB1_REGION_LOCAL_IP=192.168.10.10
+              ROUTER_DB1_IP=192.168.4.10
+
+          - path: /etc/isucon/portal.env
+            owner: root:isureal-router
+            permissions: '0640'
+            content: |
+              PORTAL_TEAM_NUMBER=120107
+              PORTAL_TEAM_HASH=aws
+              PORTAL_DOMAIN_SUFFIX=127.0.0.1.nip.io
+              PORTAL_ROUTER_MODE=external-router
+              PORTAL_LISTEN_ADDRESS=127.0.0.1:18082
+              PORTAL_WEB_DIR=
+          - path: /etc/systemd/system/isucon-register.service.d/router.conf
+            permissions: '0644'
+            content: |
+              [Unit]
+              Wants=isucon-router-bootstrap.service
+              After=isucon-router-bootstrap.service
+              [Service]
+              ExecStartPre=/usr/bin/systemctl is-active isucon-router-bootstrap.service
+          - path: /etc/systemd/system/isucon-router-bootstrap.service
+            permissions: '0644'
+            content: |
+              [Unit]
+              Description=Configure ISUCON2026 Router network on every boot
+              Wants=network-online.target
+              After=network-online.target cloud-final.service
+              StartLimitIntervalSec=0
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/python3 /opt/isucon-registration/router-bootstrap.py
+              ExecStart=/usr/bin/systemctl start isureal-portal isureal-router isureal-haproxy
+              Restart=on-failure
+              RestartSec=10s
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=cloud-init.target
+
+          - path: /etc/systemd/system/isucon-register.service
+            permissions: '0644'
+            content: |
+              [Unit]
+              Description=Register the contest instance with the portal on every boot
+              Wants=network-online.target
+              After=network-online.target cloud-final.service
+              StartLimitIntervalSec=0
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/python3 /opt/isucon-registration/register.py
+              Restart=on-failure
+              RestartSec=20s
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=cloud-init.target
+
+          runcmd:
+            - |
+              set -eu
+              umask 077
+              cd /etc/isucon/haproxy/tls
+              openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj '/CN=app.team120107-aws.127.0.0.1.nip.io' -keyout server.key -out server.crt
+              cat server.crt server.key > server.pem
+              chown root:isureal-router server.pem
+              chmod 0640 server.pem
+              rm server.key server.crt
+            - systemctl daemon-reload
+            - systemctl enable --now --no-block isucon-router-bootstrap.service
+            - systemctl enable --now --no-block isucon-register.service
+            - systemctl enable --now --no-block envcheck.service
+  RouterIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  RouterIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt RouterIP.AllocationId
+      NetworkInterfaceId: !Ref RouterPublicInterface
+Outputs:
+
+  App1PublicIP:
+    Value: !Ref App1IP
+
+  App2PublicIP:
+    Value: !Ref App2IP
+
+  App3PublicIP:
+    Value: !Ref App3IP
+
+  DatabasePublicIP:
+    Value: !Ref DatabaseIP
+
+  RouterPublicIP:
+    Value: !Ref RouterIP
+  BenchmarkHost:
+    Value: 'app.team120107-aws.127.0.0.1.nip.io'
+
