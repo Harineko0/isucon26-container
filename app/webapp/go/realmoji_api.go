@@ -109,24 +109,51 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 		if (input.BeforeCreatedAt == nil) != (input.BeforeID == "") {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
-		ctx := c.Request().Context()
-		var reactions []RealMojiWithReactor
-		var listErr error
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			reactions, listErr = selectCurrentRealMojis(ctx, h.DB, `AND r.post_id=$1 AND ($2::timestamptz IS NULL OR (r.created_at,r.id)<($2,$3)) ORDER BY r.created_at DESC,r.id DESC LIMIT 51`, input.PostID, input.BeforeCreatedAt, input.BeforeID)
-		}()
-		allowed, _, err := postAccess(ctx, h.DB, GetSession(c).UserID, input.PostID)
-		<-done
-		if err != nil {
+		// セッションの確認・閲覧可否 (isureal_post_access)・一覧の取得を 1 文・接続 1 本で行う (#82)。
+		// 閲覧できないか一覧が空なら番兵の行 (found = false) が 1 行返る。
+		var rows []struct {
+			SessRegion *string `db:"sess_region"`
+			Allowed    bool    `db:"allowed"`
+			Found      bool    `db:"found"`
+			RealMojiWithReactor
+		}
+		if err := selectWithSession(c, h, &rows, func() (int, *string) {
+			if len(rows) == 0 {
+				return 0, nil
+			}
+			return len(rows), rows[0].SessRegion
+		}, `
+   SELECT s.sess_region, a.can_view AS allowed, r.id IS NOT NULL AS found,
+          COALESCE(r.id, '') AS id, COALESCE(r.post_id, '') AS post_id, COALESCE(r.reactor_id, '') AS reactor_id,
+          COALESCE(r.image_id, '') AS image_id, COALESCE(r.reaction_type, '') AS reaction_type,
+          COALESCE(r.created_at, 'epoch') AS created_at, r.replaced_at, r.deleted_at,
+          `+userColumnsCoalesced("r", "reactor")+`
+   FROM {session}
+   CROSS JOIN LATERAL isureal_post_access(s.sess_user_id, $1) a
+   LEFT JOIN LATERAL (
+     SELECT m.id, m.post_id, m.reactor_id, m.image_id, m.reaction_type, m.created_at, m.replaced_at, m.deleted_at,
+            `+userColumnsAs("u", "reactor")+`
+     FROM realmojis m JOIN users u ON u.id = m.reactor_id AND u.status = 'active'
+     WHERE a.can_view AND m.replaced_at IS NULL AND m.deleted_at IS NULL AND m.post_id=$1 AND ($2::timestamptz IS NULL OR (m.created_at,m.id)<($2,$3))
+     ORDER BY m.created_at DESC,m.id DESC LIMIT 51
+   ) r ON true
+   ORDER BY r.created_at DESC, r.id DESC
+  `, input.PostID, input.BeforeCreatedAt, input.BeforeID); err != nil {
 			return err
 		}
-		if !allowed {
+		if len(rows) == 0 || !rows[0].Allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		if listErr != nil {
-			return listErr
+		reactions := make([]RealMojiWithReactor, 0, len(rows))
+		for _, row := range rows {
+			if !row.Found {
+				continue
+			}
+			reaction := row.RealMojiWithReactor
+			if err := reaction.Reactor.setImageKey(); err != nil {
+				return err
+			}
+			reactions = append(reactions, reaction)
 		}
 		plan := newSignaturePlan()
 		for _, reaction := range reactions {

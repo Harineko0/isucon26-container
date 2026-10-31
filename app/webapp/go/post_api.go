@@ -57,8 +57,9 @@ type createPostGate chan struct{}
 // 3 台合計で 8 + 4 + 4 = 16 本 (待ちが 0 だった 12 本に近い値。asia に寄せる)。
 // asia 8 のベンチ (main 91832e2, 64,912) では画像 INSERT が 390→88 ms に下がった一方、asia の POST /api/posts が
 // 平均 1.9 s (最大 4.7 s) と gate 待ちが支配的になり、グランプリの投稿は 400 人中 125 人だった。
-// 待ちが 0 だった同時 12 本まで asia を広げる (#81)。3 台合計 12 + 4 + 4 = 20。
-var createPostGateSize = map[string]int{"asia": 12, "europe": 4, "america": 4}
+// asia 12 のベンチ (main b48193a, 63,766) では asia の POST /api/posts が平均 4.1 s (最大 10.7 s) になり、
+// グランプリの投稿は 374 人中 19 人に落ちた (8 のときは 400 人中 125 人)。8 に戻す。3 台合計 8 + 4 + 4 = 16。
+var createPostGateSize = map[string]int{"asia": 8, "europe": 4, "america": 4}
 
 func newCreatePostGate(region string) createPostGate {
 	n, ok := createPostGateSize[region]

@@ -2,8 +2,6 @@ package isureal
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -125,26 +123,28 @@ func getUserHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		viewer := GetSession(c).UserID
+		// セッションの確認と同じ 1 文で引く (#82)。利用者が無ければ番兵の行 (found = false) が返る。
 		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Found      bool    `db:"found"`
 			User
 			Blocked  bool `db:"blocked"`
 			IsFriend bool `db:"is_friend"`
 		}
-		err := h.DB.GetContext(ctx, &row, `
-   SELECT `+strings.Join(userColumns, ", ")+`,
-     EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=u.id) OR (blocker_id=u.id AND blocked_id=$1)) AS blocked,
-     EXISTS(SELECT 1 FROM friendships WHERE user_low_id=least($1, u.id) AND user_high_id=greatest($1, u.id)) AS is_friend
-   FROM users u WHERE u.id = $2 AND u.status = 'active'
-  `, viewer, input.UserID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "relationship_not_found")
-		}
+		err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, `
+   SELECT s.sess_region, r.id IS NOT NULL AS found, `+userColumnsCoalesced("r", "")+`,
+     COALESCE(r.blocked, false) AS blocked, COALESCE(r.is_friend, false) AS is_friend
+   FROM {session} LEFT JOIN LATERAL (
+     SELECT `+strings.Join(userColumns, ", ")+`,
+       EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=s.sess_user_id AND blocked_id=u.id) OR (blocker_id=u.id AND blocked_id=s.sess_user_id)) AS blocked,
+       EXISTS(SELECT 1 FROM friendships WHERE user_low_id=least(s.sess_user_id, u.id) AND user_high_id=greatest(s.sess_user_id, u.id)) AS is_friend
+     FROM users u WHERE u.id = $1 AND u.status = 'active'
+   ) r ON true
+  `, input.UserID)
 		if err != nil {
 			return err
 		}
-		if row.Blocked {
+		if !row.Found || row.Blocked {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
 		user := row.User
