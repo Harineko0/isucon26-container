@@ -74,9 +74,11 @@ func canComment(ctx context.Context, db sqlx.QueryerContext, viewerID, postID st
 	return viewer.Friends[post.AuthorID], nil
 }
 
+// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、ポインタで受ける
+// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
 type interactionRow struct {
 	SessRegion     *string    `db:"sess_region"`
-	Result         string     `db:"o_result"`
+	Result         *string    `db:"o_result"`
 	CreatedAt      *time.Time `db:"o_created_at"`
 	ID             *string    `db:"o_id"`
 	Username       *string    `db:"o_username"`
@@ -90,7 +92,10 @@ type interactionRow struct {
 }
 
 func (row interactionRow) err() error {
-	switch row.Result {
+	if row.Result == nil {
+		return errors.New("interaction function returned no result")
+	}
+	switch *row.Result {
 	case "ok":
 		return nil
 	case "forbidden":
@@ -98,7 +103,7 @@ func (row interactionRow) err() error {
 	case "not_found":
 		return NewAPIError(http.StatusNotFound, "relationship_not_found")
 	default:
-		return fmt.Errorf("unexpected interaction result: %s", row.Result)
+		return fmt.Errorf("unexpected interaction result: %s", *row.Result)
 	}
 }
 
