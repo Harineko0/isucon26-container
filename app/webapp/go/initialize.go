@@ -29,6 +29,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		resetPeerImageStores(h.Config.Region)
+		// login_sessions は作り直されるので、覚えていたセッションも捨てる (他のリージョンの分は DB の確認で外れる)。
+		knownSessions.Clear()
 		go loadInitialDataBoundary(h.DB)
 		go refreshSearchNorms(h.DB)
 

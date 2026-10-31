@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -69,7 +68,8 @@ func lookupSession(ctx context.Context, db *sqlx.DB, tokenHash string) (*Session
 // トークンと利用者の対応は変わらないので、一度確認したセッションを覚えておき、
 // 読み取りの GET ではセッションの確認と処理を並行に進める。応答はいったんバッファに溜め、
 // 確認結果が覚えていた内容と一致したときだけ返す。一致しなければ通常どおりやり直す。
-var knownSessions sync.Map
+// 1 件 200 バイト程度。上限を超えて捨てても、次の確認で覚え直すだけ。
+var knownSessions = &boundedMap{limit: 100_000}
 
 type bufferedResponseWriter struct {
 	header http.Header

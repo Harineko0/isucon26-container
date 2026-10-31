@@ -472,3 +472,15 @@ BEGIN
   END IF;
   RETURN 'ok';
 END $$;
+
+-- 通知の id は (投稿期間, 利用者) から決まる値にする。SSE は notifications 表を読まずに、
+-- 投稿期間と利用者からこの関数で id を組み立てる (#27)。形式は以前の
+-- 「開始時刻 (ミリ秒) の 16 進 12 桁 + gen_random_uuid() の後半」と同じで、後半を
+-- md5(期間 id || ':' || 利用者 id) から UUID version 4 / variant 8〜b の形で作る (全体で 36 文字)。
+CREATE OR REPLACE FUNCTION isureal_notification_id(p_window_id text, p_user_id text, p_starts_at timestamptz)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
+         || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12)
+  FROM (SELECT lpad(to_hex((extract(epoch FROM p_starts_at) * 1000)::bigint), 12, '0') AS ts,
+               md5(p_window_id || ':' || p_user_id) AS h) x
+$$;
