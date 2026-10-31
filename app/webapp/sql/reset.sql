@@ -6,6 +6,9 @@ TRUNCATE ip_bans, login_sessions, administrator_sessions, friendships, friend_re
 
 -- 通知は投稿期間の開始時にだけ、その期間の posting_window_id 付きで作られる(NOT NULL)。
 -- created_at に索引が無く全件走査になるので、境界より後の投稿期間から notifications_window_user で引く。
+-- posting_windows の統計が古いと境界後の期間数を過大に見積もり（実測 18 を 369）、notifications の全件走査を選ぶ。
+-- 1.1k 行の表なので ANALYZE は数 ms。これで notifications_window_user のインデックス経由になる。
+ANALYZE posting_windows;
 DELETE FROM notifications WHERE posting_window_id IN (SELECT id FROM posting_windows WHERE created_at > (SELECT created_at FROM initial_data_boundary));
 DELETE FROM comments WHERE created_at > (SELECT created_at FROM initial_data_boundary);
 DELETE FROM realmojis WHERE created_at > (SELECT created_at FROM initial_data_boundary);
