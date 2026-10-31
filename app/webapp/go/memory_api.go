@@ -1,10 +1,13 @@
 package isureal
 
 import (
-	"encoding/json"
+	"crypto/sha256"
+	"errors"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/labstack/echo/v5"
 )
 
@@ -80,14 +83,12 @@ const memoriesFrom = `posting_windows w
 
 // User の公開 JSON に含めない署名鍵と画像 ID は、DB からの内部転送でだけ別に受け取る。
 type memoryInteraction struct {
-	ID             string
-	Body           string
-	ImageID        string
-	ReactionType   string
-	CreatedAt      time.Time
-	User           User
-	SigningKey     string
-	ProfileImageID *string
+	ID           string
+	Body         string
+	ImageID      string
+	ReactionType string
+	CreatedAt    time.Time
+	User         User
 }
 
 type memoryPageRow struct {
@@ -95,14 +96,35 @@ type memoryPageRow struct {
 	Found      bool    `db:"found"`
 	HasMore    bool    `db:"has_more"`
 	PostWithAuthor
-	ReactionsJSON []byte `db:"reactions"`
-	CommentsJSON  []byte `db:"comments"`
+	ReactionRecords []byte `db:"reactions"`
+	CommentRecords  []byte `db:"comments"`
 }
 
-const memoryInteractionUser = `json_build_object(
-  'id', u.id, 'username', u.username, 'displayName', u.display_name, 'bio', u.bio,
-  'accountType', u.account_type) AS "User",
-  u.secret_key_hash AS "SigningKey", u.profile_image_id AS "ProfileImageID"`
+// The field order is shared with memoryInteraction.ScanIndex. Send the signing
+// key as 32 bytes. The two length checks also reject whitespace, which
+// PostgreSQL's hex decoder would otherwise ignore.
+const memoryInteractionUser = `u.id, u.username, u.display_name, u.bio, u.account_type,
+  CASE WHEN octet_length(u.secret_key_hash) = 64 THEN decode(u.secret_key_hash, 'hex') END,
+  u.profile_image_id`
+
+// pgx uses these destinations when it scans one anonymous ROW. Scanning into
+// the result directly avoids building a second slice of reflective structs.
+func (item *memoryInteraction) ScanIndex(i int) any {
+	fields := [...]any{
+		&item.ID, &item.Body, &item.ImageID, &item.ReactionType, &item.CreatedAt,
+		&item.User.ID, &item.User.Username, &item.User.DisplayName, &item.User.Bio,
+		&item.User.AccountType, &item.User.ImageKey, &item.User.ProfileImageID,
+	}
+	if i >= len(fields) {
+		return nil
+	}
+	return fields[i]
+}
+
+func (*memoryInteraction) ScanNull() error { return errors.New("unexpected NULL memory interaction") }
+
+// Reuse the pgx type registry without sharing it between concurrent decoders.
+var memoryRecordMaps = sync.Pool{New: func() any { return pgtype.NewMap() }}
 
 // memoryAnyOf は `col = ANY(ARRAY(SELECT id FROM src))` を、空の配列との OR にしたもの。
 // 本番の DB 時間の 4 分の 3 はヒープのディスク読み (1 回 ~3ms) で (#154 の pg_stat_statements: blk_read_time
@@ -141,24 +163,22 @@ var memoriesQuery = `
   ),
   top AS MATERIALIZED (SELECT * FROM page ORDER BY posted_at DESC, id DESC LIMIT 50),
   rx AS MATERIALIZED (
-    SELECT post_id, json_agg(item ORDER BY created_at DESC, id DESC) AS items
+    SELECT post_id, array_send(array_agg(item ORDER BY created_at DESC, id DESC)) AS items
     FROM (
-      SELECT r.post_id, r.created_at, r.id, item,
+      SELECT r.post_id, r.created_at, r.id,
+        ROW(r.id, ''::text, r.image_id, r.reaction_type, r.created_at, ` + memoryInteractionUser + `) AS item,
         row_number() OVER (PARTITION BY r.post_id ORDER BY r.created_at DESC, r.id DESC) AS n
       FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
-      CROSS JOIN LATERAL (SELECT r.id AS "ID", r.image_id AS "ImageID", r.reaction_type AS "ReactionType",
-        r.created_at AS "CreatedAt", ` + memoryInteractionUser + `) item
       WHERE ` + memoryAnyOf("r.post_id", "top") + ` AND COALESCE(r.replaced_at, r.deleted_at) IS NULL
     ) ranked WHERE n <= 50 GROUP BY post_id
   ),
   cx AS MATERIALIZED (
-    SELECT post_id, json_agg(item ORDER BY created_at, id) AS items
+    SELECT post_id, array_send(array_agg(item ORDER BY created_at, id)) AS items
     FROM (
-      SELECT c.post_id, c.created_at, c.id, item,
+      SELECT c.post_id, c.created_at, c.id,
+        ROW(c.id, c.body, ''::varchar, ''::text, c.created_at, ` + memoryInteractionUser + `) AS item,
         row_number() OVER (PARTITION BY c.post_id ORDER BY c.created_at, c.id) AS n
       FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
-      CROSS JOIN LATERAL (SELECT c.id AS "ID", c.body AS "Body", c.created_at AS "CreatedAt",
-        ` + memoryInteractionUser + `) item
       WHERE ` + memoryAnyOf("c.post_id", "top") + ` AND c.deleted_at IS NULL
     ) ranked WHERE n <= 50 GROUP BY post_id
   )
@@ -169,7 +189,7 @@ var memoriesQuery = `
     COALESCE(p.location_kind, '') AS location_kind, p.latitude, p.longitude, p.locality,
     COALESCE(p.posted_at, 'epoch') AS posted_at, COALESCE(p.on_time_deadline, 'epoch') AS on_time_deadline,
     p.window_ended_at, ` + userColumnsCoalesced("p", "author") + `,
-    COALESCE(rx.items, '[]') AS reactions, COALESCE(cx.items, '[]') AS comments
+    rx.items AS reactions, cx.items AS comments
   FROM sess s LEFT JOIN top p ON true
   LEFT JOIN rx ON rx.post_id = p.id
   LEFT JOIN cx ON cx.post_id = p.id
@@ -177,17 +197,19 @@ var memoriesQuery = `
 `
 
 func decodeMemoryInteractions(data []byte) ([]memoryInteraction, error) {
-	var items []memoryInteraction
-	if err := json.Unmarshal(data, &items); err != nil {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	types := memoryRecordMaps.Get().(*pgtype.Map)
+	defer memoryRecordMaps.Put(types)
+	var items pgtype.FlatArray[memoryInteraction]
+	if err := types.Scan(pgtype.RecordArrayOID, pgtype.BinaryFormatCode, data, &items); err != nil {
 		return nil, err
 	}
 	for i := range items {
-		// pgx の通常の timestamptz 読み取りと同じローカル時刻表記にする。
 		items[i].CreatedAt = items[i].CreatedAt.In(time.Local)
-		items[i].User.SecretKeyHash = items[i].SigningKey
-		items[i].User.ProfileImageID = items[i].ProfileImageID
-		if err := items[i].User.setImageKey(); err != nil {
-			return nil, err
+		if len(items[i].User.ImageKey) != sha256.Size {
+			return nil, errors.New("invalid image signing key")
 		}
 	}
 	return items, nil
@@ -221,10 +243,10 @@ func listMemories(c *echo.Context, h *HandlerContext, start, end time.Time, befo
 			return response, err
 		}
 		var err error
-		if reactions[i], err = decodeMemoryInteractions(post.ReactionsJSON); err != nil {
+		if reactions[i], err = decodeMemoryInteractions(post.ReactionRecords); err != nil {
 			return response, err
 		}
-		if comments[i], err = decodeMemoryInteractions(post.CommentsJSON); err != nil {
+		if comments[i], err = decodeMemoryInteractions(post.CommentRecords); err != nil {
 			return response, err
 		}
 		plan.add(post.Author, post.ImageID)

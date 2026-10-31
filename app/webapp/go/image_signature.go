@@ -33,7 +33,7 @@ func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	return key, nil
 }
 
-func computeImageSignature(key []byte, imageID string, exp int64) []byte {
+func computeImageSignatureGeneric(key []byte, imageID string, exp int64) []byte {
 	// hmac.New を 1 回だけにして Reset で使い回す(鍵の前処理を毎回やり直さない)。結果は同じ。
 	mac := hmac.New(sha256.New, key)
 	value := []byte(strconv.FormatInt(exp, 10) + ":" + imageID)
