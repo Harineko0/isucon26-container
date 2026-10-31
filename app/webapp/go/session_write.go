@@ -19,6 +19,13 @@ func init() {
 		"DELETE /api/me/profile-image",
 		"POST /api/me/account-deletion",
 		"POST /api/friend-requests/:requestId/:action",
+		"GET /api/posts/me/current",
+		"GET /api/posts/:postId",
+		"PATCH /api/posts/:postId",
+		"DELETE /api/posts/:postId",
+		"GET /api/feeds/:feed",
+		"DELETE /api/comments/:commentId",
+		"DELETE /api/realmojis/:realMojiId",
 	} {
 		deferredSessionRoutes[route] = true
 	}

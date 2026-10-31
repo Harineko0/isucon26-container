@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"errors"
 	"image/jpeg"
 	"mime/multipart"
 	"net/http"
@@ -217,25 +216,32 @@ type getMyCurrentPostResponse createPostResponse
 
 func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		var posts []PostWithAuthor
-		err := h.DB.SelectContext(ctx, &posts, `
-   SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
-   FROM posts p
-   JOIN posting_windows w ON w.id = p.posting_window_id
-   JOIN users u ON u.id = p.author_id AND u.status = 'active'
-   JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
-                              AND current.local_date = w.local_date
-   WHERE p.author_id = $1 AND p.deleted_at IS NULL
-  `, userID)
-		if err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Found      bool    `db:"found"`
+			PostWithAuthor
+		}
+		if err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, `
+   SELECT s.sess_region, r.id IS NOT NULL AS found,
+          `+postWithAuthorColumnsCoalesced("r")+`
+   FROM {session}
+   LEFT JOIN LATERAL (
+     SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+     FROM posts p
+     JOIN posting_windows w ON w.id = p.posting_window_id
+     JOIN users u ON u.id = p.author_id AND u.status = 'active'
+     JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                                AND current.local_date = w.local_date
+     WHERE p.author_id = s.sess_user_id AND p.deleted_at IS NULL
+     LIMIT 1
+   ) r ON true
+  `); err != nil {
 			return err
 		}
-		if len(posts) == 0 {
+		if !row.Found {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
-		post, user := posts[0].Post, posts[0].Author
+		post, user := row.Post, row.Author
 		if err := user.setImageKey(); err != nil {
 			return err
 		}
@@ -255,22 +261,32 @@ func getPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		post, err, viewer, viewerErr := loadPostAndViewer(ctx, h.DB, input.PostID, GetSession(c).UserID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "post_not_found")
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Found      bool    `db:"found"`
+			PostWithAuthor
 		}
-		if err != nil {
+		if err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, `
+   SELECT s.sess_region, r.id IS NOT NULL AS found,
+          `+postWithAuthorColumnsCoalesced("r")+`
+   FROM {session}
+   LEFT JOIN LATERAL (
+     SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+     FROM isureal_post_access(s.sess_user_id, $1) a
+     JOIN posts p ON a.can_view AND p.id = $1 AND p.deleted_at IS NULL
+     JOIN posting_windows w ON w.id = p.posting_window_id
+     JOIN users u ON u.id = p.author_id AND u.status = 'active'
+   ) r ON true
+  `, input.PostID); err != nil {
 			return err
 		}
-		err = viewerErr
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if err != nil || !viewer.canView(post.Post) {
+		if !row.Found {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
-		return c.JSON(http.StatusOK, getPostResponse(newPostResponse(post.Post, post.Author)))
+		if err := row.Author.setImageKey(); err != nil {
+			return err
+		}
+		return c.JSON(http.StatusOK, getPostResponse(newPostResponse(row.Post, row.Author)))
 	}
 }
 
@@ -302,9 +318,16 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 		}
 		ctx := c.Request().Context()
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_update_post($1, $2, $3, $4)`, GetSession(c).UserID, input.PostID, input.Caption, input.Visibility); err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_update_post({user}, $1, $2, $3) AS result)`, input.PostID, input.Caption, input.Visibility); err != nil {
 			return err
+		}
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
 		}
 		switch result {
 		case "ok":
@@ -332,9 +355,16 @@ func deletePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		var result string
-		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_post($1, $2)`, GetSession(c).UserID, input.PostID); err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_post({user}, $1) AS result)`, input.PostID); err != nil {
 			return err
+		}
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
 		}
 		switch result {
 		case "ok":
