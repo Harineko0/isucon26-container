@@ -4,7 +4,11 @@ CREATE INDEX IF NOT EXISTS administrator_sessions_token_hash ON administrator_se
 DROP INDEX IF EXISTS users_username;
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users(username);
 CREATE INDEX IF NOT EXISTS users_region_active ON users(region) WHERE status = 'active';
-CREATE INDEX IF NOT EXISTS friendships_user_high_id ON friendships(user_high_id);
+-- user_high_id からの逆引き (mutual、フィードの friends_of_friends 判定、閲覧可否) は相手の user_low_id も読むので、
+-- (user_high_id, user_low_id) にして Index Only Scan にする (以前は 1 行ごとにヒープを読んでいた)。
+-- user_high_id 単独の索引はこれで代わる。friendships は 2.5 万行 (6MB) なので作成は 0.1 秒未満。
+CREATE INDEX IF NOT EXISTS friendships_high_low ON friendships(user_high_id, user_low_id);
+DROP INDEX IF EXISTS friendships_user_high_id;
 CREATE INDEX IF NOT EXISTS follows_followee_id ON follows(followee_id);
 CREATE INDEX IF NOT EXISTS block_relations_blocked_id ON block_relations(blocked_id);
 CREATE INDEX IF NOT EXISTS friend_requests_recipient_status ON friend_requests(recipient_id, status);

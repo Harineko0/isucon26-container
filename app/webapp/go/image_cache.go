@@ -179,6 +179,10 @@ func (c *imageDataCache) get(id string) ([]byte, bool) {
 		c.put(id, data)
 		return data, true
 	}
+	if data, ok := readImageFromStore(id); ok {
+		c.put(id, data)
+		return data, true
+	}
 	return nil, false
 }
 

@@ -80,7 +80,7 @@ func imageQueryFor(rel string) string {
 	}
 	q := strings.ReplaceAll(`
    SELECT u.secret_key_hash, i.media_type, i.created_at, i.tableoid::regclass::text AS partition,
-     CASE WHEN $2 THEN NULL ELSE i.data END AS data, COALESCE(
+     CASE WHEN $2 THEN NULL ELSE i.data END AS data, i.stored_region, COALESCE(
      u.profile_image_id = i.id
      OR EXISTS (
        SELECT 1 FROM posts p

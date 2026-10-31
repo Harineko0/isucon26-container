@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -21,10 +22,10 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
 		// 投稿一覧は利用者の取得に依存しないので並行に取り、往復を 1 回分に重ねる。
-		// 参照実装は image_objects と内部結合するので、画像の行が無い投稿は含めない。以前はここで
-		// EXISTS (image_objects) を投稿ごとに評価していたが、image_objects は 40 余りのパーティションなので
-		// 投稿ごとに全パーティションの Append を再走査し、1 回 189ms (ベンチ中の平均) かかっていた。
-		// 画像の行の有無は、下で本体を取るときに分かる (手元に無い画像だけ DB に聞く) ので、そこで除く。
+		// 参照実装は image_objects と JOIN して「画像がある投稿」だけを出していたが、その判定は SQL では行わず、
+		// 下で画像を集めたあとに画像が見つからなかった投稿を外す (結果は同じ)。SQL で EXISTS を引くと、投稿ごとに
+		// image_objects の索引を 1 回ずつ引き、export の読み取りの約 6 割 (実測 1 回 331 件で 206 ページを disk から) を占めていた。
+		// 投稿画像は isureal_create_post で投稿と同じトランザクションで作られ、投稿画像を消す処理は無いので、実際に外れる投稿は無い。
 		var posts []Post
 		postsDone := make(chan error, 1)
 		go func() {
@@ -60,51 +61,72 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 			// 投稿画像の created_at は投稿時刻と同じなので、(id, created_at) で引いてパーティションを絞る。
 			// 一致しないものがあれば id だけで引き直す。
 			var rows []struct {
-				ID        string    `db:"id"`
-				Data      []byte    `db:"data"`
-				CreatedAt time.Time `db:"created_at"`
+				ID           string    `db:"id"`
+				Data         []byte    `db:"data"`
+				StoredRegion *string   `db:"stored_region"`
+				CreatedAt    time.Time `db:"created_at"`
 			}
 			if err := h.DB.SelectContext(ctx, &rows, `
-    SELECT i.id, i.data, i.created_at FROM unnest($1::text[], $2::timestamptz[]) AS k(id, created_at)
+    SELECT i.id, i.data, i.stored_region, i.created_at FROM unnest($1::text[], $2::timestamptz[]) AS k(id, created_at)
     JOIN image_objects i ON i.id = k.id AND i.created_at = k.created_at
    `, missingIDs, missingAt); err != nil {
 				return err
 			}
-			for _, row := range rows {
-				images[row.ID] = row.Data
-				imageDataStore.put(row.ID, row.Data)
-				saveInitialImageToDisk(row.ID, row.CreatedAt, row.Data)
-			}
 			rest := make([]string, 0)
+			seen := make(map[string]bool, len(rows))
+			for _, row := range rows {
+				seen[row.ID] = true
+			}
 			for _, id := range missingIDs {
-				if _, ok := images[id]; !ok {
+				if !seen[id] {
 					rest = append(rest, id)
 				}
 			}
 			if len(rest) > 0 {
 				// 固定の SQL にして、件数ごとに文が変わって Prepare の往復が増えるのを避ける。
-				rows = rows[:0]
-				if err := h.DB.SelectContext(ctx, &rows, `SELECT id, data, created_at FROM image_objects WHERE id = ANY($1)`, rest); err != nil {
+				// rows に追記される (sqlx の Select はスライスに append する) ので、下のループで両方をまとめて扱う。
+				if err := h.DB.SelectContext(ctx, &rows, `SELECT id, data, stored_region, created_at FROM image_objects WHERE id = ANY($1)`, rest); err != nil {
 					return err
 				}
-				for _, row := range rows {
+			}
+			// 本体が stored_region のサーバーのディスクにあるもの (image_store.go) は並行して取る。
+			var mu sync.Mutex
+			var wg sync.WaitGroup
+			var fetchErr error
+			for _, row := range rows {
+				if row.StoredRegion == nil || len(row.Data) > 0 {
 					images[row.ID] = row.Data
 					imageDataStore.put(row.ID, row.Data)
 					saveInitialImageToDisk(row.ID, row.CreatedAt, row.Data)
+					continue
 				}
+				wg.Add(1)
+				go func(id, region string) {
+					defer wg.Done()
+					data, err := loadStoredImage(id, region, h.Config.Region)
+					mu.Lock()
+					defer mu.Unlock()
+					if err != nil {
+						fetchErr = err
+						return
+					}
+					images[id] = data
+				}(row.ID, *row.StoredRegion)
+			}
+			wg.Wait()
+			if fetchErr != nil {
+				return fetchErr
 			}
 		}
 
-		// 画像の行が無い投稿は除く (参照実装の内部結合と同じ)。投稿画像は消されないので通常は 0 件。
-		if len(images) < len(posts) {
-			kept := make([]Post, 0, len(images))
-			for _, post := range posts {
-				if _, ok := images[post.ImageID]; ok {
-					kept = append(kept, post)
-				}
+		// 画像が見つからなかった投稿は出さない (参照実装の JOIN image_objects と同じ)。
+		kept := posts[:0]
+		for _, post := range posts {
+			if _, ok := images[post.ImageID]; ok {
+				kept = append(kept, post)
 			}
-			posts = kept
 		}
+		posts = kept
 
 		plan := newSignaturePlan()
 		plan.addProfile(author)
