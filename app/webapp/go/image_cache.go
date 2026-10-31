@@ -231,6 +231,14 @@ func (c *imageDataCache) get(id string) ([]byte, bool) {
 	return nil, false
 }
 
+// putUpload はファイルを直接配信できないときだけ、アップロードした本体をヒープに保持する。
+// ディスクに永続化できた画像は locate から nginx に渡す。
+func (c *imageDataCache) putUpload(id string, data []byte, storedRegion *string) {
+	if storedRegion == nil || !imageAccelEnabled {
+		c.put(id, data)
+	}
+}
+
 func (c *imageDataCache) put(id string, data []byte) {
 	if data == nil || len(data) > imageDataMaxEntryBytes {
 		return

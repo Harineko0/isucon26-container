@@ -46,7 +46,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			discardUploadedImage(imageID, storedRegion)
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
-		imageDataStore.put(imageID, data)
+		imageDataStore.putUpload(imageID, data, storedRegion)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
