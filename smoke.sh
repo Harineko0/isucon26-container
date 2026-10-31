@@ -1,8 +1,9 @@
 #!/bin/bash
 # ルーター経由で主要 API を一通り叩く簡易スモークテスト。最後に initialize で元に戻す。
 set -u
+. "$(dirname "$0")/ci/guard.sh"
+IMG=${IMG:-$(dirname "$0")/ci/bench/test.jpg}
 R=http://35.73.68.236:8080
-IMG=${IMG:-/private/tmp/claude-501/-Users-hari-proj-isucon26/cbfe4815-0498-4588-91b7-438e9a4643b6/scratchpad/test.jpg}
 S=$$
 j() { curl -s -H 'Content-Type: application/json' "$@"; }
 code() { curl -s -o /dev/null -w "%{http_code}" "$@"; }

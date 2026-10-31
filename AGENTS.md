@@ -9,7 +9,15 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 ## 競技の基本
 
 - 10:00 開始 / 17:00 リーダーボード凍結 / 18:00 終了。**最終スコア = 最後に回したベンチ**（FAIL なら記録なし）。17:30 以降は安定版のみ回す。
-- ベンチはポータルから実行（<https://portal.isucon.net/contestant/benchmark_jobs>）。WAITING/RUNNING の間は次を投げられない＝チームで同時に 1 本。1 回あたり約 2 分。初回スコアは #448 の **3465**（10:17、無改修）。
+- ベンチはポータル（<https://portal.isucon.net/contestant/benchmark_jobs>）のジョブとして走る。PENDING/RUNNING の間は次を投げられない＝チームで同時に 1 本。1 回あたり約 2 分。初回スコアは #448 の **3465**（10:17、無改修）。
+
+## ベンチとデプロイは CI だけ（[ci/README.md](ci/README.md)）
+
+- **PR は isucon26-container に作り、`/bench [メモ]` とコメントする**。app の変更は `app/` の中でブランチを切って isucon26 に push し、container の PR でサブモジュールの指す commit を進める。CI は PR の head と、その `app/` が指す commit をデプロイする。main の基準値は `gh workflow run bench.yml -R Harineko0/isucon26-container`。
+- CI が到着順に 1 本ずつ「デプロイ → initialize 確認 → ベンチ → 改変チェック」を行い、結果を PR コメントと `bench-results` ブランチの `results.jsonl` に残す。
+- 手元から `deploy.sh` / `infra/deploy.sh` / `smoke.sh` を実行しない、ポータルの Enqueue を押さない、サーバで再起動・設定変更・DB 書き込みをしない。他の人のベンチ中にサーバが変わると、どの変更でスコアが動いたか分からなくなる。スクリプトのガードと Claude Code の hook（`.claude/hooks/guard-bench.py`）が止める。
+- 読み取り（ssh での `journalctl` / `top` / `cat`、DB への `SELECT` / `EXPLAIN`、ルーターへの GET、`infra/deploy.sh -n`）は自由。
+- 17:30 以降は main 以外のベンチを CI が拒否する。
 - スコア = Σ(採点件数 × 配点 × リージョン倍率)。倍率は asia 1 / **europe 1.5 / america 1.5**。配点表は manual.md「スコアの計算」。
 
 ## 環境（CloudFormation スタック `isucon-prod-2`、ap-northeast-1）
@@ -42,8 +50,8 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
   | `app-europe/` | europe1 | <https://github.com/Harineko0/isucon26-europe> | `ISUREAL_REGION=europe`、`ISUREAL_LOG_LEVEL=info` |
   | `app-america/` | america1 | <https://github.com/Harineko0/isucon26-america> | `ISUREAL_REGION=america` |
 
-  `app-europe/` と `app-america/` は各サーバの初期状態（`init` コミット）のまま。改善中のコードは `app/` にあり、ルートの `deploy.sh` は `app/webapp` の Go と SQL を 3 台すべてに配る。
-- `/home` 以外の設定（nginx、systemd unit、sysctl、PostgreSQL）は `infra/` で管理する。サーバ上で直接編集せず、`infra/` を直して `infra/deploy.sh` で配る。使い方は [infra/README.md](infra/README.md)。
+  `app-europe/` と `app-america/` は各サーバの初期状態（`init` コミット）のまま。改善中のコードは `app/` にあり、ルートの `deploy.sh` は `app/webapp` の Go と SQL を 3 台すべてに配る（CI だけが実行する）。
+- `/home` 以外の設定（nginx、systemd unit、sysctl、PostgreSQL）は `infra/` で管理する。サーバ上で直接編集せず、`infra/` を直して PR にし、`/bench` で配る（`infra/deploy.sh` は CI が実行する）。使い方は [infra/README.md](infra/README.md)。
 - 稼働中は Go 実装（`isureal-go.service`、`:8080`、前段に nginx）。`webapp/{go,rust,nodejs,perl,php,python,ruby}` は同一 API の参照実装で、Rust 版は `xxx.go` ⇔ `src/xxx.rs` でファイル名・SQL・ロック順が揃っている。
 - 設定は `/home/isucon/env.sh`（`ISUREAL_REGION` / `ISUREAL_DB_*`、`ISUREAL_LOG_LEVEL`）。region 値はサーバごとに異なる。
 - ビルド: `cd app/webapp/go && make`（`go build -o isureal cmd/isureal/main.go`）。Rust は `cd app/webapp/rust && make` / `make lint`。Go にも Rust にもテストは同梱されていない。

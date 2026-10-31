@@ -9,6 +9,8 @@
 | `hosts/<host>/` | そのホストだけ（`app/` `db/` の同じパスより優先） |
 | `notes/` | 配らない。設定変更の経緯メモ |
 
+反映（`infra/deploy.sh` の実行）は CI だけが行う。PR に `/bench` とコメントする（[ci/README.md](../ci/README.md)）。手元では `-n` の差分表示と `pull.sh` だけを使う。
+
 ```bash
 infra/pull.sh -n                     # リポジトリとサーバの差分を見る（全台）
 infra/deploy.sh -n                   # 配ると変わるファイルを見る

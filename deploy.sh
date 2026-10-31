@@ -1,6 +1,7 @@
 #!/bin/bash
 # app/webapp の Go と SQL を 3 台のアプリサーバに配って再起動する。
 set -eu
+. "$(dirname "$0")/ci/guard.sh"
 cd "$(dirname "$0")/app/webapp"
 KEY=~/.ssh/id_ed25519_github
 HOSTS="${HOSTS:-13.159.52.104 52.199.206.161 52.197.40.86}"

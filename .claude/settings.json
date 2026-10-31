@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|mcp__claude-in-chrome__navigate|mcp__claude-in-chrome__javascript_tool|mcp__Claude_Browser__navigate|mcp__Claude_Browser__javascript_tool",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-bench.py"
+          }
+        ]
+      }
+    ]
+  }
+}

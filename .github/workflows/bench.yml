@@ -1,0 +1,153 @@
+# ベンチマークは必ずここから回す（ポータルの Enqueue と手元からのデプロイはしない）。
+#
+# - PR に `/bench [メモ]` とコメント → PR の head（infra/ 等）と、その commit が指す app サブモジュール
+# - 手動: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...] [-f app_ref=...]
+#
+# run は到着順に 1 本ずつ進む（ci/bench/queue.sh）。結果は PR コメントと bench-results ブランチの
+# results.jsonl に残る。詳細は ci/README.md。
+name: bench
+run-name: >-
+  bench ${{ github.event_name == 'issue_comment' && format('#{0}', github.event.issue.number)
+  || format('{0}{1}', inputs.container_ref, inputs.app_ref != '' && format(' app@{0}', inputs.app_ref) || '') }}
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      container_ref:
+        description: このリポジトリの ref / sha
+        default: main
+      app_ref:
+        description: app（Harineko0/isucon26）の ref / sha。空ならサブモジュールが指す commit
+        default: ""
+      note:
+        description: メモ（コメントに載る）
+        default: ""
+
+permissions:
+  contents: write # bench-results ブランチへの記録
+  issues: write
+  pull-requests: write
+  actions: read # queue.sh が run 一覧を読む
+
+env:
+  APP_REPO: Harineko0/isucon26
+
+jobs:
+  bench:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/bench') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180 # キュー待ちを含む
+    env:
+      COMMENT_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ secrets.BENCH_GH_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          IN_CONTAINER_REF: ${{ inputs.container_ref }}
+          IN_APP_REF: ${{ inputs.app_ref }}
+          IN_NOTE: ${{ inputs.note }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -eu
+          STATE_DIR=$RUNNER_TEMP/bench
+          mkdir -p "$STATE_DIR"
+          pr_number= app_ref=
+          if [ "$EVENT" = issue_comment ]; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null || true
+            pr_number=$ISSUE_NUMBER
+            container_ref=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .head.sha)
+            note=$(head -n1 <<<"$COMMENT_BODY" | sed 's|^/bench *||')
+          else
+            container_ref=${IN_CONTAINER_REF:-main} app_ref=$IN_APP_REF note=$IN_NOTE
+          fi
+          container_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$container_ref" --jq .sha)
+          if [ -n "$app_ref" ]; then
+            app_sha=$(GH_TOKEN=$APP_TOKEN gh api "repos/$APP_REPO/commits/$app_ref" --jq .sha)
+          else
+            # サブモジュールの gitlink（この commit が指す app の commit）
+            app_sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/app?ref=$container_sha" --jq .sha)
+          fi
+          if [ -n "$pr_number" ]; then
+            label="#$pr_number"
+          elif [ "$container_ref" = main ] && [ -z "$app_ref" ]; then
+            label=main
+          else
+            label="container@${container_sha:0:7} app@${app_sha:0:7}"
+          fi
+          jq -n --arg label "$label" --arg pr_repo "$GITHUB_REPOSITORY" --arg pr_number "$pr_number" \
+            --arg app_repo "$APP_REPO" --arg app_sha "$app_sha" \
+            --arg container_repo "$GITHUB_REPOSITORY" --arg container_sha "$container_sha" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg note "$note" --arg actor "$ACTOR" '$ARGS.named' >"$STATE_DIR/meta.json"
+          cat "$STATE_DIR/meta.json"
+          {
+            echo "STATE_DIR=$STATE_DIR"
+            echo "HISTORY=$STATE_DIR/results.jsonl"
+            echo "PR_REPO=$GITHUB_REPOSITORY"
+            echo "PR_NUMBER=$pr_number"
+            echo "APP_SHA=$app_sha"
+            echo "CONTAINER_SHA=$container_sha"
+            echo "LABEL=$label"
+          } >>"$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTAINER_SHA }}
+          fetch-depth: 0 # bench-results を fetch するため
+
+      - name: Checkout app (${{ env.APP_SHA }})
+        env:
+          TOKEN: ${{ secrets.BENCH_GH_TOKEN }}
+        run: |
+          rm -rf app
+          git clone -q --filter=blob:none "https://x-access-token:$TOKEN@github.com/$APP_REPO" app
+          git -C app checkout -q "$APP_SHA"
+
+      - name: Freeze check
+        env:
+          FREEZE_AT: ${{ vars.BENCH_FREEZE_AT || '2026-10-31T17:30:00+09:00' }}
+        run: |
+          if [ "$(date +%s)" -ge "$(date -d "$FREEZE_AT" +%s)" ] && [ "$LABEL" != main ]; then
+            ci/bench/stage.sh rejected "$FREEZE_AT 以降は main（安定版）しかベンチしません（最終スコア = 最後のベンチ）"
+            exit 1
+          fi
+
+      - name: Wait for my turn
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ON_WAIT: ci/bench/stage.sh queued
+        run: |
+          ci/bench/stage.sh queued
+          ci/bench/queue.sh
+          git fetch -q origin bench-results && git show FETCH_HEAD:results.jsonl >"$HISTORY" || : >"$HISTORY"
+
+      - name: Set up SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" >~/.ssh/id_ed25519_github
+          chmod 600 ~/.ssh/id_ed25519_github
+          printf 'Host *\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\n' >~/.ssh/config
+
+      - name: Deploy and benchmark
+        env:
+          PORTAL_COOKIE: ${{ secrets.PORTAL_COOKIE }}
+          PORTAL_TARGET_ID: ${{ vars.PORTAL_TARGET_ID || '1707' }}
+        run: ci/bench/run.sh
+
+      - name: Record and report
+        if: always()
+        env:
+          PORTAL_COOKIE: ${{ secrets.PORTAL_COOKIE }}
+        run: ci/bench/finalize.sh

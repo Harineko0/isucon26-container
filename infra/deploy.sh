@@ -12,6 +12,7 @@ set -eu
 
 DRY=
 if [ "${1:-}" = -n ]; then DRY=1; shift; fi
+[ -n "$DRY" ] || . "$(dirname "$0")/../ci/guard.sh"
 HOSTS="${*:-$ALL_HOSTS}"
 TS=$(date +%Y%m%d-%H%M%S)
 
