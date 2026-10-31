@@ -18,7 +18,7 @@ sleep 1
 
 "${PSQL[@]}" < 001-schema.sql >/dev/null 2>&1
 for pass in 1 2; do
-	for f in 002-indexes.sql 004-functions.sql 005-roundtrips.sql 006-image-storage.sql 007-feed-indexes.sql 008-image-partitions.sql; do
+	for f in 002-indexes.sql 007-image-location.sql 004-functions.sql 005-roundtrips.sql 006-image-storage.sql 007-feed-indexes.sql 008-image-partitions.sql; do  # init.sh と同じ順
 		"${PSQL[@]}" < "$f" >/dev/null 2>&1 || { echo "FAIL: $f (pass $pass)"; exit 1; }
 	done
 done
@@ -61,7 +61,7 @@ post_out_file=$(mktemp)
 # 背景で動かす側は -i を付けない (stdin が無いと docker exec -i が出力を落とすことがある)。
 docker exec "$NAME" psql -U postgres -d postgres -v ON_ERROR_STOP=1 -qAtX \
   -c "SELECT o_result || ':' || o_window_id
-  FROM isureal_create_post('u-active', 'img-1', 'post-1', '\\x00'::bytea, 'c', 'public', 'none', NULL, NULL, NULL)" >"$post_out_file" 2>&1 &
+  FROM isureal_create_post('u-active', 'img-1', 'post-1', '\\x00'::bytea, 'c', 'public', 'none', NULL, NULL, NULL, NULL)" >"$post_out_file" 2>&1 &
 post_pid=$!
 sleep 1
 locks=$("${PSQL[@]}" -c "SELECT locktype || ':' || granted::text FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
