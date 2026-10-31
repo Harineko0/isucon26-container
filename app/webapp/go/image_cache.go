@@ -28,10 +28,13 @@ const (
 	imageStoreAccelPrefix = "/_imgstore/"
 )
 
+// statImageFile は imageFileExists が使う stat (テストで呼び出しを数える)。
+var statImageFile = os.Stat
+
 // imageFileExists はディスクの画像ファイルが読める状態 (長さ > 0) かを stat だけで確かめる。
 // 長さ 0 は書きかけ (強制停止など) とみなす。一時ファイルは別名なので、見えるのは書き終えたものだけ。
 func imageFileExists(path string) bool {
-	fi, err := os.Stat(path)
+	fi, err := statImageFile(path)
 	return err == nil && fi.Mode().IsRegular() && fi.Size() > 0
 }
 
@@ -52,13 +55,32 @@ func (c *imageDataCache) locate(id string) (data []byte, accelURI string, ok boo
 		data, ok = c.get(id)
 		return data, "", ok
 	}
+	// 投稿された画像 (id の末尾がリージョンの印) はまず imgstore を見る。初期データの 180 万件が並ぶ
+	// imgcache を先に引くと、まず無い名前の検索でディレクトリのブロックを読みに行く。
+	// 初期データの id も 1/256 ずつの確率で同じ末尾になるので、imgstore に無ければ imgcache も見る。
+	_, tagged := imageRegionHint(id)
+	if tagged {
+		if uri, ok := storeAccelURI(id); ok {
+			return nil, uri, true
+		}
+	}
 	if path, ok := imageDiskPath(id); ok && imageFileExists(path) {
 		return nil, imageDiskAccelPrefix + id[:2] + "/" + id, true
 	}
-	if path, ok := storedImagePath(id); ok {
-		return nil, imageStoreAccelPrefix + filepath.Base(filepath.Dir(path)) + "/" + id, true
+	if !tagged {
+		if uri, ok := storeAccelURI(id); ok {
+			return nil, uri, true
+		}
 	}
 	return nil, "", false
+}
+
+func storeAccelURI(id string) (string, bool) {
+	path, ok := storedImagePath(id)
+	if !ok {
+		return "", false
+	}
+	return imageStoreAccelPrefix + filepath.Base(filepath.Dir(path)) + "/" + id, true
 }
 
 var imageIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
