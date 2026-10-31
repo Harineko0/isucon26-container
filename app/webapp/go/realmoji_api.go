@@ -183,20 +183,19 @@ func deleteRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_delete_realmoji($1, $2)`, actor, input.RealMojiID); err != nil {
+		// セッションとリージョンの確認と同じ 1 文で呼ぶ (#17)。
+		var row resultRow
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_realmoji({user}, $1) AS result)`, input.RealMojiID); err != nil {
 			return err
 		}
-		switch result {
+		switch row.result() {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "interaction_not_found")
 		case "forbidden":
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		default:
-			return fmt.Errorf("unexpected delete realmoji result: %s", result)
+			return fmt.Errorf("unexpected delete realmoji result: %s", row.result())
 		}
 		return c.NoContent(http.StatusNoContent)
 	}

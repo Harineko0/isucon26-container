@@ -81,3 +81,36 @@ BEGIN
               profile_image_id::text, region, account_type, status;
   IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; END IF;
 END $$;
+
+-- #17: PATCH /api/posts/:postId を「セッション確認 → isureal_update_post → 投稿と投稿者の再取得」の 3 往復から
+-- 1 文にする (Go 側は callWithSessionColumns)。更新は isureal_update_post そのもの (同じ順序・同じロック)。
+-- 'ok' のときだけ、更新後の投稿と投稿者を getPostWithAuthor と同じ条件で返す。plpgsql (VOLATILE) は文ごとに
+-- 新しいスナップショットを取るので、同じトランザクションで更新した後の値が読める。それ以外は o_result だけの 1 行。
+CREATE OR REPLACE FUNCTION isureal_update_post_returning(p_user text, p_post text, p_caption text, p_visibility text)
+RETURNS TABLE (
+  o_result text, o_id text, o_author_id text, o_posting_window_id text, o_image_id text, o_caption text,
+  o_visibility text, o_location_kind text, o_latitude numeric, o_longitude numeric, o_locality text,
+  o_posted_at timestamptz, o_on_time_deadline timestamptz, o_window_ended_at timestamptz,
+  o_user_id text, o_username text, o_secret_key_hash text, o_display_name text, o_bio text,
+  o_profile_image_id text, o_region text, o_account_type text, o_status text
+) LANGUAGE plpgsql AS $$
+DECLARE
+  v_result text;
+BEGIN
+  v_result := isureal_update_post(p_user, p_post, p_caption, p_visibility);
+  IF v_result = 'ok' THEN
+    RETURN QUERY
+      SELECT v_result, p.id::text, p.author_id::text, p.posting_window_id::text, p.image_id::text, p.caption,
+             p.visibility, p.location_kind, p.latitude, p.longitude, p.locality,
+             p.posted_at, w.on_time_deadline, w.ended_at,
+             u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
+             u.profile_image_id::text, u.region, u.account_type, u.status
+      FROM posts p
+      JOIN posting_windows w ON w.id = p.posting_window_id
+      JOIN users u ON u.id = p.author_id AND u.status = 'active'
+      WHERE p.id = p_post AND p.deleted_at IS NULL;
+    IF FOUND THEN RETURN; END IF;
+  END IF;
+  o_result := v_result;
+  RETURN NEXT;
+END $$;

@@ -249,28 +249,53 @@ type getPostRequest struct {
 
 type getPostResponse createPostResponse
 
+// getPostQuery は getWithSession に渡す GET /api/posts/:postId の 1 文。閲覧できないときも
+// 番兵の 1 行 (allowed = false、投稿の列は COALESCE の空値) を返す。
+var getPostQuery = `
+  SELECT s.sess_region, a.can_view AS allowed,
+         COALESCE(r.id, '') AS id, COALESCE(r.author_id, '') AS author_id,
+         COALESCE(r.posting_window_id, '') AS posting_window_id, COALESCE(r.image_id, '') AS image_id,
+         COALESCE(r.caption, '') AS caption, COALESCE(r.visibility, '') AS visibility,
+         COALESCE(r.location_kind, '') AS location_kind, r.latitude, r.longitude, r.locality,
+         COALESCE(r.posted_at, 'epoch') AS posted_at, COALESCE(r.on_time_deadline, 'epoch') AS on_time_deadline,
+         r.window_ended_at, ` + userColumnsCoalesced("r", "author") + `
+  FROM {session}
+  CROSS JOIN LATERAL isureal_post_access(s.sess_user_id, $1) a
+  LEFT JOIN LATERAL (
+    SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
+    FROM ` + postsWithWindowFrom + `
+    JOIN users u ON u.id = p.author_id AND u.status = 'active'
+    WHERE a.can_view AND p.id = $1 AND p.deleted_at IS NULL
+  ) r ON true`
+
 func getPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input getPostRequest
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		post, err, viewer, viewerErr := loadPostAndViewer(ctx, h.DB, input.PostID, GetSession(c).UserID)
+		// セッションの確認・閲覧可否 (isureal_post_access = viewerContext.canView と同じ判定)・投稿と投稿者の
+		// 取得を 1 文・接続 1 本で行う (#17)。以前は投稿と閲覧者の文脈 (友達の友達のペア全部) を別々の接続で
+		// 並行に取り、EU/US では投機的なセッション確認と合わせて GET 1 回で接続を 3 本使っていた。
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Allowed    bool    `db:"allowed"`
+			PostWithAuthor
+		}
+		err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, getPostQuery, input.PostID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		err = viewerErr
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if err != nil || !viewer.canView(post.Post) {
+		if !row.Allowed || row.ID == "" {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
-		return c.JSON(http.StatusOK, getPostResponse(newPostResponse(post.Post, post.Author)))
+		if err := row.Author.setImageKey(); err != nil {
+			return err
+		}
+		return c.JSON(http.StatusOK, getPostResponse(newPostResponse(row.Post, row.Author)))
 	}
 }
 
@@ -301,26 +326,49 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 				return NewAPIError(http.StatusBadRequest, "invalid_post")
 			}
 		}
-		ctx := c.Request().Context()
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_update_post($1, $2, $3, $4)`, GetSession(c).UserID, input.PostID, input.Caption, input.Visibility); err != nil {
+		// セッションとリージョンの確認・更新・更新後の投稿と投稿者の取得を 1 文で行う (#17)。
+		// 以前は「セッション確認 → isureal_update_post → getPostWithAuthor」の 3 往復だった。
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     string  `db:"result"`
+			PostWithAuthor
+		}
+		if err := callWithSessionColumns(c, h, &row, func() *string { return row.SessRegion }, updatePostReturningColumns,
+			`isureal_update_post_returning({user}, $1, $2, $3)`, input.PostID, input.Caption, input.Visibility); err != nil {
 			return err
 		}
-		switch result {
+		switch row.Result {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		default:
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
-		updated, err := getPostWithAuthor(ctx, h.DB, input.PostID)
-		if err != nil {
+		if row.ID == "" {
+			// 更新できたのに投稿者が active でない (以前の getPostWithAuthor の sql.ErrNoRows と同じく 500)。
+			return sql.ErrNoRows
+		}
+		if err := row.Author.setImageKey(); err != nil {
 			return err
 		}
-		post, user := updated.Post, updated.Author
-		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(post, user)))
+		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(row.Post, row.Author)))
 	}
 }
+
+// updatePostReturningColumns は isureal_update_post_returning の o_* を PostWithAuthor の列名で受ける選択リスト。
+// リージョン違いや 'ok' 以外では列が NULL になるので、NOT NULL の列は COALESCE で埋める (値は使わない)。
+const updatePostReturningColumns = `COALESCE(r.o_result, '') AS result,
+  COALESCE(r.o_id, '') AS id, COALESCE(r.o_author_id, '') AS author_id,
+  COALESCE(r.o_posting_window_id, '') AS posting_window_id, COALESCE(r.o_image_id, '') AS image_id,
+  COALESCE(r.o_caption, '') AS caption, COALESCE(r.o_visibility, '') AS visibility,
+  COALESCE(r.o_location_kind, '') AS location_kind, r.o_latitude AS latitude, r.o_longitude AS longitude,
+  r.o_locality AS locality, COALESCE(r.o_posted_at, 'epoch') AS posted_at,
+  COALESCE(r.o_on_time_deadline, 'epoch') AS on_time_deadline, r.o_window_ended_at AS window_ended_at,
+  COALESCE(r.o_user_id, '') AS "author.id", COALESCE(r.o_username, '') AS "author.username",
+  COALESCE(r.o_secret_key_hash, '') AS "author.secret_key_hash", COALESCE(r.o_display_name, '') AS "author.display_name",
+  COALESCE(r.o_bio, '') AS "author.bio", r.o_profile_image_id AS "author.profile_image_id",
+  COALESCE(r.o_region, '') AS "author.region", COALESCE(r.o_account_type, '') AS "author.account_type",
+  COALESCE(r.o_status, '') AS "author.status"`
 
 type deletePostRequest struct {
 	PostID string `param:"postId" json:"-"`
@@ -332,11 +380,12 @@ func deletePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		var result string
-		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_post($1, $2)`, GetSession(c).UserID, input.PostID); err != nil {
+		// セッションとリージョンの確認と同じ 1 文で呼ぶ (#17)。
+		var row resultRow
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_post({user}, $1) AS result)`, input.PostID); err != nil {
 			return err
 		}
-		switch result {
+		switch row.result() {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")

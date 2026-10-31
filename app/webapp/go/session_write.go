@@ -19,6 +19,11 @@ func init() {
 		"DELETE /api/me/profile-image",
 		"POST /api/me/account-deletion",
 		"POST /api/friend-requests/:requestId/:action",
+		"DELETE /api/comments/:commentId",
+		"DELETE /api/realmojis/:realMojiId",
+		"DELETE /api/posts/:postId",
+		"PATCH /api/posts/:postId",
+		"GET /api/posts/:postId",
 	} {
 		deferredSessionRoutes[route] = true
 	}
@@ -53,4 +58,18 @@ func callWithSessionAnyRegion(c *echo.Context, h *HandlerContext, dest any, call
 		return NewAPIError(http.StatusUnauthorized, "invalid_session")
 	}
 	return err
+}
+
+// resultRow はスカラーを返す関数を `(SELECT f({user}, ...) AS result)` の形で callWithSession に渡したときの行。
+// リージョン違いでは関数が呼ばれず result が NULL になるので、ポインタで受ける (#53)。
+type resultRow struct {
+	SessRegion *string `db:"sess_region"`
+	Result     *string `db:"result"`
+}
+
+func (r resultRow) result() string {
+	if r.Result == nil {
+		return ""
+	}
+	return *r.Result
 }

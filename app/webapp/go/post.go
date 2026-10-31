@@ -179,20 +179,6 @@ func splitIDs(value *string) []string {
 	return strings.Split(*value, ",")
 }
 
-// loadPostAndViewer は投稿と閲覧者の情報を別々のコネクションで並行に取る(往復を重ねる)。
-func loadPostAndViewer(ctx context.Context, db *sqlx.DB, postID, viewerID string) (PostWithAuthor, error, viewerContext, error) {
-	var post PostWithAuthor
-	var postErr error
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		post, postErr = getPostWithAuthor(ctx, db, postID)
-	}()
-	viewer, viewerErr := loadViewerContext(ctx, db, viewerID)
-	<-done
-	return post, postErr, viewer, viewerErr
-}
-
 func (viewer viewerContext) canView(post Post) bool {
 	if post.AuthorID == viewer.ID {
 		return true
