@@ -40,11 +40,7 @@ BEGIN
     -- 利用者が存在しなければ外部キー違反(23503) → 'no_user'(従来と同じ結果)。
     INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at, stored_region)
     VALUES (p_image_id, p_user_id, p_data, 'image/jpeg', v_image_at, p_stored_region);
-    PERFORM 1 FROM users WHERE id = p_user_id FOR NO KEY UPDATE;
-    IF NOT FOUND THEN
-      v_fail := 'no_user'; RAISE SQLSTATE 'IR001';
-    END IF;
-    SELECT * INTO u FROM users WHERE id = p_user_id AND status = 'active';
+    SELECT * INTO u FROM users WHERE id = p_user_id AND status = 'active' FOR NO KEY UPDATE;
     IF NOT FOUND THEN
       v_fail := 'no_user'; RAISE SQLSTATE 'IR001';
     END IF;
@@ -81,12 +77,11 @@ BEGIN
   INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                      location_kind, latitude, longitude, locality, posted_at)
   VALUES (p_post_id, p_user_id, w.id, p_image_id, p_caption, p_visibility,
-          p_location_kind, p_latitude, p_longitude, p_locality, v_posted_at);
-  SELECT 'ok', w.id, w.on_time_deadline, p.posted_at, p.latitude::double precision, p.longitude::double precision, p.locality,
+          p_location_kind, p_latitude, p_longitude, p_locality, v_posted_at)
+  RETURNING 'ok', w.id, w.on_time_deadline, posts.posted_at, posts.latitude::double precision, posts.longitude::double precision, posts.locality,
          u.id, u.username, u.secret_key_hash, u.display_name, u.bio, u.profile_image_id, u.region, u.account_type, u.status
   INTO o_result, o_window_id, o_on_time_deadline, o_posted_at, o_latitude, o_longitude, o_locality,
-       o_id, o_username, o_secret_key_hash, o_display_name, o_bio, o_profile_image_id, o_region, o_account_type, o_status
-  FROM posts p WHERE p.id = p_post_id;
+       o_id, o_username, o_secret_key_hash, o_display_name, o_bio, o_profile_image_id, o_region, o_account_type, o_status;
   RETURN NEXT;
 END $$;
 
@@ -126,12 +121,13 @@ BEGIN
   -- users_username_key(UNIQUE)で一意性を保証するので、テーブルロックは取らない。
   INSERT INTO users (id, username, secret_key_hash, display_name, region)
   VALUES (p_user_id, p_username, p_secret_key_hash, p_display_name, p_region)
-  ON CONFLICT (username) DO NOTHING;
+  ON CONFLICT (username) DO NOTHING
+  RETURNING 'ok', id::text, username::text, display_name, bio, region, account_type, status
+  INTO o_result, o_id, o_username, o_display_name, o_bio, o_region, o_account_type, o_status;
   IF NOT FOUND THEN
     o_result := 'username_taken'; RETURN NEXT; RETURN;
   END IF;
-  RETURN QUERY SELECT 'ok'::text, u.id::text, u.username::text, u.display_name, u.bio, u.region, u.account_type, u.status
-  FROM users u WHERE u.id = p_user_id;
+  RETURN NEXT;
 END $$;
 
 -- 2 人の関係(友達申請・友達・フォロー・ブロック)の変更は、2 人組(順不同)の advisory lock で直列化する。
@@ -185,15 +181,14 @@ BEGIN
     LIMIT 1;
     IF FOUND THEN
       IF v_req.requester_id = p_actor THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
-      UPDATE friend_requests SET status = 'accepted', updated_at = clock_timestamp() WHERE id = v_req.id;
+      UPDATE friend_requests SET status = 'accepted', updated_at = clock_timestamp() WHERE id = v_req.id RETURNING * INTO v_req;
       INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
       VALUES (gen_random_uuid()::text, least(v_req.requester_id, v_req.recipient_id), greatest(v_req.requester_id, v_req.recipient_id), v_req.id);
     ELSE
       INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
-      VALUES (p_new_id, p_actor, p_target, 'pending', clock_timestamp(), clock_timestamp());
-      v_req.id := p_new_id;
+      VALUES (p_new_id, p_actor, p_target, 'pending', clock_timestamp(), clock_timestamp()) RETURNING * INTO v_req;
     END IF;
-    RETURN QUERY SELECT 'ok'::text, r.id::text, r.status, r.updated_at FROM friend_requests r WHERE r.id = v_req.id;
+    RETURN QUERY SELECT 'ok'::text, v_req.id::text, v_req.status, v_req.updated_at;
     RETURN;
   ELSIF p_action = 'follow' THEN
     SELECT account_type INTO v_type FROM users WHERE id = p_target AND status = 'active';
@@ -248,8 +243,8 @@ BEGIN
     INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
     VALUES (gen_random_uuid()::text, least(v_req.requester_id, v_req.recipient_id), greatest(v_req.requester_id, v_req.recipient_id), v_req.id);
   END IF;
-  UPDATE friend_requests SET status = p_status, updated_at = clock_timestamp() WHERE id = v_req.id;
-  RETURN QUERY SELECT 'ok'::text, r.id::text, r.status, r.updated_at FROM friend_requests r WHERE r.id = v_req.id;
+  RETURN QUERY UPDATE friend_requests SET status = p_status, updated_at = clock_timestamp() WHERE id = v_req.id
+    RETURNING 'ok'::text, id::text, status, updated_at;
 END $$;
 
 -- viewerContext.canView / canComment と同じ判定。
@@ -270,12 +265,15 @@ BEGIN
   SELECT ended_at INTO w_ended FROM posting_windows WHERE id = p.posting_window_id;
   SELECT * INTO v FROM users WHERE id = p_viewer AND status = 'active';
   IF NOT FOUND THEN RETURN; END IF;
+  IF w_ended IS NOT NULL THEN
+    can_view := p.author_id = v.id;
+    RETURN;
+  END IF;
   posted := EXISTS(
     SELECT 1 FROM posts pp
     JOIN posting_windows pw ON pw.id = pp.posting_window_id
     JOIN posting_windows cur ON cur.region = v.region AND cur.ended_at IS NULL AND cur.local_date = pw.local_date
     WHERE pp.author_id = v.id AND pp.deleted_at IS NULL);
-  is_friend := EXISTS(SELECT 1 FROM friendships WHERE user_low_id = least(v.id, p.author_id) AND user_high_id = greatest(v.id, p.author_id));
   IF p.author_id = v.id THEN
     can_view := true;
   ELSIF w_ended IS NOT NULL OR NOT posted
@@ -283,14 +281,17 @@ BEGIN
     can_view := false;
   ELSIF p.visibility = 'public' THEN
     can_view := true;
-  ELSIF p.visibility = 'friends' THEN
-    can_view := is_friend;
-  ELSIF p.visibility = 'friends_of_friends' THEN
-    can_view := is_friend OR EXISTS(
+  ELSE
+    is_friend := EXISTS(SELECT 1 FROM friendships WHERE user_low_id = least(v.id, p.author_id) AND user_high_id = greatest(v.id, p.author_id));
+    IF p.visibility = 'friends' THEN
+      can_view := is_friend;
+    ELSIF p.visibility = 'friends_of_friends' THEN
+      can_view := is_friend OR EXISTS(
       SELECT 1 FROM friendships f1
       CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = v.id THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
       JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p.author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p.author_id)
       WHERE f1.user_low_id = v.id OR f1.user_high_id = v.id);
+    END IF;
   END IF;
   IF can_view AND w_ended IS NULL THEN
     IF v.id = p.author_id THEN
@@ -341,12 +342,11 @@ BEGIN
   UPDATE realmojis SET replaced_at = clock_timestamp()
   WHERE post_id = p_post AND reactor_id = p_actor AND replaced_at IS NULL AND deleted_at IS NULL;
   INSERT INTO realmojis (id, post_id, reactor_id, image_id, reaction_type, created_at)
-  VALUES (p_id, p_post, p_actor, p_image_id, p_reaction_type, clock_timestamp());
+  VALUES (p_id, p_post, p_actor, p_image_id, p_reaction_type, clock_timestamp()) RETURNING created_at INTO o_created_at;
   SELECT * INTO u FROM users WHERE id = p_actor AND status = 'active';
   IF NOT FOUND THEN RAISE EXCEPTION 'reactor not found'; END IF;
-  RETURN QUERY SELECT 'ok'::text, r.created_at, u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
-    u.profile_image_id::text, u.region, u.account_type, u.status
-  FROM realmojis r WHERE r.id = p_id;
+  RETURN QUERY SELECT 'ok'::text, o_created_at, u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
+    u.profile_image_id::text, u.region, u.account_type, u.status;
 END $$;
 
 -- o_result: ok / forbidden(403 interaction_forbidden)
@@ -374,12 +374,11 @@ BEGIN
   IF NOT (SELECT can_comment FROM isureal_post_access(p_actor, p_post)) THEN
     o_result := 'forbidden'; RETURN NEXT; RETURN;
   END IF;
-  INSERT INTO comments (id, post_id, author_id, body, created_at) VALUES (p_id, p_post, p_actor, p_body, clock_timestamp());
+  INSERT INTO comments (id, post_id, author_id, body, created_at) VALUES (p_id, p_post, p_actor, p_body, clock_timestamp()) RETURNING created_at INTO o_created_at;
   SELECT * INTO u FROM users WHERE id = p_actor AND status = 'active';
   IF NOT FOUND THEN RAISE EXCEPTION 'comment author not found'; END IF;
-  RETURN QUERY SELECT 'ok'::text, c.created_at, u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
-    u.profile_image_id::text, u.region, u.account_type, u.status
-  FROM comments c WHERE c.id = p_id;
+  RETURN QUERY SELECT 'ok'::text, o_created_at, u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio,
+    u.profile_image_id::text, u.region, u.account_type, u.status;
 END $$;
 
 -- o_result: ok / not_found(404 account_not_found)
@@ -468,11 +467,8 @@ BEGIN
   WHERE p.id = p_post AND p.deleted_at IS NULL;
   IF NOT FOUND THEN RETURN 'not_found'; END IF;
   IF v_author <> p_user OR v_ended IS NOT NULL THEN RETURN 'forbidden'; END IF;
-  IF p_caption IS NOT NULL THEN
-    UPDATE posts SET caption = p_caption WHERE id = p_post;
-  END IF;
-  IF p_visibility IS NOT NULL THEN
-    UPDATE posts SET visibility = p_visibility WHERE id = p_post;
+  IF p_caption IS NOT NULL OR p_visibility IS NOT NULL THEN
+    UPDATE posts SET caption = COALESCE(p_caption, caption), visibility = COALESCE(p_visibility, visibility) WHERE id = p_post;
   END IF;
   RETURN 'ok';
 END $$;
