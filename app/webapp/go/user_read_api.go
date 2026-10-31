@@ -51,6 +51,11 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		// (user_search_dirty、users のトリガーで記録) に限り、全 active 利用者は並べ替えない (#26)。
 		// dirty のうち正規化が今の名前に追いついている (または消えた) 利用者は候補にしない。
 		// 混ぜると候補が数百件になり、users と正規化の表を全件読むプランになる (#97)。
+		// 候補の 2 つの枝は重ならないように分け (UNION ALL)、正規化の行は枝の中で読んだものをそのまま使う。
+		// 以前は候補の id を UNION で重複除去してから users と正規化の表を引き直していた (正規化を候補ごとに 2 回読む)。
+		//   - 一致の枝: trigram 索引で引いた正規化の行 s と、その利用者 u。stale / matched は以前と同じ式。
+		//   - dirty の枝: 正規化が無い・今の表示名と違う利用者のうち、一致の枝に出ないもの (s が無いか、s が一致しない)。
+		//     s.display_name IS DISTINCT FROM u.display_name なので stale は真、matched は偽 (以前の式でも同じ値)。
 		var rows []struct {
 			User
 			Stale   bool `db:"stale"`
@@ -58,22 +63,23 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		err := h.DB.SelectContext(ctx, &rows, `
   WITH cand AS (
-    SELECT user_id FROM user_search_norms WHERE username_norm LIKE $5 OR display_name_norm LIKE $5
-    UNION
-    SELECT d.user_id FROM user_search_dirty d
-    JOIN users u ON u.id = d.user_id
+    SELECT u.*, s.display_name IS DISTINCT FROM u.display_name AS stale,
+      COALESCE(s.display_name = u.display_name AND (strpos(s.username_norm, $4) > 0 OR strpos(s.display_name_norm, $4) > 0), false) AS matched
+    FROM user_search_norms s JOIN users u ON u.id = s.user_id
+    WHERE s.username_norm LIKE $5 OR s.display_name_norm LIKE $5
+    UNION ALL
+    SELECT u.*, true AS stale, false AS matched
+    FROM user_search_dirty d JOIN users u ON u.id = d.user_id
     LEFT JOIN user_search_norms s ON s.user_id = d.user_id
     WHERE s.display_name IS DISTINCT FROM u.display_name
+      AND NOT COALESCE(s.username_norm LIKE $5 OR s.display_name_norm LIKE $5, false)
   )
   SELECT `+strings.Join(userColumns, ", ")+`, stale, matched FROM (
-    SELECT u.*, m.stale, m.matched, count(*) FILTER (WHERE m.matched) OVER (ORDER BY u.username, u.id) AS n
-    FROM cand JOIN users u ON u.id = cand.user_id
-    LEFT JOIN user_search_norms s ON s.user_id = u.id
-    CROSS JOIN LATERAL (SELECT s.display_name IS DISTINCT FROM u.display_name AS stale,
-      COALESCE(s.display_name = u.display_name AND (strpos(s.username_norm, $4) > 0 OR strpos(s.display_name_norm, $4) > 0), false) AS matched) m
-    WHERE u.status = 'active' AND u.id <> $1 AND ($2 = '' OR (u.username, u.id) > ($2, $3))
+    SELECT c.*, count(*) FILTER (WHERE c.matched) OVER (ORDER BY c.username, c.id) AS n
+    FROM cand c
+    WHERE c.status = 'active' AND c.id <> $1 AND ($2 = '' OR (c.username, c.id) > ($2, $3))
       AND NOT EXISTS (SELECT 1 FROM block_relations b
-                      WHERE (b.blocker_id = $1 AND b.blocked_id = u.id) OR (b.blocked_id = $1 AND b.blocker_id = u.id))
+                      WHERE (b.blocker_id = $1 AND b.blocked_id = c.id) OR (b.blocked_id = $1 AND b.blocker_id = c.id))
   ) x
   WHERE (matched AND n <= 51) OR (stale AND n < 51)
   ORDER BY username, id
