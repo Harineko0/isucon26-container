@@ -1,0 +1,135 @@
+name: bench
+
+# PR に `bench` ラベルを付けると:
+#   app/ サブモジュールのコードを 3 台にデプロイ → PR に「ポータルで Run を押して」とコメント
+#   → ベンチの開始と終了を検知 → nginx / pg_stat_statements を集計 → baseline と比較して PR にコメント
+#   → 元のコードに戻す（PR のベンチでサーバの状態を変えたままにしない）
+# main で手動実行（update_baseline=true）すると、結果を bench/results/baseline.json として保存する。
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "app/ を 3 台にデプロイしてから計測する"
+        type: boolean
+        default: false
+      update_baseline:
+        description: "結果を bench/results/baseline.json にして main にコミットする"
+        type: boolean
+        default: false
+      score:
+        description: "ポータルのスコア（分かれば）"
+        required: false
+      force:
+        description: "安全確認（ベンチ中・未コミットのサーバコード）を無視する"
+        type: boolean
+        default: false
+
+# ベンチはチームで同時に 1 本だけ。キャンセルせず順番に待つ。
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bench:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+       contains(github.event.pull_request.labels.*.name, 'bench'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      DEPLOY: ${{ github.event_name == 'pull_request' || inputs.deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Checkout app submodule
+        if: env.DEPLOY == 'true'
+        env:
+          TOKEN: ${{ secrets.SUBMODULE_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init app
+          echo "APP_SHA=$(git -C app rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: SSH config
+        env:
+          KEY: ${{ secrets.BENCH_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/bench && chmod 600 ~/.ssh/bench
+          cat > ~/.ssh/config <<'EOF'
+          Host isucon26-asia
+            HostName 13.159.52.104
+          Host isucon26-europe
+            HostName 52.199.206.161
+          Host isucon26-america
+            HostName 52.197.40.86
+          Host isucon26-*
+            User isucon
+            IdentityFile ~/.ssh/bench
+            StrictHostKeyChecking accept-new
+          EOF
+
+      - name: Deploy
+        if: env.DEPLOY == 'true'
+        run: python3 bench/bench.py deploy ${{ inputs.force && '--force' || '' }}
+
+      - name: Snapshot
+        run: python3 bench/bench.py snapshot -o snap.json
+
+      - name: Ask for a run
+        run: |
+          MSG="🔔 \`${APP_SHA:-current}\` を 3 台にデプロイしました（ワークフロー: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}）。
+          **15 分以内にポータルでベンチを Run してください**: https://portal.isucon.net/contestant/benchmark_jobs
+          終わったら計測結果をここにコメントし、PR のベンチ後は元のコードに戻します。"
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR" ]; then gh pr comment "$PR" --body "$MSG"; fi
+
+      - name: Wait for the benchmark
+        run: python3 bench/bench.py wait --snap snap.json --start-timeout 900
+
+      - name: Collect
+        run: |
+          LABEL="${APP_SHA:-current}${PR:+-pr$PR}"
+          python3 bench/bench.py collect --snap snap.json -o result.json --label "$LABEL" ${{ inputs.score && format('--score {0}', inputs.score) || '' }}
+
+      - name: Compare with baseline
+        run: |
+          git show origin/main:bench/results/baseline.json > baseline.json 2>/dev/null || rm -f baseline.json
+          python3 bench/bench.py compare result.json --base baseline.json -o report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR" ]; then gh pr comment "$PR" --body-file report.md; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}
+          path: |
+            result.json
+            report.md
+
+      - name: Roll back PR deploy
+        if: always() && github.event_name == 'pull_request' && env.DEPLOY == 'true'
+        run: python3 bench/bench.py rollback
+
+      - name: Update baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.update_baseline && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p bench/results
+          cp result.json bench/results/baseline.json
+          cp result.json "bench/results/$(date -u +%Y%m%d-%H%M%S)-${APP_SHA:-current}.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/results
+          git commit -m "bench: update baseline (${APP_SHA:-current})"
+          git push
