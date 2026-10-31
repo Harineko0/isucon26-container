@@ -47,30 +47,17 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			prefetchStoredImage(input.ImageID, h.Config.Region)
 		}
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
-		var object struct {
-			SecretKeyHash string    `db:"secret_key_hash"`
-			MediaType     string    `db:"media_type"`
-			Data          []byte    `db:"data"`
-			StoredRegion  *string   `db:"stored_region"`
-			Allowed       bool      `db:"allowed"`
-			CreatedAt     time.Time `db:"created_at"`
-			Partition     string    `db:"partition"`
-		}
-		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
-		if err != nil {
-			return err
-		}
+		request := imageReadRequest{id: input.ImageID, hasData: hasData, ip: c.RealIP()}
 		// 画像の created_at は不変なので、手がかり (imageCreatedAt / imagePartitions) があればそのパーティションの表を
 		// 直接引く (image_partition.go)。親表を引くと全パーティションの表ロックを取り、asia2 の LockManager が詰まる。
 		rel, exact := imageRelationFor(input.ImageID, time.Now())
-		err = conn.GetContext(ctx, &object, imageQueryFor(rel), input.ImageID, hasData)
+		object, err := readImageObject(ctx, h, rel, request)
 		hinted := err == nil
 		if errors.Is(err, sql.ErrNoRows) && !exact {
 			// 手がかり (または今のパーティションという推測) が外れていた場合に備えて親表で引き直す。
 			// DB から教わった葉 (exact) に無ければ画像は消えているので、そのまま 403 にする。
-			err = conn.GetContext(ctx, &object, imageQueryFor("image_objects"), input.ImageID, hasData)
+			object, err = readImageObject(ctx, h, "image_objects", request)
 		}
-		conn.Close()
 		if err == nil {
 			if !hinted {
 				imageCreatedAt.Store(input.ImageID, object.CreatedAt)

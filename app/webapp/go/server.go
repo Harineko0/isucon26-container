@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -11,10 +12,11 @@ import (
 )
 
 type HandlerContext struct {
-	DB      *sqlx.DB
-	Config  *Config
-	IPBans  *IPBanList
-	Windows *postingWindowWatcher
+	imageReads *imageReads
+	DB         *sqlx.DB
+	Config     *Config
+	IPBans     *IPBanList
+	Windows    *postingWindowWatcher
 }
 
 func NewServer(config *Config) *echo.Echo {
@@ -62,6 +64,9 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans:  ipBans,
 		Windows: newPostingWindowWatcher(db, config.Region),
 	}
+	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, requests []imageReadRequest) []imageReadResult {
+		return loadImageReadBatch(ctx, handlerContext, rel, requests)
+	}}
 	e.Pre(InternalMiddleware(handlerContext))
 	go ipBans.abuse.writeLoop(db)
 	e.Use(IPBanMiddleware(handlerContext))
