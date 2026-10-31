@@ -45,5 +45,7 @@ echo "A put profile image again: $(code -XPUT $R/api/me/profile-image $H -H "Aut
 echo "A delete profile image: $(code -XDELETE $R/api/me/profile-image $H -H "Authorization: Bearer $TA") again: $(code -XDELETE $R/api/me/profile-image $H -H "Authorization: Bearer $TA")"
 IURL=$(curl -s $R/api/posts/$PA $H -H "Authorization: Bearer $TA" | jq -r .imageUrl)
 echo "B delete A post: $(code -XDELETE $R/api/posts/$PA $H -H "Authorization: Bearer $TB") A delete: $(code -XDELETE $R/api/posts/$PA $H -H "Authorization: Bearer $TA") again: $(code -XDELETE $R/api/posts/$PA $H -H "Authorization: Bearer $TA") image: $(code $R$IURL)"
-echo "B delete account: $(code -XPOST $R/api/me/account-deletion $H -H "Authorization: Bearer $TB") me: $(code $R/api/me $H -H "Authorization: Bearer $TB")"
+echo "B delete account: $(code -XPOST $R/api/me/account-deletion $H -H "Authorization: Bearer $TB") me: $(code $R/api/me $H -H "Authorization: Bearer $TB") comment: $(code -XPOST $R/api/posts/$PC/comments $H -H "Authorization: Bearer $TB" -H 'Content-Type: application/json' -d '{"body":"x"}') follow: $(code -XPUT $R/api/follows/$CID $H -H "Authorization: Bearer $TB")"
+echo "C logout then post: $(code -XPOST $R/api/auth/logout $H -H "Authorization: Bearer $TC") $(code -XPOST $R/api/posts $H -H "Authorization: Bearer $TC" -F image=@$IMG -F caption=c -F visibility=public -F location_kind=none)"
+echo "A post via asia (region mismatch): $(code -XPOST $R/api/posts -H "Authorization: Bearer $TA" -F image=@$IMG -F caption=c -F visibility=public -F location_kind=none)"
 j -XPOST $R/api/initialize >/dev/null
