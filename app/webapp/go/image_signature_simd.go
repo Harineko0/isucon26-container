@@ -8,7 +8,7 @@ import (
 	"example.com/isureal-company/isureal/internal/sha256x16"
 )
 
-// Prefer the standard library on CPUs with SHA instructions.
+// SHA-capable machines use the single-signature path.
 var useSIMDSignatures = archsimd.X86.AVX512() && !archsimd.X86.SHA()
 
 func iterateLanes(lanes []hmacLane, n int) {
