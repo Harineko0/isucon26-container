@@ -57,3 +57,9 @@ COMMIT;
 -- Seq Scan が読むページも減る。autovacuum に任せるとベンチ中になり、検索と競合して切り詰めを諦めることがある。
 -- VACUUM はトランザクションの外でしか流せない。ほかの VACUUM が動いていれば待たずに飛ばす (SKIP_LOCKED)。
 VACUUM (SKIP_LOCKED) user_search_norms;
+
+-- friendships / friend_requests / follows / block_relations は上で TRUNCATE してから入れ直したので、可視性マップが
+-- 空で統計も古い。autovacuum が回るまで（実測でベンチ開始から約55秒）Index Only Scan でも heap を読み、
+-- プランナーも古い統計で計画する（friendships_high_low を入れた #122 の後、friends-of-friends のフィードが読む
+-- ページが 269 → 482 に増えた）。合計約6.5万行の小さい表なので、ここで VACUUM (ANALYZE) しておく。
+VACUUM (ANALYZE, SKIP_LOCKED) friendships, friend_requests, follows, block_relations;
