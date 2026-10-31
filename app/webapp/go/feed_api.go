@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -27,6 +28,7 @@ type getFeedResponse struct {
 }
 
 func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
+	var friends friendFeedQueue
 	return func(c *echo.Context) error {
 		var input getFeedRequest
 		if err := c.Bind(&input); err != nil {
@@ -49,27 +51,8 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		// 51 件だけを受け取る。フィードごとに別の SQL にして、不要な CTE（mutual など）の計画・実行を省く。
 		tokenHash, deferred := deferredSession(c)
 		userID := GetSession(c).UserID
-		var rows []feedRow
-		var query string
-		var args []any
-		if ranked {
-			if deferred {
-				query = feedDeferredQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore, h.Config.Region, tokenHash}
-			} else {
-				query = feedQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore}
-			}
-		} else {
-			if deferred {
-				query = feedDeferredQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID, h.Config.Region, tokenHash}
-			} else {
-				query = feedQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID}
-			}
-		}
-		if err := sqlx.SelectContext(ctx, h.DB, &rows, query, args...); err != nil {
+		rows, err := selectFeedRows(ctx, h, &friends, input, userID, tokenHash, deferred)
+		if err != nil {
 			return err
 		}
 		var sessRegion *string
@@ -110,6 +93,25 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, getFeedResponse{Items: items, HasMore: hasMore})
 	}
+}
+
+func selectFeedRows(ctx context.Context, h *HandlerContext, friends *friendFeedQueue, input getFeedRequest, userID, tokenHash string, deferred bool) ([]feedRow, error) {
+	if deferred && input.Feed == "friends" && input.BeforePostedAt == nil {
+		return friends.selectRows(ctx, h.DB, h.Config.Region, friendFeedRequest{userID: userID, tokenHash: tokenHash})
+	}
+
+	query := feedQueries[input.Feed]
+	args := []any{userID, input.BeforePostedAt, input.BeforeID}
+	if input.Feed == "friends-of-friends" {
+		args = append(args, input.BeforeScore)
+	}
+	if deferred {
+		query = feedDeferredQueries[input.Feed]
+		args = append(args, h.Config.Region, tokenHash)
+	}
+	var rows []feedRow
+	err := sqlx.SelectContext(ctx, h.DB, &rows, query, args...)
+	return rows, err
 }
 
 type feedRow struct {
