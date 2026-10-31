@@ -8,9 +8,13 @@ User=isucon
 Group=isucon
 WorkingDirectory=/home/isucon/webapp/go
 EnvironmentFile=/home/isucon/env.sh
-# Soft heap cap so the image cache plus GOGC=100 headroom cannot push asia1 into OOM.
-# Above the observed peak (Sys 1.68 GB); see infra/notes/go-memlimit.md
-Environment=GOMEMLIMIT=2GiB
+# Soft heap cap. Images are now served from /home/isucon/imgcache (16 GB, 1.8M files), so the
+# page cache is the image tier and the Go heap competes with it on a 3.8 GB box. At 2GiB the
+# runtime kept 1.2 GB of idle heap (RSS 1.75 GB vs HeapAlloc 0.47 GB after a bench) while the
+# bench read ~56 MB/s from disk (vmstat wa 13-18 %). 1280MiB still clears the live heap
+# (two 192 MiB cache generations + working set) and returns the idle part to the page cache.
+# See infra/notes/go-memlimit.md
+Environment=GOMEMLIMIT=1280MiB
 ExecStart=/home/isucon/webapp/go/isureal
 Restart=on-failure
 RestartSec=5
