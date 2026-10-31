@@ -49,12 +49,22 @@ var imagePartitionName = regexp.MustCompile(`^image_objects(_[0-9a-z_]+)?$`)
 var imagePartitions = &boundedMap{limit: 2_000_000}
 
 // imageRelationFor は画像 id を引くべき表の名前を返す。手がかりが無ければ "" (親表を引く)。
+//
+// 手がかりの表 (imagePartitions / imageCreatedAt) はサーバーごとなので、europe1/america1 経由で上げた画像を
+// asia1 で初めて読むときや、追い出された後は手がかりが無く、親表 (全パーティション、ロック 92 個) を引いていた
+// (前回のベンチで画像読み取り 13857 件中 1153 件 = 8%、平均 24 ms。葉・中間パーティション直接は 1.8〜2.9 ms)。
+// 新しい画像の id は先頭にミリ秒時刻が入っている (ids.go の newTimeID) ので、created_at の代わりにそれから
+// パーティションを求める。画像の created_at は DB の clock_timestamp() か投稿時刻で、id の時刻と数秒以内に
+// 揃うので、月の境目以外は同じパーティションになる。外れていれば image_api.go が親表で引き直す。
 func imageRelationFor(imageID string) string {
 	if rel, ok := imagePartitions.Load(imageID); ok {
 		return rel.(string)
 	}
 	if createdAt, ok := imageCreatedAt.Load(imageID); ok {
 		return imagePartitionFor(createdAt.(time.Time))
+	}
+	if createdAt, ok := timeIDTime(imageID); ok {
+		return imagePartitionFor(createdAt)
 	}
 	return ""
 }

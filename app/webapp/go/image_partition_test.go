@@ -46,3 +46,20 @@ func TestRememberImagePartition(t *testing.T) {
 		t.Errorf("e: %s", got)
 	}
 }
+
+func TestImageRelationFor_TimeID(t *testing.T) {
+	// 手がかりが無くても、時刻先頭の id (他のサーバー経由で上げた画像) なら中間パーティションを引く。
+	id := timeIDAt(time.Date(2026, 10, 31, 0, 30, 0, 0, time.UTC), "f2")
+	if got := imageRelationFor(id); got != "image_objects_20261028" {
+		t.Errorf("no hint: %s", got)
+	}
+	// DB から教わった葉があればそちらが優先。
+	rememberImagePartition(id, "image_objects_20261028_p5")
+	if got := imageRelationFor(id); got != "image_objects_20261028_p5" {
+		t.Errorf("leaf hint: %s", got)
+	}
+	// 乱数 UUID (初期データ) は従来どおり手がかり無し。
+	if got := imageRelationFor("3f2504e0-4f89-41d3-9a0c-0305e82c3301"); got != "" {
+		t.Errorf("random uuid: %s", got)
+	}
+}

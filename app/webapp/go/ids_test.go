@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -69,6 +70,60 @@ func TestNewTimeID_UniqueAndOrdered(t *testing.T) {
 	}
 	if !sort.StringsAreSorted(prefixes) {
 		t.Errorf("timestamp prefixes are not non-decreasing in generation order")
+	}
+}
+
+// timeIDAt は ms の時刻を先頭に持つ、newTimeID と同じ形の固定 id を作る (テスト用)。
+func timeIDAt(at time.Time, suffix string) string {
+	ms := at.UnixMilli()
+	return fmt.Sprintf("%08x-%04x-4000-8000-0000000000%s", ms>>16, ms&0xffff, suffix)
+}
+
+func TestTimeIDTime_RoundTrip(t *testing.T) {
+	for _, gen := range []struct {
+		name string
+		id   func() string
+	}{
+		{"newTimeID", newTimeID},
+		{"newImageID(europe)", func() string { return newImageID("europe") }},
+	} {
+		before := time.Now().Truncate(time.Millisecond)
+		id := gen.id()
+		after := time.Now()
+		got, ok := timeIDTime(id)
+		if !ok {
+			t.Fatalf("%s: timeIDTime(%q) = !ok", gen.name, id)
+		}
+		if got.Before(before) || got.After(after) {
+			t.Errorf("%s: timeIDTime(%q) = %s, want within [%s, %s]", gen.name, id, got, before, after)
+		}
+	}
+	fixed := time.Date(2026, 10, 31, 0, 30, 0, 0, time.UTC)
+	got, ok := timeIDTime(timeIDAt(fixed, "f1"))
+	if !ok || !got.Equal(fixed) {
+		t.Errorf("timeIDTime(fixed) = %s, %v; want %s, true", got, ok, fixed)
+	}
+}
+
+func TestTimeIDTime_RejectsOtherIDs(t *testing.T) {
+	cases := map[string]string{
+		"empty":            "",
+		"short":            "b",
+		"not uuid":         "unused-image",
+		"zero":             "00000000-0000-4000-8000-000000000000",
+		"random v4 (2122)": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		"far future":       "ffffffff-ffff-4fff-8fff-ffffffffffff",
+		"upper hex":        strings.ToUpper(newTimeID()),
+		"bad hex":          "zzzzzzzz-zzzz-4000-8000-000000000000",
+		"before since":     timeIDAt(timeIDSince.Add(-time.Millisecond), "00"),
+		"2 hours ahead":    timeIDAt(time.Now().Add(2*time.Hour), "00"),
+		"truncated":        newTimeID()[:35],
+		"no dashes":        strings.ReplaceAll(newTimeID(), "-", "0"),
+	}
+	for name, id := range cases {
+		if got, ok := timeIDTime(id); ok {
+			t.Errorf("%s: timeIDTime(%q) = %s, true; want !ok", name, id, got)
+		}
 	}
 }
 
