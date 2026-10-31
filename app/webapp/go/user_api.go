@@ -146,9 +146,8 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		token := uuid.NewString()
 		tokenHash := sha256.Sum256([]byte(token))
 		hashedToken := hex.EncodeToString(tokenHash[:])
-		row, err := logins.execute(ctx, c.RealIP(), [4]string{
-			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hashedToken,
-		})
+		row, err := logins.execute(ctx, c.RealIP(),
+			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hashedToken)
 		if err != nil {
 			return err
 		}

@@ -20,7 +20,7 @@ const maxPipelinedWrites = 8
 type writeCall[T any] struct {
 	ctx   context.Context
 	ip    string
-	args  [4]string
+	args  []any
 	reply chan writeResult[T]
 }
 
@@ -30,9 +30,11 @@ type writeResult[T any] struct {
 }
 
 type writeBatch[T any] struct {
-	calls  []*writeCall[T]
-	live   int
-	cancel context.CancelFunc
+	calls      []*writeCall[T]
+	live       int
+	checkedOut bool
+	abandoned  bool
+	cancel     context.CancelFunc
 }
 
 type writeQueue[T any] struct {
@@ -43,15 +45,15 @@ type writeQueue[T any] struct {
 	pending *writeBatch[T]
 }
 
-func (q *writeQueue[T]) query(ctx context.Context, conn *sqlx.Conn, args [4]string) (T, error) {
+func (q *writeQueue[T]) query(ctx context.Context, conn *sqlx.Conn, args []any) (T, error) {
 	var row T
-	err := conn.GetContext(ctx, &row, q.sql, args[0], args[1], args[2], args[3])
+	err := conn.GetContext(ctx, &row, q.sql, args...)
 	return row, err
 }
 
 // Use the regular prepared query while the pool has headroom. Under pressure
 // only arrivals overlapping acquisition share a connection, without a timer.
-func (q *writeQueue[T]) execute(ctx context.Context, ip string, args [4]string) (T, error) {
+func (q *writeQueue[T]) execute(ctx context.Context, ip string, args ...any) (T, error) {
 	var zero T
 	stats := q.db.Stats()
 	if stats.Idle > 0 || stats.MaxOpenConnections == 0 || stats.OpenConnections < stats.MaxOpenConnections {
@@ -80,24 +82,34 @@ func (q *writeQueue[T]) execute(ctx context.Context, ip string, args [4]string) 
 		q.pending = nil
 	}
 	q.mu.Unlock()
-	defer func() {
-		q.mu.Lock()
-		b.live--
-		if b.live == 0 && ctx.Err() != nil {
-			if q.pending == b {
-				q.pending = nil
-			}
-			b.cancel()
-		}
-		q.mu.Unlock()
-	}()
-
+	var result writeResult[T]
+	var canceled bool
 	select {
-	case result := <-call.reply:
-		return result.row, result.err
+	case result = <-call.reply:
 	case <-ctx.Done():
-		return zero, ctx.Err()
+		canceled = true
 	}
+	q.mu.Lock()
+	b.live--
+	b.abandoned = b.abandoned || canceled
+	if b.live == 0 && b.abandoned {
+		if q.pending == b {
+			q.pending = nil
+		}
+		b.cancel()
+	}
+	checkedOut := b.checkedOut
+	q.mu.Unlock()
+	if canceled {
+		if !checkedOut {
+			// run checks each context after checkout, so this write cannot be sent.
+			return zero, ctx.Err()
+		}
+		// A shared flush cannot cancel only this statement. Keep ownership of
+		// its admission slot and report the actual commit/rollback outcome.
+		result = <-call.reply
+	}
+	return result.row, result.err
 }
 
 func (q *writeQueue[T]) run(ctx context.Context, b *writeBatch[T]) {
@@ -108,6 +120,7 @@ func (q *writeQueue[T]) run(ctx context.Context, b *writeBatch[T]) {
 		q.pending = nil
 	}
 	calls := b.calls
+	b.checkedOut = err == nil
 	q.mu.Unlock()
 	if err != nil {
 		for _, c := range calls {
@@ -149,12 +162,23 @@ func (q *writeQueue[T]) pipeline(ctx context.Context, conn *sqlx.Conn, calls []*
 		pg := driverConn.Conn()
 		pipe := pg.PgConn().StartPipeline(ctx)
 		defer pipe.Close()
+		var params pgx.ExtendedQueryBuilder
+		sent := make([]*writeCall[T], 0, len(calls))
 		for _, c := range calls {
-			args := [][]byte{[]byte(c.args[0]), []byte(c.args[1]), []byte(c.args[2]), []byte(c.args[3])}
-			pipe.SendQueryParams(q.sql, args, nil, nil, nil)
+			// Use pgx's text encoders, including SQL NULLs for optional fields.
+			if err := params.Build(pg.TypeMap(), nil, c.args); err != nil {
+				c.reply <- writeResult[T]{err: err}
+				continue
+			}
+			pipe.SendQueryParams(q.sql, params.ParamValues, nil, nil, nil)
 			// Sync ends each transaction, so locks and statement failures stay
 			// within one request. Flush the whole batch to cross the network once.
 			pipe.SendPipelineSync()
+			sent = append(sent, c)
+		}
+		calls = sent
+		if len(calls) == 0 {
+			return nil
 		}
 		if err := pipe.Flush(); err != nil {
 			return err
