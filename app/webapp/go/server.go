@@ -25,11 +25,7 @@ func NewServer(config *Config) *echo.Echo {
 	e.IPExtractor = extractClientIP
 
 	ipBans := newIPBanList()
-	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, func(action string, status int, ip, abuse string) {
-		if kind := abuseKind(action, status, abuse); kind != "" {
-			ipBans.abuse.observe(kind, ip, time.Now())
-		}
-	}))
+	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, ipBans.observeActionLog))
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 

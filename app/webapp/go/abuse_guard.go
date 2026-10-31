@@ -143,3 +143,10 @@ func (d *abuseDetector) writeLoop(db *sqlx.DB) {
 		}
 	}
 }
+
+// observeActionLog は ActionLogMiddleware に渡すフック。書いた action log の行を guard と同じ条件で数える。
+func (l *IPBanList) observeActionLog(action string, status int, ip, abuse string) {
+	if kind := abuseKind(action, status, abuse); kind != "" {
+		l.abuse.observe(kind, ip, time.Now())
+	}
+}
