@@ -4,7 +4,9 @@ BEGIN;
 
 TRUNCATE ip_bans, login_sessions, administrator_sessions, friendships, friend_requests, follows, block_relations;
 
-DELETE FROM notifications WHERE created_at > (SELECT created_at FROM initial_data_boundary);
+-- 通知は投稿期間の開始時にだけ、その期間の posting_window_id 付きで作られる(NOT NULL)。
+-- created_at に索引が無く全件走査になるので、境界より後の投稿期間から notifications_window_user で引く。
+DELETE FROM notifications WHERE posting_window_id IN (SELECT id FROM posting_windows WHERE created_at > (SELECT created_at FROM initial_data_boundary));
 DELETE FROM comments WHERE created_at > (SELECT created_at FROM initial_data_boundary);
 DELETE FROM realmojis WHERE created_at > (SELECT created_at FROM initial_data_boundary);
 DELETE FROM posts WHERE created_at > (SELECT created_at FROM initial_data_boundary);

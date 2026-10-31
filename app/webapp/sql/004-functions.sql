@@ -369,8 +369,10 @@ BEGIN
       RETURN 'not_found';
   END;
   UPDATE users SET profile_image_id = p_image_id, updated_at = clock_timestamp() WHERE id = p_user;
+  -- 初期データの画像(境界以前)は消さない。initialize で users.profile_image_id が初期値に戻るので、
+  -- 行が残っていないと初期データと一致しなくなる。外れた画像は image_api の profile_image_id 判定で 403 になる。
   IF v_old IS NOT NULL THEN
-    DELETE FROM image_objects WHERE id = v_old;
+    DELETE FROM image_objects WHERE id = v_old AND created_at > (SELECT created_at FROM initial_data_boundary);
   END IF;
   RETURN 'ok';
 END $$;
@@ -383,7 +385,8 @@ BEGIN
   SELECT profile_image_id INTO v_old FROM users WHERE id = p_user FOR NO KEY UPDATE;
   IF NOT FOUND OR v_old IS NULL THEN RETURN 'not_found'; END IF;
   UPDATE users SET profile_image_id = NULL, updated_at = clock_timestamp() WHERE id = p_user;
-  DELETE FROM image_objects WHERE id = v_old;
+  -- 初期データの画像は消さない(isureal_put_profile_image と同じ理由)。
+  DELETE FROM image_objects WHERE id = v_old AND created_at > (SELECT created_at FROM initial_data_boundary);
   RETURN 'ok';
 END $$;
 
