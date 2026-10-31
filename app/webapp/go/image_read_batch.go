@@ -22,6 +22,7 @@ type imageObject struct {
 }
 
 type imageReadRequest struct {
+	post    postImageProof
 	id      string
 	hasData bool
 	ip      string
@@ -159,6 +160,10 @@ func loadImageReadBatch(ctx context.Context, h *HandlerContext, rel string, requ
 	}
 	imageReadStats.Add("requests", int64(len(ids)))
 	imageReadStats.Add("queries", 1)
+	if rel == postImageBatchKey {
+		loadCommittedPostImages(ctx, conn, requests, indices, results)
+		return results
+	}
 	// Sparse traffic should reuse the original prepared statement and plan.
 	// Only a batch that actually combines requests needs the array query.
 	if len(ids) == 1 {

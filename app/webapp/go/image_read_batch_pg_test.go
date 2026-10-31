@@ -80,7 +80,11 @@ FROM (VALUES ('profile','owner'), ('posted','owner'), ('real','owner'), ('replac
 	oldStore := imageDataStore
 	imageDataStore = newImageDataCache()
 	t.Cleanup(func() { imageDataStore = oldStore })
+	var postQueries int
 	h.imageReads = &imageReads{load: func(ctx context.Context, rel string, requests []imageReadRequest) []imageReadResult {
+		if rel == postImageBatchKey {
+			postQueries++
+		}
 		return loadImageReadBatch(ctx, h, rel, requests)
 	}}
 	for _, id := range []string{"profile", "posted", "real", "replaced", "deleted-owner"} {
@@ -108,7 +112,41 @@ FROM (VALUES ('profile','owner'), ('posted','owner'), ('real','owner'), ('replac
 		}
 	}
 	get("posted", true, 200)
+	if postQueries != 0 {
+		t.Fatal("a URL or local body cannot establish post image ownership")
+	}
+	proofs := committedPostImages.Load()
+	t.Cleanup(resetCommittedPostImages)
+	proof := postImageProof{postID: "post", ownerID: "owner"}
+	proofs.Store("posted", proof)
+	get("posted", true, 200)
 	get("posted", false, 403)
+	if postQueries != 1 {
+		t.Fatalf("local JPEG must recheck its post once for the valid GET: %d", postQueries)
+	}
+	batch := loadImageReadBatch(t.Context(), h, postImageBatchKey, []imageReadRequest{
+		{id: "posted", post: proof, ip: "banned", hasData: true},
+		{id: "posted", post: postImageProof{postID: "post", ownerID: "author"}, hasData: true},
+		{id: "profile", post: proof, hasData: true},
+		{id: "posted", post: proof, hasData: true},
+	})
+	if err, ok := batch[0].err.(*APIError); !ok || err.Code != "ip_banned" {
+		t.Fatalf("banned IP obtained a cached post image: %+v", batch[0])
+	}
+	if !errors.Is(batch[1].err, sql.ErrNoRows) || !errors.Is(batch[2].err, sql.ErrNoRows) ||
+		batch[3].err != nil || !batch[3].object.Allowed || batch[3].object.MediaType != "image/jpeg" {
+		t.Fatalf("incorrect post proof association or batch order: %+v", batch)
+	}
+	db.MustExec(`UPDATE users SET status='deleted' WHERE id='owner'`)
+	get("posted", true, 403)
+	db.MustExec(`UPDATE users SET status='active' WHERE id='owner'`)
+	// An invalid proof must fall back to the canonical result and be discarded.
+	proofs.Store("posted", postImageProof{postID: "target", ownerID: "owner"})
+	get("posted", true, 200)
+	if _, ok := proofs.Load("posted"); ok {
+		t.Fatal("stale proof was kept")
+	}
+	proofs.Store("posted", proof)
 	get("real", true, 200)
 	get("replaced", true, 403)
 	get("deleted-owner", true, 403)

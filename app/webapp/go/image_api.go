@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
@@ -56,24 +57,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
 		request := imageReadRequest{id: input.ImageID, hasData: hasData, ip: c.RealIP()}
-		// 画像の created_at は不変なので、手がかり (imageCreatedAt / imagePartitions) があればそのパーティションの表を
-		// 直接引く (image_partition.go)。親表を引くと全パーティションの表ロックを取り、asia2 の LockManager が詰まる。
-		rel, exact := imageRelationFor(input.ImageID, time.Now())
-		object, err := readImageObject(ctx, h, rel, request)
-		hinted := err == nil
-		if errors.Is(err, sql.ErrNoRows) && !exact {
-			// 手がかり (または今のパーティションという推測) が外れていた場合に備えて親表で引き直す。
-			// DB から教わった葉 (exact) に無ければ画像は消えているので、そのまま 403 にする。
-			object, err = readImageObject(ctx, h, "image_objects", request)
-		}
-		if err == nil {
-			if !hinted {
-				imageCreatedAt.Store(input.ImageID, object.CreatedAt)
-			}
-			if object.Partition != rel {
-				rememberImagePartition(input.ImageID, object.Partition)
-			}
-		}
+		object, err := lookupImageForRequest(ctx, h, request)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
@@ -124,4 +108,37 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.Blob(http.StatusOK, object.MediaType, object.Data)
 	}
+}
+
+func lookupImageForRequest(ctx context.Context, h *HandlerContext, request imageReadRequest) (imageObject, error) {
+	if h.imageReads != nil && request.hasData {
+		proofs := committedPostImages.Load()
+		if proof, ok := proofs.Load(request.id); ok {
+			request.post = proof.(postImageProof)
+			object, err := h.imageReads.get(ctx, postImageBatchKey, request)
+			if !errors.Is(err, sql.ErrNoRows) {
+				return object, err
+			}
+			proofs.Delete(request.id)
+		}
+	}
+	// 画像の created_at は不変なので、手がかり (imageCreatedAt / imagePartitions) があればそのパーティションの表を
+	// 直接引く (image_partition.go)。親表を引くと全パーティションの表ロックを取り、asia2 の LockManager が詰まる。
+	rel, exact := imageRelationFor(request.id, time.Now())
+	object, err := readImageObject(ctx, h, rel, request)
+	hinted := err == nil
+	if errors.Is(err, sql.ErrNoRows) && !exact {
+		// 手がかり (または今のパーティションという推測) が外れていた場合に備えて親表で引き直す。
+		// DB から教わった葉 (exact) に無ければ画像は消えているので、そのまま 403 にする。
+		object, err = readImageObject(ctx, h, "image_objects", request)
+	}
+	if err == nil {
+		if !hinted {
+			imageCreatedAt.Store(request.id, object.CreatedAt)
+		}
+		if object.Partition != rel {
+			rememberImagePartition(request.id, object.Partition)
+		}
+	}
+	return object, err
 }
