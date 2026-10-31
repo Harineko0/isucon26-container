@@ -183,30 +183,43 @@ func saveSearchNorms(ctx context.Context, db *sqlx.DB, users []User) error {
 		displayNames[i] = user.DisplayName
 		displayNameNorms[i] = normalizeSearchText(user.DisplayName)
 	}
-	// 保存した表示名が今の表示名と同じ利用者だけ dirty から外す。保存の間に名前が変わっていれば
-	// dirty に残り (トリガーが入れ直す)、次の検索でもアプリで照合される。
+	// dirty の行 (user_search_dirty) が保存の直列化点になる。表示名を変える UPDATE はトリガーで同じトランザクションの
+	// 中で dirty の行に新しい表示名を書く (行ロックを取る) ので、dirty の行の display_name が利用者の今の表示名になる。
+	// 保存は dirty の行を表示名が一致するものだけロックし (FOR UPDATE は READ COMMITTED でも最新の版で一致を見直す)、
+	// ロックできた利用者だけ正規化を書いて dirty から外す。ロックを持つ間は改名がトリガーで待つので、
+	// 「保存の後に改名が確定したのに dirty を消す」ことも、「古い表示名の保存が新しい保存を上書きして dirty も無い」
+	// ことも起きない (#148)。表示名が違う・行が無い利用者は書かない (dirty に残っていればアプリで照合され、次の検索で
+	// 今の表示名で保存し直される)。ほかがロック中の行 (改名中・別の台が保存中) は待たずに飛ばす (デッドロックもしない)。
 	_, err := db.ExecContext(ctx, `
-  WITH saved AS (
+  WITH batch AS (
+    SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS b(user_id, username_norm, display_name, display_name_norm)
+  ), locked AS (
+    SELECT b.* FROM batch b JOIN user_search_dirty d ON d.user_id = b.user_id AND d.display_name = b.display_name
+    FOR UPDATE OF d SKIP LOCKED
+  ), saved AS (
     INSERT INTO user_search_norms (user_id, username_norm, display_name, display_name_norm)
-    SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
+    SELECT user_id, username_norm, display_name, display_name_norm FROM locked
     ON CONFLICT (user_id) DO UPDATE SET username_norm = EXCLUDED.username_norm,
       display_name = EXCLUDED.display_name, display_name_norm = EXCLUDED.display_name_norm
-    RETURNING user_id, display_name
+    RETURNING user_id
   )
-  DELETE FROM user_search_dirty d USING saved, users u
-  WHERE d.user_id = saved.user_id AND u.id = saved.user_id AND u.display_name = saved.display_name
+  DELETE FROM user_search_dirty d USING saved WHERE d.user_id = saved.user_id
  `, ids, usernameNorms, displayNames, displayNameNorms)
 	return err
 }
 
-// cleanSearchDirty は、正規化が今の表示名に追いついた利用者と、消えた利用者を dirty から外す。
+// cleanSearchDirty は、正規化が dirty の行の表示名 (= 今の表示名) に追いついた利用者と、消えた利用者を dirty から外す。
 // 名前が変わった直後 (正規化が古い) の利用者は残すので、検索の正しさは変わらない。
+// 行は FOR UPDATE でロックしてから消す。改名がこの文の開始後に確定していれば、ロックが最新の版 (新しい表示名) で
+// 条件を見直すので消さない (#148)。ロック中の行 (改名中・保存中) は待たずに飛ばす。
 func cleanSearchDirty(ctx context.Context, db *sqlx.DB) error {
 	_, err := db.ExecContext(ctx, `
-  DELETE FROM user_search_dirty d
-  WHERE NOT EXISTS (
-    SELECT 1 FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
-    WHERE u.id = d.user_id AND s.display_name IS DISTINCT FROM u.display_name)
+  DELETE FROM user_search_dirty WHERE user_id IN (
+    SELECT d.user_id FROM user_search_dirty d
+    WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = d.user_id)
+       OR EXISTS (SELECT 1 FROM user_search_norms s JOIN users u ON u.id = s.user_id
+                  WHERE s.user_id = d.user_id AND s.display_name = d.display_name AND u.display_name = d.display_name)
+    FOR UPDATE OF d SKIP LOCKED)
  `)
 	return err
 }
@@ -390,18 +403,32 @@ var searchNormsSchema = []string{
 	`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
 	`CREATE INDEX IF NOT EXISTS user_search_norms_username_trgm ON user_search_norms USING gin (username_norm gin_trgm_ops)`,
 	`CREATE INDEX IF NOT EXISTS user_search_norms_display_name_trgm ON user_search_norms USING gin (display_name_norm gin_trgm_ops)`,
-	`CREATE TABLE IF NOT EXISTS user_search_dirty (user_id text PRIMARY KEY)`,
+	`CREATE TABLE IF NOT EXISTS user_search_dirty (user_id text PRIMARY KEY, display_name text)`,
+	// 表示名の列は後から足した (#148)。足してあれば ALTER TABLE (ACCESS EXCLUSIVE) を取らない。
+	`DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'user_search_dirty'::regclass
+                 AND attname = 'display_name' AND NOT attisdropped) THEN
+    ALTER TABLE user_search_dirty ADD COLUMN IF NOT EXISTS display_name text;
+  END IF;
+END $$`,
 	`CREATE OR REPLACE FUNCTION isureal_mark_search_dirty() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  INSERT INTO user_search_dirty (user_id) VALUES (NEW.id) ON CONFLICT DO NOTHING;
+  INSERT INTO user_search_dirty (user_id, display_name) VALUES (NEW.id, NEW.display_name)
+  ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name;
   RETURN NULL;
 END $$`,
 	`CREATE OR REPLACE TRIGGER users_search_dirty_insert AFTER INSERT ON users
   FOR EACH ROW EXECUTE FUNCTION isureal_mark_search_dirty()`,
 	`CREATE OR REPLACE TRIGGER users_search_dirty_update AFTER UPDATE OF display_name ON users
   FOR EACH ROW WHEN (OLD.display_name IS DISTINCT FROM NEW.display_name) EXECUTE FUNCTION isureal_mark_search_dirty()`,
-	`INSERT INTO user_search_dirty (user_id)
-  SELECT u.id FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
+	// 列を足す前からある行 (表示名が NULL) を埋める。NULL の行だけなので、並行する改名が書いた表示名は上書きしない。
+	`UPDATE user_search_dirty d SET display_name = u.display_name FROM users u
+  WHERE u.id = d.user_id AND d.display_name IS NULL`,
+	// 既にある行はトリガーが今の表示名を書いているので触らない (DO NOTHING)。この文のスナップショットより後の
+	// 改名の表示名を古い名前で上書きしないため。
+	`INSERT INTO user_search_dirty (user_id, display_name)
+  SELECT u.id, u.display_name FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
   WHERE s.display_name IS DISTINCT FROM u.display_name
   ON CONFLICT DO NOTHING`,
 }
