@@ -13,8 +13,6 @@ import (
 )
 
 const (
-	// DB サーバ (メモリ 4GB) は 3 台 × 接続数ぶんのバックエンドを抱えるので、OOM にならない数に抑える。
-	dbMaxConns = 40
 	// 接続の作り直しは EU/US で 1 本 ~0.43s (TCP + 起動 + SCRAM 認証の往復) かかるので寿命は長めにする。
 	// ただしバックエンドのメモリ (プラン/ステートメントのキャッシュ) が際限なく育たないよう無期限にはしない。
 	dbConnMaxLifetime = 30 * time.Minute
@@ -24,6 +22,16 @@ const (
 	dbPingIdleThreshold = 30 * time.Second
 )
 
+// dbMaxConns はプールの上限。DB サーバ (メモリ 4GB, max_connections 200) は 3 台ぶんの
+// バックエンドを抱えるので OOM にならない数に抑える。asia1 はリクエストが EU/US の約 5 倍で、
+// 40 本ではベンチ中ずっと満杯になる (#68)。asia 80 + EU 40 + US 40 = 160。
+func dbMaxConns(region string) int {
+	if region == "asia" {
+		return 80
+	}
+	return 40
+}
+
 func openDB(config *Config) (*sqlx.DB, error) {
 	connConfig, err := pgx.ParseConfig(config.DatabaseDSN())
 	if err != nil {
@@ -32,8 +40,8 @@ func openDB(config *Config) (*sqlx.DB, error) {
 	sqlDB := stdlib.OpenDB(*connConfig, stdlib.OptionShouldPing(func(_ context.Context, p stdlib.ShouldPingParams) bool {
 		return p.IdleDuration > dbPingIdleThreshold
 	}))
-	sqlDB.SetMaxOpenConns(dbMaxConns)
-	sqlDB.SetMaxIdleConns(dbMaxConns)
+	sqlDB.SetMaxOpenConns(dbMaxConns(config.Region))
+	sqlDB.SetMaxIdleConns(dbMaxConns(config.Region))
 	sqlDB.SetConnMaxLifetime(dbConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(0)
 	return sqlx.NewDb(sqlDB, "pgx"), nil
@@ -41,15 +49,15 @@ func openDB(config *Config) (*sqlx.DB, error) {
 
 // warmUpDBPool はプールの全接続を起動時に張っておき、ベンチ開始直後のリクエストが
 // 接続確立の往復を払わないようにする。接続数は定常時 (ベンチ後) と同じなので DB の負荷は増えない。
-func warmUpDBPool(db *sqlx.DB) {
+func warmUpDBPool(db *sqlx.DB, n int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var failed int
-	conns := make(chan interface{ Close() error }, dbMaxConns)
-	for range dbMaxConns {
+	conns := make(chan interface{ Close() error }, n)
+	for range n {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -71,6 +79,6 @@ func warmUpDBPool(db *sqlx.DB) {
 		_ = conn.Close()
 	}
 	if failed > 0 {
-		fmt.Fprintf(os.Stderr, "db pool warm-up: %d/%d connections failed\n", failed, dbMaxConns)
+		fmt.Fprintf(os.Stderr, "db pool warm-up: %d/%d connections failed\n", failed, n)
 	}
 }
