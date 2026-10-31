@@ -66,11 +66,11 @@ func waitNext(t *testing.T, s *notificationSubscriber, connectedAt time.Time) (g
 func TestWatcherDeliversNewWindowWithOneFetch(t *testing.T) {
 	base := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
 	f := &fakeNotificationDB{window: "w0", rows: map[string][]windowNotification{
-		"w0": {{UserID: "u1", ID: "old", CreatedAt: base, UserActive: true, UserRegion: "asia"}},
+		"w0": {{UserID: "u1", ID: "old", CreatedAt: base}},
 		"w1": {
-			{UserID: "u1", ID: "n1", CreatedAt: base.Add(time.Minute), UserActive: true, UserRegion: "asia"},
-			{UserID: "u2", ID: "n2", CreatedAt: base.Add(time.Minute), UserActive: true, UserRegion: "asia"},
-			{UserID: "u3", ID: "n3", CreatedAt: base.Add(time.Minute), UserActive: false, UserRegion: "asia"},
+			{UserID: "u1", ID: "n1", CreatedAt: base.Add(time.Minute)},
+			{UserID: "u2", ID: "n2", CreatedAt: base.Add(time.Minute)},
+			{UserID: "u3", ID: "n3", CreatedAt: base.Add(time.Minute), kick: true},
 		},
 	}}
 	w := f.watcher()
@@ -112,7 +112,7 @@ func TestWatcherDeliversNewWindowWithOneFetch(t *testing.T) {
 func TestWatcherSkipsNotificationsNotAfterConnectedAt(t *testing.T) {
 	base := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
 	f := &fakeNotificationDB{rows: map[string][]windowNotification{
-		"w1": {{UserID: "u1", ID: "n1", CreatedAt: base, UserActive: true, UserRegion: "asia"}},
+		"w1": {{UserID: "u1", ID: "n1", CreatedAt: base}},
 	}}
 	w := f.watcher()
 	s := w.subscribe("u1")
@@ -128,7 +128,7 @@ func TestWatcherSkipsNotificationsNotAfterConnectedAt(t *testing.T) {
 func TestWatcherRetriesAfterFetchError(t *testing.T) {
 	base := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
 	f := &fakeNotificationDB{window: "w1", fetchErr: errors.New("boom"), rows: map[string][]windowNotification{
-		"w1": {{UserID: "u1", ID: "n1", CreatedAt: base.Add(time.Minute), UserActive: true, UserRegion: "asia"}},
+		"w1": {{UserID: "u1", ID: "n1", CreatedAt: base.Add(time.Minute)}},
 	}}
 	w := f.watcher()
 	s := w.subscribe("u1")
@@ -151,8 +151,8 @@ func TestWatcherRetriesAfterFetchError(t *testing.T) {
 func TestWatcherFollowsInitializeOnAnotherServer(t *testing.T) {
 	base := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
 	f := &fakeNotificationDB{window: "bench", rows: map[string][]windowNotification{
-		"init": {{UserID: "u1", ID: "old", CreatedAt: base, UserActive: true, UserRegion: "asia"}},
-		"new":  {{UserID: "u1", ID: "n", CreatedAt: base.Add(time.Hour), UserActive: true, UserRegion: "asia"}},
+		"init": {{UserID: "u1", ID: "old", CreatedAt: base}},
+		"new":  {{UserID: "u1", ID: "n", CreatedAt: base.Add(time.Hour)}},
 	}}
 	w := f.watcher()
 	ctx := context.Background()
@@ -196,7 +196,7 @@ func TestWatcherConcurrentSubscribers(t *testing.T) {
 	users := make([]string, 200)
 	for i := range users {
 		users[i] = "u" + string(rune('a'+i%26)) + time.Duration(i).String()
-		rows = append(rows, windowNotification{UserID: users[i], ID: "n" + users[i], CreatedAt: base.Add(time.Minute), UserActive: true, UserRegion: "asia"})
+		rows = append(rows, windowNotification{UserID: users[i], ID: "n" + users[i], CreatedAt: base.Add(time.Minute)})
 	}
 	f.rows["w1"] = rows
 	w := f.watcher()
@@ -248,8 +248,8 @@ func TestWatcherDeliversWindowCommittedAfterConnect(t *testing.T) {
 	w0StartsAt := base
 	w1StartsAt := base.Add(time.Minute)
 	f := &fakeNotificationDB{window: "w0", rows: map[string][]windowNotification{
-		"w0": {{UserID: "u1", ID: "n0", CreatedAt: w0StartsAt, UserActive: true, UserRegion: "asia"}},
-		"w1": {{UserID: "u1", ID: "n1", CreatedAt: w1StartsAt, UserActive: true, UserRegion: "asia"}},
+		"w0": {{UserID: "u1", ID: "n0", CreatedAt: w0StartsAt}},
+		"w1": {{UserID: "u1", ID: "n1", CreatedAt: w1StartsAt}},
 	}}
 	w := f.watcher()
 	ctx := context.Background()
@@ -280,8 +280,8 @@ func TestWatcherSkipsWindowsVisibleAtConnect(t *testing.T) {
 	prevStartsAt := base.Add(-time.Minute)
 	w0StartsAt := base
 	f := &fakeNotificationDB{rows: map[string][]windowNotification{
-		"prev": {{UserID: "u1", ID: "np", CreatedAt: prevStartsAt, UserActive: true, UserRegion: "asia"}},
-		"w0":   {{UserID: "u1", ID: "n0", CreatedAt: w0StartsAt, UserActive: true, UserRegion: "asia"}},
+		"prev": {{UserID: "u1", ID: "np", CreatedAt: prevStartsAt}},
+		"w0":   {{UserID: "u1", ID: "n0", CreatedAt: w0StartsAt}},
 	}}
 	w := f.watcher()
 	ctx := context.Background()
