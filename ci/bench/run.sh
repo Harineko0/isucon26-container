@@ -32,6 +32,14 @@ python3 "$B/portal.py" list 50 | jq -r --argjson last "${last_ci:-0}" 'select(.i
   paste -sd' ' - >"$STATE_DIR/foreign.txt"
 [ "${last_ci:-0}" != 0 ] || : >"$STATE_DIR/foreign.txt" # 記録が空のうちは判定しない
 
+# A previous failed infra deployment may have left PgBouncer inaccessible.
+# Repair it before deploy.sh restarts the app using the already-installed unit;
+# otherwise deploy-app fails before infra/deploy.sh gets a chance to repair it.
+step=pool-permissions
+ssh -i ~/.ssh/id_ed25519_github isucon@13.159.52.104 \
+  'if sudo test -f /usr/local/lib/isureal/pgbouncer-1.26.1; then bash -s -- 0; fi' \
+  <"$ROOT/infra/pgbouncer/permissions.sh"
+
 step=deploy-app
 "$B/stage.sh" deploying
 ./deploy.sh 2>&1 | tee "$STATE_DIR/deploy-app.log"

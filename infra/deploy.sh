@@ -38,6 +38,18 @@ deploy_host() {
       --backup --backup-dir="/var/tmp/infra-backup/$TS" \
       -e "$SSH" "$d/" "$addr:/" | grep -v '/$' || true)$'\n'
   done
+  # --no-perms preserves existing modes, including a root-owned 0700 directory
+  # from a previous Docker export. Repair only the dedicated pool paths, and
+  # treat a permission-only repair as a change so the failed service restarts.
+  if [ "$host" = asia1 ]; then
+    local pool_changed
+    pool_changed=$($SSH "$addr" "bash -s -- ${DRY:-0}" \
+      <"$INFRA_DIR/pgbouncer/permissions.sh") || {
+      echo "[$host] ERROR: could not ensure PgBouncer permissions" >&2
+      return 1
+    }
+    changed+="$pool_changed"$'\n'
+  fi
   changed=$(echo "$changed" | sed '/^$/d' | sort -u)
 
   if [ -z "$changed" ]; then
