@@ -5,13 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"image/jpeg"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"time"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -73,7 +71,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer imageFile.Close()
-		imageData, err := io.ReadAll(imageFile)
+		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
+		imageData, err := readUpload(imageFile, input.Image.Size)
 		if err != nil {
 			return err
 		}
@@ -89,8 +88,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 投稿時刻 (posted_at) は isureal_create_post の中で DB の時計から決まり、o_posted_at で返る
 		// (投稿期間の starts_at / ended_at と同じ時計にそろえる。アプリの時計で先に決めると、
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
-		imageID := uuid.NewString()
-		postID := uuid.NewString()
+		imageID := newTimeID()
+		postID := newTimeID()
 		var row struct {
 			SessRegion     *string    `db:"sess_region"`
 			Result         string     `db:"o_result"`
