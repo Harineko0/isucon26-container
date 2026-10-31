@@ -54,6 +54,9 @@ cat "$STATE_DIR/init.json"; echo
 
 step=fingerprint
 "$B/fingerprint.sh" | tee "$STATE_DIR/fp-before.txt"
+# app 3 台が、この run の app commit で動いていること（指紋の 2 列目 = DEPLOYED_SHA）
+n=$(awk -v sha="${APP_SHA:0:12}" '$2 == sha' "$STATE_DIR/fp-before.txt" | wc -l)
+[ "$n" -eq 3 ] || { echo "DEPLOYED_SHA: $n/3 hosts run app@${APP_SHA:0:12}"; false; }
 
 step=enqueue
 wait_portal_idle
