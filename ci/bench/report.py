@@ -71,6 +71,26 @@ def delta(score, base):
     return f"{d:+d}{pct}"
 
 
+def same_pr_prev(hist):
+    """PR の run なら、同じ PR の直前の run（FAIL も含む）。PR でない run や初回は None。"""
+    if not meta.get("pr_number"):
+        return None
+    same = [h for h in hist if str(h.get("pr_number") or "") == str(meta["pr_number"])
+            and h.get("pr_repo") == meta.get("pr_repo")]
+    return same[-1] if same else None
+
+
+def compare(score, hist):
+    """見出しと status に出す比較。PR の run は同じ PR の前回と比べ、初回だけ main と比べる。"""
+    prev = same_pr_prev(hist)
+    if prev:
+        return f"前回比 {delta(score, prev)}" if prev.get("passed") else "前回は FAIL"
+    base = baseline(hist)
+    if not base:
+        return ""
+    return f"main 比 {delta(score, base)}" + ("、この PR の初回" if meta.get("pr_number") else "")
+
+
 def render():
     lines = [MARK, f"### ISUCON bench: {meta.get('label', '?')}"]
     lines.append(
@@ -101,12 +121,15 @@ def render():
         score = job.get("score", 0)
         hist = [h for h in history() if h.get("job_id") != job["id"]]
         base = baseline(hist)
-        prev = hist[-1] if hist else None
+        if meta.get("pr_number"):
+            rows = (("この PR の前回", same_pr_prev(hist)), ("baseline (main)", base))
+        else:
+            rows = (("baseline (main)", base), ("直前の CI ベンチ", hist[-1] if hist else None))
+        cmp = compare(score, hist) if ok else ""
         jid = job["id"]
         lines += [
             "",
-            f"## {'✅ PASS' if ok else '❌ FAIL'} **{score}**"
-            + (f"　vs main {delta(score, base)}" if ok and base else ""),
+            f"## {'✅ PASS' if ok else '❌ FAIL'} **{score}**" + (f"　{cmp}" if cmp else ""),
             "",
             "| | job | score | app | container |",
             "|---|---|---:|---|---|",
@@ -114,7 +137,7 @@ def render():
             f"{sha_link(meta.get('app_repo'), meta.get('app_sha'))} | "
             f"{sha_link(meta.get('container_repo'), meta.get('container_sha'))} |",
         ]
-        for name, h in (("baseline (main)", base), ("直前の CI ベンチ", prev)):
+        for name, h in rows:
             if h:
                 lines.append(
                     f"| {name}: {h.get('label')} | [#{h['job_id']}](https://portal.isucon.net/contestant/benchmark_jobs/{h['job_id']}) | "
@@ -191,8 +214,8 @@ def status():
         res = job.get("result") or {}
         score = job.get("score", 0)
         if res.get("passed"):
-            base = baseline([h for h in history() if h.get("job_id") != job["id"]])
-            state, desc = "success", f"PASS {score}" + (f"（main 比 {delta(score, base)}）" if base else "")
+            cmp = compare(score, [h for h in history() if h.get("job_id") != job["id"]])
+            state, desc = "success", f"PASS {score}" + (f"（{cmp}）" if cmp else "")
         else:
             state, desc = "failure", f"FAIL: {res.get('reason') or job['status']}"
         if integrity:
