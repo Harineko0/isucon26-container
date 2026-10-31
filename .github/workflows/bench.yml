@@ -134,10 +134,13 @@ jobs:
       - name: Set up SSH
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          PASSPHRASE: ${{ secrets.DEPLOY_SSH_PASSPHRASE }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$KEY" >~/.ssh/id_ed25519_github
           chmod 600 ~/.ssh/id_ed25519_github
+          # パスフレーズ付きの鍵は runner 上でだけ外す（非対話で使うため）
+          [ -z "$PASSPHRASE" ] || ssh-keygen -q -p -P "$PASSPHRASE" -N "" -f ~/.ssh/id_ed25519_github
           printf 'Host *\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\n' >~/.ssh/config
 
       - name: Deploy and benchmark

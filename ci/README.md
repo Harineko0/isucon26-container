@@ -56,11 +56,13 @@ Secrets:
 |---|---|---|
 | isucon26-container | `PORTAL_COOKIE` | ブラウザでポータルを開き、DevTools → Network → 任意のリクエストの `Cookie` ヘッダの値をそのまま |
 | isucon26-container | `DEPLOY_SSH_KEY` | 4 台に `isucon` で入れる秘密鍵（手元の `~/.ssh/id_ed25519_github` 相当） |
+| isucon26-container | `DEPLOY_SSH_PASSPHRASE` | その鍵のパスフレーズ（パスフレーズなしの鍵なら不要）。CI は runner 上でだけパスフレーズを外して使う |
 | isucon26-container | `BENCH_GH_TOKEN` | private な isucon26（app サブモジュール）を読める PAT（Contents read） |
 
 ```bash
 gh secret set PORTAL_COOKIE -R Harineko0/isucon26-container
 gh secret set DEPLOY_SSH_KEY -R Harineko0/isucon26-container < ~/.ssh/id_ed25519_github
+gh secret set DEPLOY_SSH_PASSPHRASE -R Harineko0/isucon26-container
 gh secret set BENCH_GH_TOKEN -R Harineko0/isucon26-container
 ```
 
