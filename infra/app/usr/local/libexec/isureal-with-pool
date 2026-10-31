@@ -1,11 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 # The primary DSN in env.sh is also used by init.sh and session-bound work.
-export ISUREAL_APP_DB_POOL=192.168.1.10:6432
-app=/home/isucon/webapp/go/isureal
+app=${ISUREAL_APP_BIN:-/home/isucon/webapp/go/isureal}
 if [[ $ISUREAL_REGION != asia ]]; then
+  # europe1 / america1 connect to PostgreSQL on asia2 directly (through the router, ~100ms
+  # like asia1). Relaying their statements through asia1's single-threaded PgBouncer kept
+  # asia1 at 98-99% CPU (30-50% system) while asia2 was mostly idle (#68).
   exec "$app"
 fi
+export ISUREAL_APP_DB_POOL=192.168.1.10:6432
 
 # Read the existing SCRAM verifier over the normal primary connection. It must
 # be identical for PgBouncer to authenticate to PostgreSQL on the client's behalf.
