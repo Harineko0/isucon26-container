@@ -1,6 +1,8 @@
 # ベンチマークは必ずここから回す（ポータルの Enqueue と手元からのデプロイはしない）。
 #
-# - PR に `/bench [メモ]` とコメント → PR の head（infra/ 等）と、その commit が指す app サブモジュール
+# - PR を open（draft なら Ready for review）すると自動で 1 回走る
+# - PR に `/bench [メモ]` とコメント → その時点の PR の head でもう一度走る（push 後の再計測など）
+#   どちらも PR の head（infra/ 等）と、その commit が指す app サブモジュールをデプロイする
 # - 手動: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...] [-f app_ref=...]
 #
 # run は到着順に 1 本ずつ進む（ci/bench/queue.sh）。結果は PR コメントと bench-results ブランチの
@@ -8,9 +10,13 @@
 name: bench
 run-name: >-
   bench ${{ github.event_name == 'issue_comment' && format('#{0}', github.event.issue.number)
+  || github.event_name == 'pull_request_target' && format('#{0}', github.event.pull_request.number)
   || format('{0}{1}', inputs.container_ref, inputs.app_ref != '' && format(' app@{0}', inputs.app_ref) || '') }}
 
 on:
+  # pull_request_target: main にあるこのファイルの定義で動く（PR 側で workflow を書き換えても trigger は変わらない）
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -38,6 +44,8 @@ jobs:
   bench:
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/bench') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
@@ -51,6 +59,8 @@ jobs:
           APP_TOKEN: ${{ secrets.BENCH_GH_TOKEN }}
           EVENT: ${{ github.event_name }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          PR_EVENT_SHA: ${{ github.event.pull_request.head.sha }}
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           IN_CONTAINER_REF: ${{ inputs.container_ref }}
@@ -67,6 +77,8 @@ jobs:
             pr_number=$ISSUE_NUMBER
             container_ref=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .head.sha)
             note=$(head -n1 <<<"$COMMENT_BODY" | sed 's|^/bench *||')
+          elif [ "$EVENT" = pull_request_target ]; then
+            pr_number=$PR_EVENT_NUMBER container_ref=$PR_EVENT_SHA note="PR open 時の自動ベンチ"
           else
             container_ref=${IN_CONTAINER_REF:-main} app_ref=$IN_APP_REF note=$IN_NOTE
           fi

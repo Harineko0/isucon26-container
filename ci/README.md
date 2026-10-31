@@ -9,7 +9,8 @@ PR は isucon26-container に作る。app のコード変更は、`app/` サブ�
 
 | やりたいこと | 方法 | 何がデプロイされるか |
 |---|---|---|
-| PR の変更を測る | isucon26-container の PR に `/bench [メモ]` とコメント | PR の head（infra/ 等）と、その commit の `app/` が指す commit |
+| PR の変更を測る | isucon26-container に PR を open する（自動で 1 回走る。draft は Ready for review にした時点） | PR の head（infra/ 等）と、その commit の `app/` が指す commit |
+| push 後に測り直す | PR に `/bench [メモ]` とコメント | その時点の PR の head と、その `app/` が指す commit |
 | main（基準値）を測る | `gh workflow run bench.yml -R Harineko0/isucon26-container` | main と、main の `app/` が指す commit |
 | 任意の組み合わせ | `gh workflow run bench.yml -R Harineko0/isucon26-container -f container_ref=<ref> [-f app_ref=<sha>]` | 指定どおり（`app_ref` を省くとサブモジュールの指す commit） |
 
