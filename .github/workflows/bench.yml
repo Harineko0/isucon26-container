@@ -40,6 +40,8 @@ jobs:
     timeout-minutes: 180 # キュー待ちを含む
     env:
       COMMENT_TOKEN: ${{ github.token }}
+      # ci/bench/freeze.sh が見る（キュー待ち前の Freeze check と、run.sh のデプロイ直前）
+      FREEZE_AT: ${{ vars.BENCH_FREEZE_AT || '2026-10-31T17:30:00+09:00' }}
     steps:
       - name: Resolve target
         env:
@@ -96,13 +98,7 @@ jobs:
           fetch-depth: 0 # bench-results を fetch するため
 
       - name: Freeze check
-        env:
-          FREEZE_AT: ${{ vars.BENCH_FREEZE_AT || '2026-10-31T17:30:00+09:00' }}
-        run: |
-          if [ "$(date +%s)" -ge "$(date -d "$FREEZE_AT" +%s)" ] && [ "$LABEL" != main ]; then
-            ci/bench/stage.sh rejected "$FREEZE_AT 以降は main（安定版）しかベンチしません（最終スコア = 最後のベンチ）"
-            exit 1
-          fi
+        run: ci/bench/freeze.sh
 
       - name: Wait for my turn
         env:

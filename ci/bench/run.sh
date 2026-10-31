@@ -25,6 +25,10 @@ wait_portal_idle() {
 step=portal-idle
 wait_portal_idle
 
+# キュー待ち・ポータル待ちの間に凍結時刻を過ぎていたら、サーバに触らずに拒否する（#245）。
+# `||` で受けるので ERR trap（failed:*）は走らず、stage は freeze.sh が書いた rejected:* のまま
+"$B/freeze.sh" || exit 1
+
 # CI の記録にない portal ジョブ = 誰かが手で投げたベンチ
 step=foreign-check
 last_ci=$(tail -n1 "$HISTORY" 2>/dev/null | jq -r '.job_id // 0' || echo 0)
