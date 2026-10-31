@@ -44,25 +44,24 @@ const (
 var prewarmCandidates = []string{
 	// セッション・利用者・関係 (毎リクエスト)
 	"users", "users_pkey", "users_username_key", "users_region_active",
-	"login_sessions", "login_sessions_pkey", "login_sessions_token_hash", "login_sessions_user_id_active",
+	"login_sessions", "login_sessions_pkey", "login_sessions_active_token", "login_sessions_user_id_active",
 	"administrator_sessions", "administrator_sessions_pkey", "administrator_sessions_token_hash",
-	"posting_windows", "posting_windows_pkey", "posting_windows_one_active_region", "posting_windows_local_date",
+	"posting_windows", "posting_windows_pkey", "posting_windows_one_active_region", "posting_windows_date_details",
 	"posting_windows_region_local_date_key",
 	"friendships", "friendships_pkey", "friendships_high_low", "friendships_user_low_id_user_high_id_key",
 	"follows", "follows_pkey", "follows_follower_id_followee_id_key", "follows_followee_id",
 	"block_relations", "block_relations_pkey", "block_relations_blocker_id_blocked_id_key", "block_relations_blocked_id",
-	"friend_requests", "friend_requests_pkey", "friend_requests_recipient_status", "friend_requests_requester_status",
+	"friend_requests", "friend_requests_pkey", "friend_requests_pending_incoming", "friend_requests_pending_outgoing",
 	"user_search_norms", "user_search_norms_pkey", "user_search_norms_username_trgm", "user_search_norms_display_name_trgm",
 	"user_search_dirty", "user_search_dirty_pkey",
 	// 投稿 (フィード・Memories・閲覧可否・当日投稿済み判定)
 	"posts_pkey", "posts_author_window", "posts_image_id", "posts_posting_window_id", "posts",
-	// Memories のコメント一覧・RealMoji 一覧 (ここまでで約 580MB = shared_buffers 768MB の 75%)
-	"comments_post_id", "realmojis_one_active",
-	// ここから先は 'read' になる見込み (shared_buffers 768MB では入らない)。
-	// 画像の閲覧可否確認 (realmojis.image_id と月パーティションの主キーで 1 行引く)、heap
-	"realmojis_image_id", "image_objects_*_pkey",
+	// Memories は投稿 ID から両方の一覧を引く。コメントと RealMoji の主キーは
+	// 使われたページだけ通常の読み取りで載せ、全ページの先読みは省く。
+	"comments_post_id", "realmojis_post_id",
+	// 画像の可否確認とリアクションの照会。大きい索引・heap は予算を超えれば 'read' で読む。
+	"realmojis_image_id", "realmojis_one_active", "image_objects_*_pkey",
 	"comments", "realmojis", "image_objects_*",
-	"comments_pkey", "realmojis_pkey", "realmojis_post_id",
 }
 
 var imageMonthlyPartition = regexp.MustCompile(`^image_objects_[0-9]{6}(_pkey)?$`)

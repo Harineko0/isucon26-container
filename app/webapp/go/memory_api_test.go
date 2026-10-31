@@ -81,10 +81,15 @@ func memoryTestDB(t *testing.T) *sqlx.DB {
         timestamptz '2026-10-20 00:00:00Z' + (i/3)*interval '1 second',
         CASE WHEN i=2 THEN now() END, CASE WHEN i=3 THEN now() END
  FROM generate_series(1,65) i;
+ INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at)
+ SELECT 'other-'||id, 'p054', reactor_id, image_id, reaction_type, created_at
+ FROM realmojis WHERE post_id='p055';
  INSERT INTO comments(id,post_id,author_id,body,created_at,deleted_at)
  SELECT 'c'||lpad(i::text,3,'0'), 'p055', 'u'||(i+1), 'コメント '||i,
         timestamptz '2026-10-20 00:00:00Z' + (i/3)*interval '1 second', CASE WHEN i=3 THEN now() END
  FROM generate_series(1,65) i;
+ INSERT INTO comments(id,post_id,author_id,body,created_at)
+ SELECT 'other-'||id, 'p054', author_id, body, created_at FROM comments WHERE post_id='p055';
  UPDATE users SET status='deleted' WHERE id='u5';`)
 	return db
 }
@@ -147,8 +152,10 @@ func TestMemoriesMatchesLegacy(t *testing.T) {
 				if len(got.Items) != 50 || !got.HasMore {
 					t.Fatalf("page: %d, more=%v", len(got.Items), got.HasMore)
 				}
-				if len(got.Items[0].RealMojis) != 50 || len(got.Items[0].Comments) != 50 {
-					t.Fatal("interaction limits")
+				for _, item := range got.Items[:2] {
+					if len(item.RealMojis) != 50 || len(item.Comments) != 50 {
+						t.Fatalf("interaction limits for post %s", item.ID)
+					}
 				}
 				data, _ := json.Marshal(got)
 				if strings.Contains(string(data), "SigningKey") || strings.Contains(string(data), "secret_key_hash") {

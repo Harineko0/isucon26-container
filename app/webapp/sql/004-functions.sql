@@ -44,11 +44,15 @@ BEGIN
     IF NOT FOUND THEN
       v_fail := 'no_user'; RAISE SQLSTATE 'IR001';
     END IF;
-    -- FOR SHARE: 同じリージョンの投稿どうしは並行させ、投稿期間の終了(UPDATE)とだけ排他にする。
-    SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL FOR SHARE;
-    IF NOT FOUND THEN
-      SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL FOR SHARE;
-    END IF;
+    -- リージョンごとの advisory lock を共有モードでとる (#79)。同じリージョンの投稿どうしは並行させ、
+    -- 投稿期間の切替 (admin_posting_window_api.go が同じ鍵を排他モードでとる) とだけ排他にする。
+    -- 以前は posting_windows の行を FOR SHARE していたが、同じ 1 行に数十の共有ロックが重なるたびに
+    -- MultiXact が作られ (SLRU ヒット 70 万回)、文の平均が 29ms かかっていた。advisory lock は
+    -- 共有メモリのロックテーブルだけで済み、行には何も書かない。
+    -- ロックをとった後の文なので、待っている間にコミットされた切替 (新しい期間) が見える
+    -- (READ COMMITTED では VOLATILE な関数の文ごとに新しいスナップショットをとる)。
+    PERFORM pg_advisory_xact_lock_shared(isureal_region_lock_key(u.region));
+    SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL;
     IF NOT FOUND THEN
       v_fail := 'slot_unavailable'; RAISE SQLSTATE 'IR001';
     END IF;
@@ -60,7 +64,7 @@ BEGIN
       v_fail := 'slot_unavailable'; RAISE SQLSTATE 'IR001';
     END IF;
     -- 画像を入れてからロックを取るまでの間に投稿期間が切り替わった (旧期間の ended_at = 新期間の starts_at は
-    -- 切替側が FOR UPDATE を取った後に刻むので、v_posted_at がそれより前になる) 場合は、
+    -- 切替側が排他の advisory lock を取った後に刻むので、v_posted_at がそれより前になる) 場合は、
     -- 今ロックを取っている新期間の中の時刻として投稿時刻を取り直す。切替は(新期間の)ロック取得より前に
     -- コミット済みなので、ここで取る clock_timestamp() は必ず starts_at 以降になる。
     -- 以前はここで 409 (slot_unavailable) にしていたが、切替待ちの間に届いた投稿を落とすだけだった。
@@ -136,8 +140,13 @@ END $$;
 -- 関係の変更が users 行から読むのは status(active か)と account_type だけで、status を変えるのは退会だけなので、
 -- 利用者ごとの advisory lock を共有モードでとり、退会(isureal_delete_account)は同じ鍵を排他モードでとる。
 -- 関係の表(friend_requests / friendships / follows / block_relations)を書くのは、2 人組のロックを持つ
--- isureal_relationship と isureal_transition_friend_request だけ。
+-- isureal_relationship と isureal_transition_friend_request(_authorized、005)だけ。
 -- ロックの順序: 利用者ごと(id 順) → 2 人組 → 行。コメント・RealMoji は行 → 2 人組だが、利用者ごとのロックはとらない。
+-- 投稿期間の切替と投稿の直列化に使う、リージョンごとの advisory lock の鍵 (#79)。
+-- 投稿 (isureal_create_post) が共有モード、切替 (admin_posting_window_api.go) が排他モードでとる。
+CREATE OR REPLACE FUNCTION isureal_region_lock_key(p_region text) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:region:' || p_region, 0) $$;
+
 CREATE OR REPLACE FUNCTION isureal_user_lock_key(p_user text) RETURNS bigint
 LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:user:' || p_user, 0) $$;
 
@@ -145,12 +154,16 @@ CREATE OR REPLACE FUNCTION isureal_pair_lock_key(p_a text, p_b text) RETURNS big
 LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:pair:' || least(p_a, p_b) || ':' || greatest(p_a, p_b), 0) $$;
 
 -- 2 人をロックし、2 人とも active なら true を返す。
+-- 3 つのロックは 1 文でとる(#154 のベンチで PERFORM 1 文が平均 2ms かかっていた。CPU が飽和した DB では文の数が効く)。
+-- 選択リストは左から順に評価されるので、順序は 利用者ごと(id 順) → 2 人組 のまま。
+-- isureal_relationship(friend_request)と isureal_transition_friend_request_authorized は、この関数を呼ばずに
+-- 同じ 1 文を直接書き、続く読み取りを 1 文にまとめている(ロックの順序とロックの後で読むことは同じ)。
 CREATE OR REPLACE FUNCTION isureal_lock_pair(p_a text, p_b text) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(least(p_a, p_b)));
-  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(greatest(p_a, p_b)));
-  PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_a, p_b));
+  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(least(p_a, p_b))),
+          pg_advisory_xact_lock_shared(isureal_user_lock_key(greatest(p_a, p_b))),
+          pg_advisory_xact_lock(isureal_pair_lock_key(p_a, p_b));
   -- ロックをとった後の文なので、待っている間にコミットされた退会や関係の変更も見える
   -- (READ COMMITTED では VOLATILE な関数の文ごとに新しいスナップショットをとる)。
   RETURN (SELECT count(*) FROM users WHERE id IN (p_a, p_b) AND status = 'active') = 2;
@@ -168,32 +181,53 @@ DECLARE
   v_type text;
   v_req friend_requests%ROWTYPE;
   v_count int;
+  v_active boolean;
+  v_conflict boolean;
+  v_pending_id text;
+  v_pending_requester text;
 BEGIN
-  IF NOT isureal_lock_pair(p_actor, p_target) THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
-
   IF p_action = 'friend_request' THEN
-    IF EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
-       OR EXISTS(SELECT 1 FROM friendships WHERE user_low_id = v_low AND user_high_id = v_high) THEN
-      o_result := 'conflict'; RETURN NEXT; RETURN;
-    END IF;
-    SELECT * INTO v_req FROM friend_requests WHERE status = 'pending' AND
-      ((requester_id = p_actor AND recipient_id = p_target) OR (requester_id = p_target AND recipient_id = p_actor))
-    LIMIT 1;
-    IF FOUND THEN
-      IF v_req.requester_id = p_actor THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
-      UPDATE friend_requests SET status = 'accepted', updated_at = clock_timestamp() WHERE id = v_req.id RETURNING * INTO v_req;
+    -- isureal_lock_pair と同じロックを同じ順序でとり、その後の 1 文で「2 人とも active か」「ブロック・友達か」
+    -- 「2 人の間の pending の申請」をまとめて読む(以前は lock_pair の 4 文 + 2 文。判定の順序と結果は同じ)。
+    -- 3 つの表を書くのは 2 人組のロックを持つ関数だけなので、文を 1 つにまとめても読む値は変わらない。
+    PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(v_low)),
+            pg_advisory_xact_lock_shared(isureal_user_lock_key(v_high)),
+            pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_target));
+    SELECT x.active, x.conflict, fr.id, fr.requester_id INTO v_active, v_conflict, v_pending_id, v_pending_requester
+    FROM (SELECT (SELECT count(*) FROM users WHERE id IN (p_actor, p_target) AND status = 'active') = 2 AS active,
+                 EXISTS(SELECT 1 FROM block_relations WHERE blocker_id = p_actor AND blocked_id = p_target
+                        UNION ALL
+                        SELECT 1 FROM block_relations WHERE blocker_id = p_target AND blocked_id = p_actor)
+                 OR EXISTS(SELECT 1 FROM friendships WHERE user_low_id = v_low AND user_high_id = v_high) AS conflict) x
+    LEFT JOIN LATERAL (
+      SELECT id, requester_id FROM friend_requests WHERE status = 'pending' AND
+        ((requester_id = p_actor AND recipient_id = p_target) OR (requester_id = p_target AND recipient_id = p_actor))
+      LIMIT 1
+    ) fr ON true;
+    IF NOT v_active THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
+    IF v_conflict THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
+    IF v_pending_id IS NOT NULL THEN
+      IF v_pending_requester = p_actor THEN o_result := 'conflict'; RETURN NEXT; RETURN; END IF;
+      UPDATE friend_requests SET status = 'accepted', updated_at = clock_timestamp() WHERE id = v_pending_id RETURNING * INTO v_req;
       INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
       VALUES (gen_random_uuid()::text, least(v_req.requester_id, v_req.recipient_id), greatest(v_req.requester_id, v_req.recipient_id), v_req.id);
     ELSE
       INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
       VALUES (p_new_id, p_actor, p_target, 'pending', clock_timestamp(), clock_timestamp()) RETURNING * INTO v_req;
     END IF;
-    RETURN QUERY SELECT 'ok'::text, v_req.id::text, v_req.status, v_req.updated_at;
+    o_result := 'ok'; o_id := v_req.id; o_status := v_req.status; o_updated_at := v_req.updated_at;
+    RETURN NEXT;
     RETURN;
-  ELSIF p_action = 'follow' THEN
+  END IF;
+
+  IF NOT isureal_lock_pair(p_actor, p_target) THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
+
+  IF p_action = 'follow' THEN
     SELECT account_type INTO v_type FROM users WHERE id = p_target AND status = 'active';
     IF v_type IS DISTINCT FROM 'certified_public'
-       OR EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
+       OR EXISTS(SELECT 1 FROM block_relations WHERE blocker_id = p_actor AND blocked_id = p_target
+                 UNION ALL
+                 SELECT 1 FROM block_relations WHERE blocker_id = p_target AND blocked_id = p_actor)
        OR EXISTS(SELECT 1 FROM follows WHERE follower_id = p_actor AND followee_id = p_target) THEN
       o_result := 'conflict'; RETURN NEXT; RETURN;
     END IF;
@@ -237,7 +271,9 @@ BEGIN
   SELECT * INTO v_req FROM friend_requests WHERE id = p_request_id;
   IF v_req.status <> 'pending' THEN o_result := 'forbidden'; RETURN NEXT; RETURN; END IF;
   IF p_status = 'accepted' THEN
-    IF EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = v_req.requester_id AND blocked_id = v_req.recipient_id) OR (blocker_id = v_req.recipient_id AND blocked_id = v_req.requester_id)) THEN
+    IF EXISTS(SELECT 1 FROM block_relations WHERE blocker_id = v_req.requester_id AND blocked_id = v_req.recipient_id
+              UNION ALL
+              SELECT 1 FROM block_relations WHERE blocker_id = v_req.recipient_id AND blocked_id = v_req.requester_id) THEN
       o_result := 'conflict'; RETURN NEXT; RETURN;
     END IF;
     INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
@@ -251,52 +287,60 @@ END $$;
 CREATE OR REPLACE FUNCTION isureal_post_access(p_viewer text, p_post text, OUT can_view boolean, OUT can_comment boolean)
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
-  v users%ROWTYPE;
-  p posts%ROWTYPE;
+  v_region text;
+  p_author_id text;
+  p_visibility text;
   w_ended timestamptz;
   posted boolean;
   is_friend boolean;
 BEGIN
   can_view := false;
   can_comment := false;
-  SELECT pp.* INTO p FROM posts pp JOIN users a ON a.id = pp.author_id AND a.status = 'active'
+  SELECT pp.author_id, pp.visibility, pw.ended_at
+    INTO p_author_id, p_visibility, w_ended
+  FROM posts pp
+  JOIN users a ON a.id = pp.author_id AND a.status = 'active'
+  JOIN posting_windows pw ON pw.id = pp.posting_window_id
   WHERE pp.id = p_post AND pp.deleted_at IS NULL;
   IF NOT FOUND THEN RETURN; END IF;
-  SELECT ended_at INTO w_ended FROM posting_windows WHERE id = p.posting_window_id;
-  SELECT * INTO v FROM users WHERE id = p_viewer AND status = 'active';
+  SELECT region INTO v_region FROM users WHERE id = p_viewer AND status = 'active';
   IF NOT FOUND THEN RETURN; END IF;
   IF w_ended IS NOT NULL THEN
-    can_view := p.author_id = v.id;
+    can_view := p_author_id = p_viewer;
     RETURN;
   END IF;
   posted := EXISTS(
     SELECT 1 FROM posts pp
     JOIN posting_windows pw ON pw.id = pp.posting_window_id
-    JOIN posting_windows cur ON cur.region = v.region AND cur.ended_at IS NULL AND cur.local_date = pw.local_date
-    WHERE pp.author_id = v.id AND pp.deleted_at IS NULL);
-  IF p.author_id = v.id THEN
+    JOIN posting_windows cur ON cur.region = v_region AND cur.ended_at IS NULL AND cur.local_date = pw.local_date
+    WHERE pp.author_id = p_viewer AND pp.deleted_at IS NULL);
+  IF p_author_id = p_viewer THEN
     can_view := true;
-  ELSIF w_ended IS NOT NULL OR NOT posted
-     OR EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = v.id AND blocked_id = p.author_id) OR (blocker_id = p.author_id AND blocked_id = v.id)) THEN
+  ELSIF NOT posted
+     OR EXISTS(
+       SELECT 1 FROM block_relations WHERE blocker_id = p_viewer AND blocked_id = p_author_id
+       UNION ALL
+       SELECT 1 FROM block_relations WHERE blocker_id = p_author_id AND blocked_id = p_viewer
+     ) THEN
     can_view := false;
-  ELSIF p.visibility = 'public' THEN
+  ELSIF p_visibility = 'public' THEN
     can_view := true;
   ELSE
-    is_friend := EXISTS(SELECT 1 FROM friendships WHERE user_low_id = least(v.id, p.author_id) AND user_high_id = greatest(v.id, p.author_id));
-    IF p.visibility = 'friends' THEN
+    is_friend := EXISTS(SELECT 1 FROM friendships WHERE user_low_id = least(p_viewer, p_author_id) AND user_high_id = greatest(p_viewer, p_author_id));
+    IF p_visibility = 'friends' THEN
       can_view := is_friend;
-    ELSIF p.visibility = 'friends_of_friends' THEN
+    ELSIF p_visibility = 'friends_of_friends' THEN
       can_view := is_friend OR EXISTS(
       SELECT 1 FROM friendships f1
-      CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = v.id THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
-      JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p.author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p.author_id)
-      WHERE f1.user_low_id = v.id OR f1.user_high_id = v.id);
+      CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = p_viewer THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
+      JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p_author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p_author_id)
+      WHERE f1.user_low_id = p_viewer OR f1.user_high_id = p_viewer);
     END IF;
   END IF;
-  IF can_view AND w_ended IS NULL THEN
-    IF v.id = p.author_id THEN
+  IF can_view THEN
+    IF p_viewer = p_author_id THEN
       can_comment := posted;
-    ELSIF p.visibility = 'public' THEN
+    ELSIF p_visibility = 'public' THEN
       can_comment := true;
     ELSE
       can_comment := is_friend;
@@ -324,9 +368,10 @@ BEGIN
   BEGIN
     -- リアクションした人が存在しなければ外部キー違反(23503) → 'not_found'(従来と同じ結果)。
     INSERT INTO image_objects (id, owner_user_id, data, media_type, stored_region) VALUES (p_image_id, p_actor, p_data, 'image/jpeg', p_stored_region);
-    PERFORM 1 FROM users WHERE id = least(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
+    -- 2 人の users 行は共有ロック (FOR SHARE) にする (理由は isureal_create_comment の上)。
+    PERFORM 1 FROM users WHERE id = least(p_actor, p_author) AND status = 'active' FOR SHARE;
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
-    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
+    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) AND status = 'active' FOR SHARE;
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
     -- 2 人の関係の変更(ブロック・友達の解除など)と直列化する(isureal_lock_pair)。
     PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_author));
@@ -349,6 +394,19 @@ BEGIN
     u.profile_image_id::text, u.region, u.account_type, u.status;
 END $$;
 
+-- コメント・RealMoji (isureal_replace_realmoji) は、リアクションする人と投稿者の users 行を共有ロック (FOR SHARE) でとる。
+-- 以前は FOR NO KEY UPDATE (排他) で、同じ投稿者の投稿へのコメント・RealMoji どうしが投稿者の行で 1 件ずつ
+-- 直列に待っていた (1 ベンチで 2 つの行ロックだけで平均 40〜46ms ずつ)。共有ロックどうしは待たない。
+-- 共有ロックでも直列化が保たれる相手 (FOR SHARE は UPDATE・FOR NO KEY UPDATE・FOR UPDATE と衝突する):
+--   退会 (isureal_delete_account: FOR NO KEY UPDATE → UPDATE users SET status)、PATCH /api/me の region 変更
+--   (isureal_update_me: UPDATE users)、投稿の作成・公開範囲の変更・削除 (isureal_create_post / isureal_update_post /
+--   isureal_delete_post: 投稿者の行を FOR NO KEY UPDATE)、ログイン・ログアウト・プロフィール画像 (FOR NO KEY UPDATE)。
+--   待っている間に退会がコミットされれば、WHERE status = 'active' を新しい版で見直して見つからない (従来と同じ)。
+-- 2 人の関係の変更 (ブロック・友達の解除・友達申請の承認) は users 行をロックせず、2 人組の advisory lock で
+-- 直列化しているので、下の pg_advisory_xact_lock(isureal_pair_lock_key(...)) がそのまま効く。
+-- 共有ロックどうしで衝突しなくなるのはコメント・RealMoji どうしだけで、同じ 2 人組の RealMoji の置き換えは
+-- 2 人組の advisory lock で今までどおり直列になる。ロックの順序 (least → greatest → 2 人組) は変えない。
+-- 同じトランザクションの中で同じ行をより強いモードでロックし直すことはない (昇格によるデッドロックは起きない)。
 -- o_result: ok / forbidden(403 interaction_forbidden)
 CREATE OR REPLACE FUNCTION isureal_create_comment(
   p_actor text, p_post text, p_id text, p_body text
@@ -363,10 +421,10 @@ DECLARE
 BEGIN
   SELECT author_id INTO p_author FROM posts WHERE id = p_post AND deleted_at IS NULL;
   IF NOT FOUND THEN o_result := 'forbidden'; RETURN NEXT; RETURN; END IF;
-  PERFORM 1 FROM users WHERE id = least(p_actor, p_author) FOR NO KEY UPDATE;
+  PERFORM 1 FROM users WHERE id = least(p_actor, p_author) FOR SHARE;
   IF NOT FOUND THEN RAISE EXCEPTION 'user not found'; END IF;
   IF p_actor <> p_author THEN
-    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) FOR NO KEY UPDATE;
+    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) FOR SHARE;
     IF NOT FOUND THEN RAISE EXCEPTION 'user not found'; END IF;
     -- 2 人の関係の変更(ブロック・友達の解除など)と直列化する(isureal_lock_pair)。
     PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_author));
@@ -478,9 +536,11 @@ END $$;
 -- 「開始時刻 (ミリ秒) の 16 進 12 桁 + gen_random_uuid() の後半」と同じで、後半を
 -- md5(期間 id || ':' || 利用者 id) から UUID version 4 / variant 8〜b の形で作る (全体で 36 文字)。
 CREATE OR REPLACE FUNCTION isureal_notification_id(p_window_id text, p_user_id text, p_starts_at timestamptz)
-RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
-  SELECT substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
-         || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12)
-  FROM (SELECT lpad(to_hex((extract(epoch FROM p_starts_at) * 1000)::bigint), 12, '0') AS ts,
-               md5(p_window_id || ':' || p_user_id) AS h) x
-$$;
+RETURNS text LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE
+  ts CONSTANT text := lpad(to_hex((extract(epoch FROM p_starts_at) * 1000)::bigint), 12, '0');
+  h CONSTANT text := md5(p_window_id || ':' || p_user_id);
+BEGIN
+  RETURN substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
+         || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12);
+END $$;

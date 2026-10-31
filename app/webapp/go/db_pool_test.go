@@ -1,26 +1,76 @@
 package isureal
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 )
 
-// TestDBConnConfigPlanCacheMode は アプリの接続が起動パケットで plan_cache_mode を送り、
-// 文を prepare する実行モード (generic plan が効くモード) のままであることを確かめる (#153)。
+func TestRequestPoolKeepsSessionConnectionsOnPrimary(t *testing.T) {
+	for region, want := range map[string]int{"asia": 64, "europe": 128, "america": 128} {
+		t.Run(region, func(t *testing.T) {
+			cfg := &Config{Region: region, DBHost: "127.0.0.1", DBPort: "5432", DBSSLMode: "disable"}
+			primary, err := openDB(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer primary.Close()
+			direct, err := openRequestDB(cfg, primary, "")
+			if err != nil || direct != primary || direct.Stats().MaxOpenConnections != dbMaxConns(region) {
+				t.Fatalf("direct pool changed: %v", err)
+			}
+			pooled, err := openRequestDB(cfg, primary, "127.0.0.2:6432")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pooled.Close()
+			if pooled == primary || pooled.Stats().MaxOpenConnections != want || primary.Stats().MaxOpenConnections != 4 {
+				t.Fatalf("unexpected limits: app %d, primary %d", pooled.Stats().MaxOpenConnections, primary.Stats().MaxOpenConnections)
+			}
+			if cfg.DBHost != "127.0.0.1" || cfg.DBPort != "5432" {
+				t.Fatal("direct connection settings were overwritten")
+			}
+		})
+	}
+}
+
+// PostgreSQL に直接つなぐ接続は plan_cache_mode を起動パケットで送り、文を prepare する実行モード
+// (generic plan が効くモード) のままであること。PgBouncer 宛てには送らないこと (PgBouncer は知らない起動
+// パラメータを拒み、接続できなくなる。PgBouncer 側は pgbouncer.ini の connect_query で設定する) (#153)。
 func TestDBConnConfigPlanCacheMode(t *testing.T) {
 	config := &Config{DBHost: "192.0.2.1", DBPort: "5432", DBUser: "isureal", DBPassword: "isureal", DBName: "isureal", DBSSLMode: "disable"}
-	connConfig, err := dbConnConfig(config)
+	direct, err := dbConnConfig(config, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := connConfig.RuntimeParams["plan_cache_mode"]; got != "force_generic_plan" {
-		t.Errorf("plan_cache_mode = %q, want force_generic_plan", got)
+	if got := direct.RuntimeParams["plan_cache_mode"]; got != "force_generic_plan" {
+		t.Errorf("direct: plan_cache_mode = %q, want force_generic_plan", got)
 	}
-	if got := connConfig.DefaultQueryExecMode; got != pgx.QueryExecModeCacheStatement {
+	if got := direct.DefaultQueryExecMode; got != pgx.QueryExecModeCacheStatement {
 		t.Errorf("DefaultQueryExecMode = %v, want QueryExecModeCacheStatement", got)
 	}
-	if connConfig.Host != "192.0.2.1" || connConfig.Database != "isureal" {
-		t.Errorf("DSN fields lost: host=%q db=%q", connConfig.Host, connConfig.Database)
+	pooled, err := dbConnConfig(config, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := pooled.RuntimeParams["plan_cache_mode"]; ok {
+		t.Errorf("PgBouncer connection sends plan_cache_mode = %q in the startup packet", got)
+	}
+}
+
+// pgbouncer.ini が PgBouncer のサーバー接続に plan_cache_mode を設定すること (#153)。
+func TestPgBouncerSetsPlanCacheMode(t *testing.T) {
+	ini, err := os.ReadFile("../../../infra/hosts/asia1/etc/isureal/pgbouncer.ini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "connect_query='SET plan_cache_mode = " + dbPlanCacheMode + "'"
+	if !strings.Contains(string(ini), want) {
+		t.Errorf("pgbouncer.ini does not contain %s", want)
+	}
+	if strings.Contains(string(ini), "ignore_startup_parameters") {
+		t.Errorf("pgbouncer.ini ignores startup parameters; plan_cache_mode would be dropped silently")
 	}
 }

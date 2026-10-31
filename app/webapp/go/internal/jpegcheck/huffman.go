@@ -26,8 +26,9 @@ type huffman struct {
 	// are 1 plus the code length, or 0 if the value is too large to fit in
 	// lutSize bits.
 	lut [1 << lutSize]uint16
-	// Sequential AC symbols which only advance the coefficient and bit positions.
-	acStep [1 << lutSize]struct{ coefficients, bits uint8 }
+	// seq is the look-up table of the sequential fast path (sequential.go):
+	// the decoded symbol and the bits consumed by the code and its amplitude.
+	seq [1 << seqLutBits]uint16
 	// vals are the decoded values, sorted by their encoding.
 	vals [maxNCodes]uint8
 	// minCodes[i] is the minimum code of length i, or -1 if there are no
@@ -153,22 +154,6 @@ func (d *decoder) processDHT(n int) error {
 			}
 		}
 
-		if tc == acTable && !d.progressive {
-			for prefix, entry := range h.lut {
-				step := &h.acStep[prefix]
-				step.coefficients, step.bits = 0, 0
-				if entry == 0 {
-					continue
-				}
-				symbol := uint8(entry >> 8)
-				size := symbol & 15
-				if size != 0 || symbol == 0xf0 {
-					step.coefficients = 1 + symbol>>4
-					step.bits = uint8(entry) - 1 + size
-				}
-			}
-		}
-
 		// Derive minCodes, maxCodes, and valsIndices.
 		var c, index int32
 		for i, n := range nCodes {
@@ -185,6 +170,10 @@ func (d *decoder) processDHT(n int) error {
 			}
 			c <<= 1
 		}
+
+		// A short code is independent of trailing bits only in a prefix-free
+		// table. c is twice the next code at the maximum code length.
+		h.buildSeqLut(tc == acTable, c <= 1<<(maxCodeLength+1))
 	}
 	return nil
 }

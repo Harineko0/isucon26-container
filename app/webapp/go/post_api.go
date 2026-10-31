@@ -89,7 +89,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
 		var input createPostRequest
-		if err := c.Bind(&input); err != nil {
+		formImage, err := bindImageForm(c, &input)
+		if err != nil {
 			return err
 		}
 		if input.Image == nil || !validUserText(input.Caption, 0, 1000) {
@@ -107,13 +108,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if !location.valid() {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		imageFile, err := input.Image.Open()
-		if err != nil {
-			return err
-		}
-		defer imageFile.Close()
-		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
-		imageData, err := readUpload(imageFile, input.Image.Size)
+		imageData, err := readFormImage(input.Image, formImage)
 		if err != nil {
 			return err
 		}
@@ -122,7 +117,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if _, _, err := jpegcheck.Validate(bytes.NewReader(imageData)); err != nil {
+		if _, _, err := jpegcheck.ValidateBytes(imageData); err != nil {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
@@ -200,6 +195,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 func newPostResponse(post Post, user User) createPostResponse {
 	// 投稿画像の created_at は投稿時刻と同じ(画像取得でパーティションを絞る手がかり)。
 	imageCreatedAt.Store(post.ImageID, post.PostedAt)
+	rememberImageKey(post.ImageID, user.ImageKey)
 	response := createPostResponse{
 		ID: post.ID,
 		Author: postAuthorResponse{

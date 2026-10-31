@@ -55,8 +55,8 @@ func (c *imageDataCache) locate(id string) (data []byte, accelURI string, ok boo
 	if path, ok := imageDiskPath(id); ok && imageFileExists(path) {
 		return nil, imageDiskAccelPrefix + id[:2] + "/" + id, true
 	}
-	if path, ok := imageStorePath(id); ok && imageFileExists(path) {
-		return nil, imageStoreAccelPrefix + id[:2] + "/" + id, true
+	if path, ok := storedImagePath(id); ok {
+		return nil, imageStoreAccelPrefix + filepath.Base(filepath.Dir(path)) + "/" + id, true
 	}
 	return nil, "", false
 }
@@ -107,6 +107,26 @@ func WriteImageToDisk(id string, data []byte) error {
 		os.Remove(tmp)
 	}
 	return err
+}
+
+// imageOwnerKeys は画像 id → 所有者の署名鍵 (users.secret_key_hash を decode したもの)。
+// image_objects.owner_user_id も secret_key_hash も UPDATE されない (git grep で確認) ので不変。
+// 署名が合わないリクエストを DB に問い合わせる前に 403 にするために使う (#95)。
+// 投稿・RealMoji の作成時と、画像取得で DB から読んだときに覚える。上限を超えて捨てても DB での確認に戻るだけ。
+var imageOwnerKeys = &boundedMap{limit: 2_000_000}
+
+func rememberImageKey(id string, key []byte) {
+	if len(key) != 0 {
+		imageOwnerKeys.Store(id, key)
+	}
+}
+
+func loadImageKey(id string) ([]byte, bool) {
+	v, ok := imageOwnerKeys.Load(id)
+	if !ok {
+		return nil, false
+	}
+	return v.([]byte), true
 }
 
 func readImageFromDisk(id string) ([]byte, bool) {
@@ -221,11 +241,15 @@ func (c *imageDataCache) get(id string) ([]byte, bool) {
 		return data, true
 	}
 	if data, ok := readImageFromDisk(id); ok {
-		c.put(id, data)
+		if !imageAccelEnabled {
+			c.put(id, data)
+		}
 		return data, true
 	}
 	if data, ok := readImageFromStore(id); ok {
-		c.put(id, data)
+		if !imageAccelEnabled {
+			c.put(id, data)
+		}
 		return data, true
 	}
 	return nil, false

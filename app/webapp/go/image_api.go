@@ -41,36 +41,31 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
+		// 所有者の署名鍵を覚えていれば、署名の確認は DB に問い合わせる前に済ませる (#95)。
+		// 鍵は不変なので判定は DB で確かめた場合と同じ。無効な署名は asia1 で 1 ベンチ 550 件あり、
+		// 満杯のプール (#68) で接続を待ってから 403 にしていた。
+		knownKey, hasKey := loadImageKey(input.ImageID)
+		if hasKey && !hmac.Equal(sig, imageSignature(knownKey, input.ImageID, exp)) {
+			c.Set("abuse", "invalid_signature")
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
 		// 本体の在り処: メモリ (cached)、ディスク (accelURI。本体は Go では読まず nginx に返させる)、どちらでもない。
 		cached, accelURI, hasData := imageDataStore.locate(input.ImageID)
 		if !hasData {
 			prefetchStoredImage(input.ImageID, h.Config.Region)
 		}
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
-		var object struct {
-			SecretKeyHash string    `db:"secret_key_hash"`
-			MediaType     string    `db:"media_type"`
-			Data          []byte    `db:"data"`
-			StoredRegion  *string   `db:"stored_region"`
-			Allowed       bool      `db:"allowed"`
-			CreatedAt     time.Time `db:"created_at"`
-			Partition     string    `db:"partition"`
-		}
-		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
-		if err != nil {
-			return err
-		}
+		request := imageReadRequest{id: input.ImageID, hasData: hasData, ip: c.RealIP()}
 		// 画像の created_at は不変なので、手がかり (imageCreatedAt / imagePartitions) があればそのパーティションの表を
 		// 直接引く (image_partition.go)。親表を引くと全パーティションの表ロックを取り、asia2 の LockManager が詰まる。
 		rel, exact := imageRelationFor(input.ImageID, time.Now())
-		err = conn.GetContext(ctx, &object, imageQueryFor(rel), input.ImageID, hasData)
+		object, err := readImageObject(ctx, h, rel, request)
 		hinted := err == nil
 		if errors.Is(err, sql.ErrNoRows) && !exact {
 			// 手がかり (または今のパーティションという推測) が外れていた場合に備えて親表で引き直す。
 			// DB から教わった葉 (exact) に無ければ画像は消えているので、そのまま 403 にする。
-			err = conn.GetContext(ctx, &object, imageQueryFor("image_objects"), input.ImageID, hasData)
+			object, err = readImageObject(ctx, h, "image_objects", request)
 		}
-		conn.Close()
 		if err == nil {
 			if !hinted {
 				imageCreatedAt.Store(input.ImageID, object.CreatedAt)
@@ -88,6 +83,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		key, err := imageSigningKey(object.SecretKeyHash)
 		if err != nil {
 			return err
+		}
+		if !hasKey {
+			rememberImageKey(input.ImageID, key)
 		}
 		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
 			c.Set("abuse", "invalid_signature")

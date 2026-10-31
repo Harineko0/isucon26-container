@@ -16,7 +16,9 @@ HOSTS="${HOSTS:-13.159.52.104 52.199.206.161 52.197.40.86}"
 # HTTP は叩かない（アクセスログ・action log・ip_bans の判定に余計なリクエストを混ぜない）。
 REMOTE='set -e
 cd ~/webapp/go
-PATH=$HOME/local/go/bin:$PATH GOEXPERIMENT=simd go build -o isureal.new cmd/isureal/main.go
+# All three app hosts support amd64-v3. The profile combines 50 s of CPU sampling
+# per region on e359706. Use an explicit name so other revisions can build without it.
+PATH=$HOME/local/go/bin:$PATH GOAMD64=v3 GOEXPERIMENT=simd go build -pgo=cmd/isureal/service-cpu.pgo -o isureal.new cmd/isureal/main.go
 mv isureal.new isureal
 rm -rf ~/.git
 echo '"$SHA"' >~/webapp/DEPLOYED_SHA

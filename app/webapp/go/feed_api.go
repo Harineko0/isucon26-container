@@ -183,8 +183,9 @@ const feedFriendsCTE = `
 
 const feedBlockedCTE = `
   blocked AS (
-    SELECT CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END AS id
-    FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+    SELECT blocked_id AS id FROM block_relations WHERE blocker_id = $1
+    UNION ALL
+    SELECT blocker_id AS id FROM block_relations WHERE blocked_id = $1
   )`
 
 // feedOpenPostsCTE はどのフィードにも共通する条件（期間中・未削除・本人以外・閲覧者が投稿済み）の投稿。
@@ -213,6 +214,14 @@ var feedCandidateBase = `
     ) u
     WHERE p.author_id NOT IN (SELECT id FROM blocked)`
 
+// feedUnrankedCandidateBase は非ランキングフィード（public / friends / following）用の候補抽出。
+// ここでは users をまだ引かず、feedUnrankedTail で posted_at, id 降順に並べてから先頭 51 件分の有効な著者だけを主キーで引く
+// （open_posts 全件に対して先に users_pkey を引くと、51 件より後ろの候補まで毎回 users を引いていた）。
+var feedUnrankedCandidateBase = `
+    SELECT p.* FROM open_posts p
+    WHERE p.author_id NOT IN (SELECT id FROM blocked)
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))`
+
 // 非ランキングのフィードは score が常に 0 なので posted_at, id の降順だけで並ぶ。
 // viewer から LEFT JOIN LATERAL して、一覧が 0 件でも有効なセッションなら番兵の 1 行を返す。
 var feedUnrankedTail = `
@@ -221,9 +230,16 @@ var feedUnrankedTail = `
     0::bigint AS score
   FROM viewer v
   LEFT JOIN LATERAL (
-    SELECT c.* FROM candidates c
-    WHERE $2::timestamptz IS NULL OR (c.posted_at, c.id) < ($2, $3)
-    ORDER BY c.posted_at DESC, c.id DESC
+    SELECT c.*, u.*
+    FROM (
+      SELECT * FROM candidates c
+      ORDER BY c.posted_at DESC, c.id DESC
+      OFFSET 0
+    ) c
+    CROSS JOIN LATERAL (
+      SELECT ` + userColumnsAs("u", "author") + ` FROM users u
+      WHERE u.id = c.author_id AND u.status = 'active' OFFSET 0
+    ) u
     LIMIT 51
   ) r ON true
   ORDER BY r.posted_at DESC, r.id DESC
@@ -233,7 +249,7 @@ var feedUnrankedTail = `
 func buildFeedPublicQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
+  candidates AS (` + feedUnrankedCandidateBase + `
       AND p.visibility = 'public'
   )` + feedUnrankedTail
 }
@@ -242,7 +258,7 @@ func buildFeedPublicQuery(regionParam, tokenParam int) string {
 func buildFeedFriendsQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
+  candidates AS (` + feedUnrankedCandidateBase + `
       AND (p.author_id IN (SELECT id FROM friends)) IS TRUE
       AND p.visibility IN ('public', 'friends', 'friends_of_friends')
   )` + feedUnrankedTail
@@ -253,7 +269,7 @@ func buildFeedFriendsQuery(regionParam, tokenParam int) string {
 func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
+  candidates AS (` + feedUnrankedCandidateBase + `
       AND (p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)) IS TRUE
       AND (p.visibility = 'public'
            OR (p.visibility = 'friends' AND p.author_id IN (SELECT id FROM friends))
@@ -268,6 +284,14 @@ func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 // おすすめ度の「著者の mutual 数」と「著者の友達の mutual 数の和」は、以前は候補ごとの相関副問い合わせで
 // mutual（CTE、友達の多い閲覧者では千数百行）を毎回全件なめていた（候補 36 件で約 13ms）。
 // mutual は id で一意なので LEFT JOIN、著者の友達の和は候補の著者ごとに 1 回だけ集計して LEFT JOIN する（値は同じ）。
+//
+// author_fof は「著者 → 和」を 1 つの jsonb にまとめ、候補ごとに ->> で引く（jsonb のキー検索は二分探索）。
+// 以前の LEFT JOIN author_fof は、candidates の見積もりが数行（実際は友達の多い閲覧者で数百行）のため
+// Nested Loop + Materialize になり、候補数 × 著者数の比較をしていた（候補 396 件で 7.8 万回）。
+// 著者が author_fof に無い（著者の友達が mutual にいない）ときは ->> が NULL になり、以前の LEFT JOIN の NULL と同じく 0 になる。
+// 反応・コメントの数は、友達かどうか（friends のハッシュ）を先に見て、友達だった利用者だけ active かを主キーで確かめる
+// （以前は反応・コメントした全員の users を主キーで引いてから友達で絞っていた）。active は利用者ごとの性質なので、
+// 「active な反応者・コメント者の集合 ∩ 友達」と「反応者・コメント者の集合 ∩ 友達 ∩ active」は同じ集合で、件数も同じ。
 func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
@@ -283,27 +307,29 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
       AND p.visibility IN ('public', 'friends_of_friends')
   ),
   author_fof AS (
-    SELECT a.author_id, sum(m.n) AS s
-    FROM (SELECT DISTINCT author_id FROM candidates) a
-    JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
-    JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
-    GROUP BY a.author_id
+    SELECT jsonb_object_agg(t.author_id, t.s) AS by_author FROM (
+      SELECT a.author_id, sum(m.n) AS s
+      FROM (SELECT DISTINCT author_id FROM candidates) a
+      JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
+      JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
+      GROUP BY a.author_id
+    ) t
   ),
   scored AS (
     SELECT c.*, (
       10 * (SELECT count(*) FROM (
-              SELECT r.reactor_id AS user_id FROM realmojis r JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
+              SELECT r.reactor_id AS user_id FROM realmojis r
               WHERE r.post_id = c.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
               UNION
-              SELECT cm.author_id FROM comments cm JOIN users cu ON cu.id = cm.author_id AND cu.status = 'active'
+              SELECT cm.author_id FROM comments cm
               WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
-            ) e WHERE e.user_id IN (SELECT id FROM friends))
+            ) e WHERE e.user_id IN (SELECT id FROM friends)
+                AND EXISTS(SELECT 1 FROM users eu WHERE eu.id = e.user_id AND eu.status = 'active'))
       + 3 * COALESCE(mm.n, 0)
-      + LEAST(COALESCE(af.s, 0), 30)
+      + LEAST(COALESCE(((SELECT by_author FROM author_fof) ->> c.author_id)::numeric, 0), 30)
       )::bigint AS score
     FROM candidates c
     LEFT JOIN mutual mm ON mm.id = c.author_id
-    LEFT JOIN author_fof af ON af.author_id = c.author_id
   )
   SELECT v.sess_region, r.id IS NOT NULL AS found,
     ` + postWithAuthorColumnsCoalesced("r") + `,

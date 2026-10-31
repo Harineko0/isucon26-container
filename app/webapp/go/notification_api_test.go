@@ -18,34 +18,36 @@ type fakeNotificationDB struct {
 	inactive []string
 }
 
+func (f *fakeNotificationDB) activeWindow(ctx context.Context, region string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.window, nil
+}
+
+func (f *fakeNotificationDB) notifications(ctx context.Context, region, windowID string, userIDs []string) ([]windowNotification, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fetchErr != nil {
+		return nil, f.fetchErr
+	}
+	ids := append([]string(nil), userIDs...)
+	sort.Strings(ids)
+	f.fetches = append(f.fetches, ids)
+	want := map[string]bool{}
+	for _, id := range userIDs {
+		want[id] = true
+	}
+	var out []windowNotification
+	for _, r := range f.rows[windowID] {
+		if want[r.UserID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeNotificationDB) watcher() *postingWindowWatcher {
 	return newPostingWindowWatcherWith("asia",
-		func(ctx context.Context, region string) (string, error) {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			return f.window, nil
-		},
-		func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error) {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			if f.fetchErr != nil {
-				return nil, f.fetchErr
-			}
-			ids := append([]string(nil), userIDs...)
-			sort.Strings(ids)
-			f.fetches = append(f.fetches, ids)
-			want := map[string]bool{}
-			for _, id := range userIDs {
-				want[id] = true
-			}
-			var out []windowNotification
-			for _, r := range f.rows[windowID] {
-				if want[r.UserID] {
-					out = append(out, r)
-				}
-			}
-			return out, nil
-		},
 		func(ctx context.Context, userIDs []string, region string) ([]string, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -73,12 +75,12 @@ func TestWatcherDeliversNewWindowWithOneFetch(t *testing.T) {
 	}}
 	w := f.watcher()
 	ctx := context.Background()
-	if err := w.checkWindow(ctx); err != nil { // w0 seen with no subscribers: no fetch
+	if err := w.checkWindow(ctx, f, ""); err != nil { // w0 seen with no subscribers: no fetch
 		t.Fatal(err)
 	}
 	connectedAt := base.Add(time.Second)
 	s1a, s1b, s2, s3 := w.subscribe("u1"), w.subscribe("u1"), w.subscribe("u2"), w.subscribe("u3")
-	if err := w.checkWindow(ctx); err != nil { // unchanged
+	if err := w.checkWindow(ctx, f, ""); err != nil { // unchanged
 		t.Fatal(err)
 	}
 	if len(f.fetches) != 0 {
@@ -87,7 +89,7 @@ func TestWatcherDeliversNewWindowWithOneFetch(t *testing.T) {
 	f.mu.Lock()
 	f.window = "w1"
 	f.mu.Unlock()
-	if err := w.checkWindow(ctx); err != nil {
+	if err := w.checkWindow(ctx, f, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.fetches) != 1 || len(f.fetches[0]) != 3 {
@@ -115,7 +117,7 @@ func TestWatcherSkipsNotificationsNotAfterConnectedAt(t *testing.T) {
 	w := f.watcher()
 	s := w.subscribe("u1")
 	f.window = "w1"
-	if err := w.checkWindow(context.Background()); err != nil {
+	if err := w.checkWindow(context.Background(), f, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := waitNext(t, s, base); ok { // created_at == connectedAt: not delivered
@@ -130,13 +132,13 @@ func TestWatcherRetriesAfterFetchError(t *testing.T) {
 	}}
 	w := f.watcher()
 	s := w.subscribe("u1")
-	if err := w.checkWindow(context.Background()); err == nil {
+	if err := w.checkWindow(context.Background(), f, ""); err == nil {
 		t.Fatal("want error")
 	}
 	f.mu.Lock()
 	f.fetchErr = nil
 	f.mu.Unlock()
-	if err := w.checkWindow(context.Background()); err != nil {
+	if err := w.checkWindow(context.Background(), f, ""); err != nil {
 		t.Fatal(err)
 	}
 	if n, ok := waitNext(t, s, base); !ok || n.ID != "n1" {
@@ -154,14 +156,14 @@ func TestWatcherFollowsInitializeOnAnotherServer(t *testing.T) {
 	}}
 	w := f.watcher()
 	ctx := context.Background()
-	_ = w.checkWindow(ctx)
+	_ = w.checkWindow(ctx, f, "")
 	s := w.subscribe("u1")
 	connectedAt := base.Add(time.Minute)
 	for _, id := range []string{"", "init", "new"} {
 		f.mu.Lock()
 		f.window = id
 		f.mu.Unlock()
-		if err := w.checkWindow(ctx); err != nil {
+		if err := w.checkWindow(ctx, f, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -215,7 +217,7 @@ func TestWatcherConcurrentSubscribers(t *testing.T) {
 	f.mu.Lock()
 	f.window = "w1"
 	f.mu.Unlock()
-	if err := w.checkWindow(context.Background()); err != nil {
+	if err := w.checkWindow(context.Background(), f, ""); err != nil {
 		t.Fatal(err)
 	}
 	wg.Wait()
@@ -251,7 +253,7 @@ func TestWatcherDeliversWindowCommittedAfterConnect(t *testing.T) {
 	}}
 	w := f.watcher()
 	ctx := context.Background()
-	if err := w.checkWindow(ctx); err != nil {
+	if err := w.checkWindow(ctx, f, ""); err != nil {
 		t.Fatal(err)
 	}
 	s := w.subscribe("u1")
@@ -260,7 +262,7 @@ func TestWatcherDeliversWindowCommittedAfterConnect(t *testing.T) {
 	f.mu.Lock()
 	f.window = "w1" // コミット
 	f.mu.Unlock()
-	if err := w.checkWindow(ctx); err != nil {
+	if err := w.checkWindow(ctx, f, ""); err != nil {
 		t.Fatal(err)
 	}
 	if !w1StartsAt.Before(connectedAt) {
@@ -289,7 +291,7 @@ func TestWatcherSkipsWindowsVisibleAtConnect(t *testing.T) {
 		f.mu.Lock()
 		f.window = id
 		f.mu.Unlock()
-		if err := w.checkWindow(ctx); err != nil {
+		if err := w.checkWindow(ctx, f, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
