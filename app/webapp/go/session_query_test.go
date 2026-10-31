@@ -147,6 +147,8 @@ func TestFeedDeferredQueriesAndRoutes(t *testing.T) {
 		"PATCH /api/posts/:postId",
 		"DELETE /api/posts/:postId",
 		"GET /api/feeds/:feed",
+		"GET /api/me/export",
+		"GET /api/users",
 		"DELETE /api/comments/:commentId",
 		"DELETE /api/realmojis/:realMojiId",
 	} {

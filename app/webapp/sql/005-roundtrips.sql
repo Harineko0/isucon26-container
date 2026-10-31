@@ -61,9 +61,11 @@ BEGIN
   -- 申請とブロックの行を書くのは 2 人組のロックを持つ関数だけなので、別々の文で読んだときと同じ値になる。
   SELECT (SELECT count(*) FROM users WHERE id IN (v_req.requester_id, v_req.recipient_id) AND status = 'active') = 2,
          fr.status,
-         CASE WHEN p_status = 'accepted' THEN EXISTS(SELECT 1 FROM block_relations
-           WHERE (blocker_id = v_req.requester_id AND blocked_id = v_req.recipient_id)
-              OR (blocker_id = v_req.recipient_id AND blocked_id = v_req.requester_id)) ELSE false END
+         CASE WHEN p_status = 'accepted' THEN EXISTS(
+           SELECT 1 FROM block_relations WHERE blocker_id = v_req.requester_id AND blocked_id = v_req.recipient_id
+           UNION ALL
+           SELECT 1 FROM block_relations WHERE blocker_id = v_req.recipient_id AND blocked_id = v_req.requester_id
+         ) ELSE false END
     INTO v_active, v_status, v_blocked
     FROM friend_requests fr WHERE fr.id = v_req.id;
   IF NOT v_active THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;

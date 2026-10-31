@@ -20,30 +20,57 @@ type exportPostResponse struct {
 func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		// 投稿一覧は利用者の取得に依存しないので並行に取り、往復を 1 回分に重ねる。
+		// セッション確認・利用者・投稿一覧を selectWithSession の 1 文（接続 1 本・1 往復）で取得する。
 		// 参照実装は image_objects と JOIN して「画像がある投稿」だけを出していたが、その判定は SQL では行わず、
 		// 下で画像を集めたあとに画像が見つからなかった投稿を外す (結果は同じ)。SQL で EXISTS を引くと、投稿ごとに
 		// image_objects の索引を 1 回ずつ引き、export の読み取りの約 6 割 (実測 1 回 331 件で 206 ページを disk から) を占めていた。
 		// 投稿画像は isureal_create_post で投稿と同じトランザクションで作られ、投稿画像を消す処理は無いので、実際に外れる投稿は無い。
-		var posts []Post
-		postsDone := make(chan error, 1)
-		go func() {
-			postsDone <- h.DB.SelectContext(ctx, &posts, `
-   SELECT `+postColumns+`
-   FROM posts p
-   JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.author_id = $1 AND p.deleted_at IS NULL
+		var exportRows []struct {
+			SessRegion *string `db:"sess_region"`
+			UserFound  bool    `db:"user_found"`
+			PostFound  bool    `db:"post_found"`
+			PostWithAuthor
+		}
+		if err := selectWithSession(c, h, &exportRows, func() (int, *string) {
+			if len(exportRows) == 0 {
+				return 0, nil
+			}
+			return len(exportRows), exportRows[0].SessRegion
+		}, `
+   SELECT s.sess_region, u."author.id" IS NOT NULL AS user_found, p.id IS NOT NULL AS post_found,
+          `+postWithAuthorColumnsCoalesced("r")+`
+   FROM {session}
+   LEFT JOIN LATERAL (
+     SELECT `+userColumnsAs("u", "author")+`
+     FROM users u
+     WHERE (s.sess_region IS NULL OR s.sess_region = $1)
+       AND u.id = s.sess_user_id AND u.status = 'active'
+   ) u ON true
+   LEFT JOIN LATERAL (
+     SELECT `+postColumns+`
+     FROM posts p
+     JOIN posting_windows w ON w.id = p.posting_window_id
+     WHERE u."author.id" IS NOT NULL AND p.author_id = s.sess_user_id AND p.deleted_at IS NULL
+     ORDER BY p.posted_at, p.id
+   ) p ON true
+   CROSS JOIN LATERAL (SELECT p.*, u.*) r
    ORDER BY p.posted_at, p.id
-  `, userID)
-		}()
-		author, err := getUser(ctx, h.DB, userID)
-		postsErr := <-postsDone
-		if err != nil {
+  `, h.Config.Region); err != nil {
 			return err
 		}
-		if postsErr != nil {
-			return postsErr
+		if len(exportRows) == 0 || !exportRows[0].UserFound {
+			return NewAPIError(http.StatusNotFound, "user_not_found")
+		}
+		author := exportRows[0].Author
+		if err := author.setImageKey(); err != nil {
+			return err
+		}
+		posts := make([]Post, 0, len(exportRows))
+		for _, row := range exportRows {
+			if !row.PostFound {
+				continue
+			}
+			posts = append(posts, row.Post)
 		}
 		// 画像の本体は不変なので、手元にないものだけ DB から取る。
 		images := make(map[string][]byte, len(posts))

@@ -134,7 +134,7 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
      SELECT m.id, m.post_id, m.reactor_id, m.image_id, m.reaction_type, m.created_at, m.replaced_at, m.deleted_at,
             `+userColumnsAs("u", "reactor")+`
      FROM realmojis m JOIN users u ON u.id = m.reactor_id AND u.status = 'active'
-     WHERE a.can_view AND m.replaced_at IS NULL AND m.deleted_at IS NULL AND m.post_id=$1 AND ($2::timestamptz IS NULL OR (m.created_at,m.id)<($2,$3))
+     WHERE a.can_view AND COALESCE(m.replaced_at, m.deleted_at) IS NULL AND m.post_id=$1 AND ($2::timestamptz IS NULL OR (m.created_at,m.id)<($2,$3))
      ORDER BY m.created_at DESC,m.id DESC LIMIT 51
    ) r ON true
    ORDER BY r.created_at DESC, r.id DESC
