@@ -14,7 +14,9 @@ import (
 )
 
 // ipBansDriver は ip_bans の SELECT に、その時点の rows を返すだけのドライバ。
-type ipBansDriver struct{ rows *atomic.Pointer[map[string]time.Time] }
+type ipBansDriver struct {
+	rows *atomic.Pointer[map[string]time.Time]
+}
 
 func (d ipBansDriver) Open(string) (driver.Conn, error) { return ipBansConn(d), nil }
 
@@ -96,31 +98,5 @@ func TestIPBanStoreKeepsNewerSnapshot(t *testing.T) {
 	newer := &ipBanSnapshot{loadedAt: t0.Add(time.Second), bans: map[string]time.Time{"5.6.7.8": t0.Add(time.Hour)}}
 	if !l.store(newer) || !l.bannedCached("5.6.7.8", t0) {
 		t.Fatal("newer snapshot not stored")
-	}
-}
-
-// initialize は、ほかのリージョンの読み直し (次の tick + EU/US と asia2 の往復 約110ms) が
-// 終わるまで待ってから返す。すでに経っていれば待たない。
-func TestIPBanPeerWait(t *testing.T) {
-	t.Parallel()
-	const crossRegionRTT = 110 * time.Millisecond
-	if ipBanPeerSettle < ipBanReloadInterval+crossRegionRTT {
-		t.Fatalf("ipBanPeerSettle = %v, shorter than one tick + cross-region RTT (%v)", ipBanPeerSettle, ipBanReloadInterval+crossRegionRTT)
-	}
-	t0 := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	tests := []struct {
-		name    string
-		elapsed time.Duration
-		want    time.Duration
-	}{
-		{"just reset", 0, ipBanPeerSettle},
-		{"partly elapsed", 150 * time.Millisecond, ipBanPeerSettle - 150*time.Millisecond},
-		{"already settled", ipBanPeerSettle, 0},
-		{"long after", 5 * time.Second, 0},
-	}
-	for _, tt := range tests {
-		if got := ipBanPeerWait(t0, t0.Add(tt.elapsed)); got != tt.want {
-			t.Errorf("%s: ipBanPeerWait = %v, want %v", tt.name, got, tt.want)
-		}
 	}
 }

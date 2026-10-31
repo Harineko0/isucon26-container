@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v5"
 )
@@ -150,5 +152,34 @@ func TestPeerImageTransferUsesShardedStoreAndReadsLegacy(t *testing.T) {
 		if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), data) {
 			t.Fatalf("peer cold GET: %d %q", w.Code, w.Body.Bytes())
 		}
+	}
+}
+
+func TestInitializeDrainsImageTransfers(t *testing.T) {
+	// No push worker is running here. The pending replica is disposable, but a
+	// transfer already owned by a worker must finish before the store rotates.
+	region := "europe"
+	enqueueImagePush(newImageID(region), []byte("old replica"), &region, region)
+	beginImageTransfer()
+	drained := make(chan struct{})
+	go func() {
+		drainImageTransfers()
+		close(drained)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for len(imagePushQueue) > 0 && ctx.Err() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-drained:
+		t.Fatal("reset passed an active image transfer")
+	default:
+	}
+	imageTransfers.jobs.Done()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		t.Fatal("reset did not finish after the in-flight transfer")
 	}
 }

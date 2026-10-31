@@ -13,12 +13,9 @@ import (
 
 const ipBanReloadInterval = 200 * time.Millisecond
 
-// ipBanPeerSettle は ip_bans を書き換えてから、ほかのリージョンの reloadLoop が新しい内容を
-// 読み終えるまでの上限。次の tick (ipBanReloadInterval) + asia2 との往復 (EU/US で約110ms) + 余裕。
-const ipBanPeerSettle = ipBanReloadInterval + 300*time.Millisecond
-
 type IPBanList struct {
 	reloading sync.Mutex
+	watch     sync.Once
 	snapshot  atomic.Pointer[ipBanSnapshot]
 	abuse     *abuseDetector
 }
@@ -45,13 +42,10 @@ func (l *IPBanList) Banned(ctx context.Context, db *sqlx.DB, ip string) (bool, e
 	if snapshot == nil && l.reloading.TryLock() {
 		// 初回だけ同期で読み、以降は裏で 200ms ごとに読み直す(リクエストに DB 往復を乗せない)。
 		defer l.reloading.Unlock()
-		loaded, err := loadIPBans(ctx, db)
-		if err != nil {
+		if err := l.reloadNow(ctx, db); err != nil {
 			return false, err
 		}
-		l.store(loaded)
 		snapshot = l.snapshot.Load()
-		go l.reloadLoop(db)
 	}
 	if snapshot == nil {
 		return false, nil
@@ -115,20 +109,16 @@ func (l *IPBanList) store(s *ipBanSnapshot) bool {
 	}
 }
 
-// reloadNow は ip_bans をすぐ読み直す。initialize の TRUNCATE のあと、受けたサーバーが
-// 次の tick を待たずに前回のベンチの BAN を捨てるために使う (#41)。
+// A peer reset can be this server's first request. Start polling after either
+// this explicit refresh or the first public request loads a snapshot.
 func (l *IPBanList) reloadNow(ctx context.Context, db *sqlx.DB) error {
 	loaded, err := loadIPBans(ctx, db)
 	if err != nil {
 		return err
 	}
 	l.store(loaded)
+	l.watch.Do(func() { go l.reloadLoop(db) })
 	return nil
-}
-
-// ipBanPeerWait は ip_bans を since に書き換えたあと、ほかのリージョンが読み直し終えるまでの残り時間。
-func ipBanPeerWait(since, now time.Time) time.Duration {
-	return max(since.Add(ipBanPeerSettle).Sub(now), 0)
 }
 
 func loadIPBans(ctx context.Context, db *sqlx.DB) (*ipBanSnapshot, error) {

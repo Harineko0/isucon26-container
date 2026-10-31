@@ -1,9 +1,10 @@
 package main
 
 import (
+	"net"
 	"net/http"
-	"os"
 	_ "net/http/pprof"
+	"os"
 
 	"example.com/isureal-company/isureal"
 )
@@ -16,10 +17,11 @@ func main() {
 	}
 	config := isureal.ConfigFromEnv()
 	server := isureal.NewServer(config)
-	addr := ":8080"
-	if port := os.Getenv("ISUREAL_PORT"); port != "" {
-		addr = ":" + port
+	port := os.Getenv("ISUREAL_PORT")
+	if port == "" {
+		port = "8080"
 	}
+	addr := net.JoinHostPort(os.Getenv("ISUREAL_LISTEN_HOST"), port)
 	if err := server.Start(addr); err != nil {
 		panic("failed to start server: " + err.Error())
 	}
