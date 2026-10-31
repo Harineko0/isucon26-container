@@ -116,9 +116,9 @@ func memoryAnyOf(column, src string) string {
 // 投稿ページを一度だけ取得し、その50件のリアクションも同じスナップショットで読む。
 // 空ページでもセッションの行を残し、401/403 と空の200を区別する。
 // 投稿・リアクション・コメントはそれぞれ 1 回の Bitmap Heap Scan でまとめて引き (memoryAnyOf)、
-// 投稿ごとの並べ替えと 50 件の上限は、引いた行 (rx, cx) に対して以前と同じ式で行う。
-// posts は OFFSET 0 の副問い合わせに閉じ込め、wins との結合条件で投稿期間ごとの索引引き (ヒープを同期で
-// 1 件ずつ読む) に戻されないようにする (汎用プランでは wins の件数を 5 件程度と見積もってそちらを選ぶため)。
+// リアクションとコメントは投稿別に順位を付け、各上位 50 件をまとめてからページに結合する。
+// 投稿の 51 件は期間 ID で絞った時点で決まる。LIMIT の後で期間を主キーで引き、
+// 日付範囲内の全期間と各投稿を改めて突き合わせる作業を省く。
 // 読む索引は以前と同じ (posts_author_window, realmojis_post_id, comments_post_id)。リアクションの
 // `COALESCE(replaced_at, deleted_at) IS NULL` は `replaced_at IS NULL AND deleted_at IS NULL` と同じ意味だが、
 // 部分索引 realmojis_one_active (重複排除が効かず realmojis_post_id の約 3 倍の大きさで、キャッシュに
@@ -126,31 +126,41 @@ func memoryAnyOf(column, src string) string {
 var memoriesQuery = `
   WITH sess AS MATERIALIZED (SELECT * FROM {session}),
   wins AS MATERIALIZED (
-    SELECT w.id, w.on_time_deadline, w.ended_at FROM posting_windows w WHERE w.local_date >= $2 AND w.local_date < $3
+    SELECT w.id FROM posting_windows w WHERE w.local_date >= $2 AND w.local_date < $3
   ),
   page AS MATERIALIZED (
     SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
-    FROM (
-      SELECT * FROM posts p WHERE p.author_id = $1 AND ` + memoryAnyOf("p.posting_window_id", "wins") + ` OFFSET 0
+    FROM sess s JOIN users u ON u.id = s.sess_user_id AND u.status = 'active'
+    CROSS JOIN LATERAL (
+      SELECT * FROM posts p WHERE p.author_id = u.id AND ` + memoryAnyOf("p.posting_window_id", "wins") + `
+        AND p.deleted_at IS NULL AND ($4::timestamptz IS NULL OR (p.posted_at, p.id) < ($4, $5))
+      ORDER BY p.posted_at DESC, p.id DESC LIMIT 51
     ) p
-    JOIN wins w ON w.id = p.posting_window_id
-    JOIN users u ON u.id = p.author_id AND u.status = 'active'
-    JOIN sess s ON s.sess_user_id = p.author_id
-    WHERE p.deleted_at IS NULL AND p.author_id = $1
-      AND ($4::timestamptz IS NULL OR (p.posted_at, p.id) < ($4, $5))
-    ORDER BY p.posted_at DESC, p.id DESC LIMIT 51
+    JOIN posting_windows w ON w.id = p.posting_window_id
+    WHERE u.id = $1
   ),
   top AS MATERIALIZED (SELECT * FROM page ORDER BY posted_at DESC, id DESC LIMIT 50),
   rx AS MATERIALIZED (
-    SELECT r.post_id, r.id AS "ID", r.image_id AS "ImageID", r.reaction_type AS "ReactionType",
-      r.created_at AS "CreatedAt", ` + memoryInteractionUser + `
-    FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
-    WHERE ` + memoryAnyOf("r.post_id", "top") + ` AND COALESCE(r.replaced_at, r.deleted_at) IS NULL
+    SELECT post_id, json_agg(item ORDER BY created_at DESC, id DESC) AS items
+    FROM (
+      SELECT r.post_id, r.created_at, r.id, item,
+        row_number() OVER (PARTITION BY r.post_id ORDER BY r.created_at DESC, r.id DESC) AS n
+      FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
+      CROSS JOIN LATERAL (SELECT r.id AS "ID", r.image_id AS "ImageID", r.reaction_type AS "ReactionType",
+        r.created_at AS "CreatedAt", ` + memoryInteractionUser + `) item
+      WHERE ` + memoryAnyOf("r.post_id", "top") + ` AND COALESCE(r.replaced_at, r.deleted_at) IS NULL
+    ) ranked WHERE n <= 50 GROUP BY post_id
   ),
   cx AS MATERIALIZED (
-    SELECT c.post_id, c.id AS "ID", c.body AS "Body", c.created_at AS "CreatedAt", ` + memoryInteractionUser + `
-    FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
-    WHERE ` + memoryAnyOf("c.post_id", "top") + ` AND c.deleted_at IS NULL
+    SELECT post_id, json_agg(item ORDER BY created_at, id) AS items
+    FROM (
+      SELECT c.post_id, c.created_at, c.id, item,
+        row_number() OVER (PARTITION BY c.post_id ORDER BY c.created_at, c.id) AS n
+      FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
+      CROSS JOIN LATERAL (SELECT c.id AS "ID", c.body AS "Body", c.created_at AS "CreatedAt",
+        ` + memoryInteractionUser + `) item
+      WHERE ` + memoryAnyOf("c.post_id", "top") + ` AND c.deleted_at IS NULL
+    ) ranked WHERE n <= 50 GROUP BY post_id
   )
   SELECT s.sess_region, p.id IS NOT NULL AS found, (SELECT count(*) > 50 FROM page) AS has_more,
     COALESCE(p.id, '') AS id, COALESCE(p.author_id, '') AS author_id,
@@ -159,21 +169,10 @@ var memoriesQuery = `
     COALESCE(p.location_kind, '') AS location_kind, p.latitude, p.longitude, p.locality,
     COALESCE(p.posted_at, 'epoch') AS posted_at, COALESCE(p.on_time_deadline, 'epoch') AS on_time_deadline,
     p.window_ended_at, ` + userColumnsCoalesced("p", "author") + `,
-    COALESCE((
-      SELECT json_agg(r ORDER BY r."CreatedAt" DESC, r."ID" DESC) FROM (
-        SELECT r."ID", r."ImageID", r."ReactionType", r."CreatedAt", r."User", r."SigningKey", r."ProfileImageID"
-        FROM rx r WHERE r.post_id = p.id
-        ORDER BY r."CreatedAt" DESC, r."ID" DESC LIMIT 50
-      ) r
-    ), '[]') AS reactions,
-    COALESCE((
-      SELECT json_agg(c ORDER BY c."CreatedAt", c."ID") FROM (
-        SELECT c."ID", c."Body", c."CreatedAt", c."User", c."SigningKey", c."ProfileImageID"
-        FROM cx c WHERE c.post_id = p.id
-        ORDER BY c."CreatedAt", c."ID" LIMIT 50
-      ) c
-    ), '[]') AS comments
+    COALESCE(rx.items, '[]') AS reactions, COALESCE(cx.items, '[]') AS comments
   FROM sess s LEFT JOIN top p ON true
+  LEFT JOIN rx ON rx.post_id = p.id
+  LEFT JOIN cx ON cx.post_id = p.id
   ORDER BY p.posted_at DESC, p.id DESC
 `
 
