@@ -282,6 +282,8 @@ func init() {
 	deferredSessionRoutes["GET /api/relationships/:kind"] = true
 	deferredSessionRoutes["GET /api/posts/:postId/comments"] = true
 	deferredSessionRoutes["GET /api/posts/:postId/realmojis"] = true
+	deferredSessionRoutes["GET /api/memories"] = true
+	deferredSessionRoutes["GET /api/memories/:date"] = true
 }
 
 // deferredSessionCheckedKey は、deferred 経路でハンドラがセッションを確認する SQL を実行したことを示す。
