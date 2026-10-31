@@ -27,10 +27,15 @@ type getNotificationsResponse struct {
 // 接続ごとの定期的な DB 照会はしない。退会・リージョン変更による切断は、接続中の利用者
 // 全員を 1 秒ごとに 1 文で確認する。
 //
-// 取りこぼしが無いこと: 接続は clock_timestamp() (connectedAt) を取る前に購読者として登録する。
-// 通知の created_at は投稿期間を開始するトランザクションの中の時刻なので、created_at > connectedAt
-// になり得る接続は、そのトランザクションのコミットより前に登録済みである。監視が新しい期間を
-// 見つけるのはコミット後のスナップショットで、購読者はその後に集めるので必ず含まれる。
+// 取りこぼしが無いこと: 接続は、接続時の SQL (clock_timestamp() と、その時点で見えている有効な
+// 投稿期間の starts_at を取る) より前に購読者として登録する。接続時に見えていなかった期間は、
+// その SQL のスナップショットより後にコミットされたので、監視がその期間を見つけるのは登録の後であり、
+// 購読者を集めるときに必ず含まれる。
+// どの期間を配るか: 接続時に見えていなかった期間の通知だけを配る。通知の created_at はその期間の
+// starts_at と同じ値で (admin_posting_window_api.go)、期間の starts_at はリージョンごとに単調に増えるので、
+// 「created_at > 接続時に有効だった期間の starts_at」で判定できる (有効な期間が無ければすべて配る)。
+// created_at > connectedAt で判定すると、開始処理のトランザクションの途中 (starts_at の後、コミットの前) に
+// 接続した利用者がその期間の通知を受け取れない (#42)。
 // 状態は DB で観測した有効な期間 id だけから決まるので、どのサーバで /api/initialize が
 // 実行されても期間 id の変化として検知される (プロセス内に初期化すべき状態は無い)。
 const (
@@ -79,14 +84,14 @@ func (s *notificationSubscriber) take() []notificationEvent {
 	return evs
 }
 
-// next は connectedAt より後に作られた通知を待つ。ok が false なら通知せずに接続を閉じる。
-func (s *notificationSubscriber) next(ctx context.Context, connectedAt time.Time) (getNotificationsResponse, bool) {
+// next は after より後に作られた通知を待つ。ok が false なら通知せずに接続を閉じる。
+func (s *notificationSubscriber) next(ctx context.Context, after time.Time) (getNotificationsResponse, bool) {
 	for {
 		for _, ev := range s.take() {
 			if ev.kick {
 				return getNotificationsResponse{}, false
 			}
-			if ev.notification.CreatedAt.After(connectedAt) {
+			if ev.notification.CreatedAt.After(after) {
 				return ev.notification, true
 			}
 		}
@@ -278,25 +283,59 @@ func (w *postingWindowWatcher) checkUsers(ctx context.Context) error {
 	return nil
 }
 
+// notificationsAfter は、接続時に有効だった投稿期間の starts_at (無ければ nil) から、
+// 配る通知の created_at の下限 (これより後なら配る) を返す。理由は postingWindowWatcher のコメント。
+func notificationsAfter(activeWindowStartsAt *time.Time) time.Time {
+	if activeWindowStartsAt == nil {
+		return time.Time{}
+	}
+	return *activeWindowStartsAt
+}
+
+type notificationConnectState struct {
+	Found                bool       `db:"found"`
+	Region               *string    `db:"region"`
+	ActiveWindowStartsAt *time.Time `db:"active_window_starts_at"`
+}
+
 func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		session := GetSession(c)
 		userID := session.UserID
-		// connectedAt を取る前に登録する (取りこぼしが無い理由は postingWindowWatcher のコメント)。
+		// 接続時の SQL より前に登録する (取りこぼしが無い理由は postingWindowWatcher のコメント)。
 		sub := h.Windows.subscribe(userID)
 		defer h.Windows.unsubscribe(sub)
-		var start struct {
-			ConnectedAt time.Time `db:"connected_at"`
-			Region      *string   `db:"region"`
+		var start notificationConnectState
+		if tokenHash, deferred := deferredSession(c); deferred {
+			// セッションの確認 (401 → 403) も同じ 1 文で行い、ヘッダを送る前に判定する。
+			err := h.DB.GetContext(ctx, &start, `
+   SELECT true AS found, u.region,
+          (SELECT starts_at FROM posting_windows WHERE region = $3 AND ended_at IS NULL) AS active_window_starts_at
+   FROM login_sessions s JOIN users u ON u.id = s.user_id
+   WHERE s.token_hash = $1 AND s.active = true AND u.status = 'active' AND u.id = $2
+  `, tokenHash, userID, h.Config.Region)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			region := ""
+			if start.Region != nil {
+				region = *start.Region
+			}
+			if err := rejectDeferredSession(c, h, tokenHash, start.Found, region); err != nil {
+				return err
+			}
+		} else {
+			// セッションは SessionMiddleware で確認済み。その後の退会・リージョン変更はここで見る。
+			if err := h.DB.GetContext(ctx, &start, `
+   SELECT true AS found,
+          (SELECT region FROM users WHERE id = $1 AND status = 'active') AS region,
+          (SELECT starts_at FROM posting_windows WHERE region = $2 AND ended_at IS NULL) AS active_window_starts_at
+  `, userID, h.Config.Region); err != nil {
+				return err
+			}
 		}
-		if err := h.DB.GetContext(ctx, &start, `
-   SELECT clock_timestamp() AS connected_at,
-          (SELECT region FROM users WHERE id = $1 AND status = 'active') AS region
-  `, userID); err != nil {
-			return err
-		}
-		connectedAt := start.ConnectedAt
+		after := notificationsAfter(start.ActiveWindowStartsAt)
 		response := c.Response()
 		response.Header().Set("Content-Type", "text/event-stream")
 		response.WriteHeader(http.StatusOK)
@@ -307,7 +346,7 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 		if start.Region == nil || *start.Region != session.Region {
 			return nil
 		}
-		notification, ok := sub.next(ctx, connectedAt)
+		notification, ok := sub.next(ctx, after)
 		if !ok {
 			return nil
 		}

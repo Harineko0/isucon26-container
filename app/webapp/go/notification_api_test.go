@@ -228,3 +228,72 @@ func TestWatcherConcurrentSubscribers(t *testing.T) {
 		t.Fatalf("want 1 fetch, got %d", len(f.fetches))
 	}
 }
+
+func TestNotificationsAfter(t *testing.T) {
+	if got := notificationsAfter(nil); !got.IsZero() {
+		t.Fatalf("no active window: want zero time, got %v", got)
+	}
+	startsAt := time.Date(2026, 10, 31, 1, 2, 3, 4000, time.UTC)
+	if got := notificationsAfter(&startsAt); !got.Equal(startsAt) {
+		t.Fatalf("want %v, got %v", startsAt, got)
+	}
+}
+
+// #42: 期間 w1 の開始処理 (starts_at = 通知の created_at の後、コミットの前) の途中に接続した利用者。
+// 接続時に見えていたのは w0 なので、w1 の通知は created_at < connectedAt でも配る。
+func TestWatcherDeliversWindowCommittedAfterConnect(t *testing.T) {
+	base := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	w0StartsAt := base
+	w1StartsAt := base.Add(time.Minute)
+	f := &fakeNotificationDB{window: "w0", rows: map[string][]windowNotification{
+		"w0": {{UserID: "u1", ID: "n0", CreatedAt: w0StartsAt, UserActive: true, UserRegion: "asia"}},
+		"w1": {{UserID: "u1", ID: "n1", CreatedAt: w1StartsAt, UserActive: true, UserRegion: "asia"}},
+	}}
+	w := f.watcher()
+	ctx := context.Background()
+	if err := w.checkWindow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := w.subscribe("u1")
+	connectedAt := w1StartsAt.Add(300 * time.Millisecond) // w1 のトランザクションはまだコミットされていない
+	after := notificationsAfter(&w0StartsAt)
+	f.mu.Lock()
+	f.window = "w1" // コミット
+	f.mu.Unlock()
+	if err := w.checkWindow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !w1StartsAt.Before(connectedAt) {
+		t.Fatal("test setup: created_at must be before connectedAt")
+	}
+	if n, ok := waitNext(t, s, after); !ok || n.ID != "n1" || n.PostingWindowID != "w1" {
+		t.Fatalf("got %+v %v", n, ok)
+	}
+}
+
+// 監視が遅れて、接続時にすでに見えていた期間 (有効な w0、または終わった w-1) の通知を接続後に配っても、
+// その利用者には送らない。
+func TestWatcherSkipsWindowsVisibleAtConnect(t *testing.T) {
+	base := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	prevStartsAt := base.Add(-time.Minute)
+	w0StartsAt := base
+	f := &fakeNotificationDB{rows: map[string][]windowNotification{
+		"prev": {{UserID: "u1", ID: "np", CreatedAt: prevStartsAt, UserActive: true, UserRegion: "asia"}},
+		"w0":   {{UserID: "u1", ID: "n0", CreatedAt: w0StartsAt, UserActive: true, UserRegion: "asia"}},
+	}}
+	w := f.watcher()
+	ctx := context.Background()
+	s := w.subscribe("u1")
+	after := notificationsAfter(&w0StartsAt) // 接続時に有効だったのは w0
+	for _, id := range []string{"prev", "w0"} {
+		f.mu.Lock()
+		f.window = id
+		f.mu.Unlock()
+		if err := w.checkWindow(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, ok := waitNext(t, s, after); ok {
+		t.Fatalf("windows visible at connect must not be delivered, got %+v", n)
+	}
+}

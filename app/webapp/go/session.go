@@ -92,8 +92,9 @@ func (w *bufferedResponseWriter) Write(b []byte) (int, error) {
 	return w.body.Write(b)
 }
 
+// deferredSessionRoutes の GET はハンドラの 1 文でセッションを確認するので、投機的には処理しない。
 func speculativeSessionAllowed(c *echo.Context) bool {
-	return c.Request().Method == http.MethodGet && c.Request().URL.Path != "/api/notifications"
+	return c.Request().Method == http.MethodGet && !deferredSessionRoutes[c.Request().Method+" "+c.RouteInfo().Path]
 }
 
 func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.MiddlewareFunc {
@@ -256,6 +257,27 @@ var deferredSessionRoutes = map[string]bool{
 	"PUT /api/blocks/:userId":             true,
 	"DELETE /api/blocks/:userId":          true,
 	"DELETE /api/friendships/:userId":     true,
+}
+
+// 読み取りだが、セッションの確認をハンドラの SQL に同居させるルート (notification_api.go, posting_window_api.go)。
+func init() {
+	deferredSessionRoutes["GET /api/notifications"] = true
+	deferredSessionRoutes["GET /api/posting-window/current"] = true
+}
+
+// rejectDeferredSession は、ハンドラの SQL でセッションを確認した結果が 401/403 のときの応答を返す。
+// found が false ならセッションが無効 (401)、region がこのサーバのリージョンと違えば 403。問題なければ nil。
+func rejectDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string, found bool, region string) error {
+	if !found {
+		knownSessions.Delete(tokenHash)
+		c.Set("session", nil)
+		return NewAPIError(http.StatusUnauthorized, "invalid_session")
+	}
+	if region != h.Config.Region {
+		knownSessions.Delete(tokenHash)
+		return NewAPIError(http.StatusForbidden, "region_mismatch")
+	}
+	return nil
 }
 
 func deferredSession(c *echo.Context) (string, bool) {
