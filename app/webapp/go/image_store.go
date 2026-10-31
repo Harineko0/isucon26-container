@@ -68,7 +68,26 @@ func imageStorePath(id string) (string, bool) {
 	if !imageIDPattern.MatchString(id) {
 		return "", false
 	}
-	return filepath.Join(imageStoreDir, id[:2], id), true
+	// newTimeID の先頭は時刻 (今は常に 01)、末尾はリージョンの印なので、
+	// 両方を避けてランダム部分で分散する。DB の時刻順 ID 自体は変えない。
+	return filepath.Join(imageStoreDir, id[24:26], id), true
+}
+
+// storedImagePath は新しい配置を先に調べ、旧 id[:2] 配置にも戻る。
+// デプロイ前に永続化された画像も、移動や initialize なしで読める。
+func storedImagePath(id string) (string, bool) {
+	path, ok := imageStorePath(id)
+	if !ok {
+		return "", false
+	}
+	if imageFileExists(path) {
+		return path, true
+	}
+	legacy := filepath.Join(imageStoreDir, id[:2], id)
+	if legacy != path && imageFileExists(legacy) {
+		return legacy, true
+	}
+	return "", false
 }
 
 func syncDir(dir string) error {
@@ -145,7 +164,7 @@ func writeImageFileDurable(path string, data []byte) error {
 }
 
 func readImageFromStore(id string) ([]byte, bool) {
-	path, ok := imageStorePath(id)
+	path, ok := storedImagePath(id)
 	if !ok {
 		return nil, false
 	}

@@ -55,6 +55,17 @@ var actionNames = map[string]string{
 
 var logLevelRanks = map[string]int{"debug": 0, "info": 1, "error": 2}
 
+// Keep the same alphabetical key order, nulls and omissions as the former map.
+type actionLogEntry struct {
+	Abuse    string  `json:"abuse,omitempty"`
+	Action   *string `json:"action"`
+	IP       string  `json:"ip"`
+	Level    string  `json:"level"`
+	Status   int     `json:"status"`
+	UserID   *string `json:"user_id"`
+	Username any     `json:"username,omitempty"`
+}
+
 // onLogged は書いた action log の 1 行ごとに呼ぶ (isureal-guard が読むのと同じ行。nil なら呼ばない)。
 func ActionLogMiddleware(minLevel string, output io.Writer, onLogged func(action string, status int, ip, abuse string)) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -77,29 +88,25 @@ func ActionLogMiddleware(minLevel string, output io.Writer, onLogged func(action
 			}
 
 			route := c.RouteInfo()
-			entry := map[string]any{
-				"level":   level,
-				"action":  nil,
-				"status":  status,
-				"ip":      c.RealIP(),
-				"user_id": nil,
-			}
+			ip := c.RealIP()
+			entry := actionLogEntry{Level: level, Status: status, IP: ip}
 			action, ok := actionNames[route.Method+" "+route.Path]
 			if ok {
-				entry["action"] = action
+				entry.Action = &action
 			}
 			if session := GetSession(c); session != nil {
-				entry["user_id"] = session.UserID
+				entry.UserID = &session.UserID
 			}
 			if action == "login" || action == "register" {
-				entry["username"] = nil
+				// A typed nil in an interface emits null; a nil interface omits the key.
+				entry.Username = (*string)(nil)
 				if username, _ := c.Get("username").(string); usernamePattern.MatchString(username) {
-					entry["username"] = username
+					entry.Username = username
 				}
 			}
 			abuse, _ := c.Get("abuse").(string)
 			if abuse != "" {
-				entry["abuse"] = abuse
+				entry.Abuse = abuse
 			}
 			line, marshalErr := json.Marshal(entry)
 			if marshalErr != nil {
@@ -107,7 +114,7 @@ func ActionLogMiddleware(minLevel string, output io.Writer, onLogged func(action
 			}
 			_, writeErr := output.Write(append(line, '\n'))
 			if onLogged != nil {
-				onLogged(action, status, c.RealIP(), abuse)
+				onLogged(action, status, ip, abuse)
 			}
 			return writeErr
 		}

@@ -101,7 +101,7 @@ type memoryPageRow struct {
 
 const memoryInteractionUser = `json_build_object(
   'id', u.id, 'username', u.username, 'displayName', u.display_name, 'bio', u.bio,
-  'region', u.region, 'accountType', u.account_type, 'status', u.status) AS "User",
+  'accountType', u.account_type) AS "User",
   u.secret_key_hash AS "SigningKey", u.profile_image_id AS "ProfileImageID"`
 
 // memoryAnyOf は `col = ANY(ARRAY(SELECT id FROM src))` を、空の配列との OR にしたもの。
