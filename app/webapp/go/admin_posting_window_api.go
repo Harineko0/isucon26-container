@@ -104,10 +104,13 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
      RETURNING w.ended_at
    ), starts AS (
      SELECT COALESCE((SELECT max(ended_at) FROM ended), clock_timestamp()) AS starts_at
+   ), opened AS (
+     INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
+     SELECT $2, $1, $3, starts_at, starts_at + $4::bigint * interval '1 second' FROM starts
+     RETURNING id, region, starts_at, on_time_deadline
    )
-   INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
-   SELECT $2, $1, $3, starts_at, starts_at + $4::bigint * interval '1 second' FROM starts
-   RETURNING starts_at, on_time_deadline
+   SELECT starts_at, on_time_deadline FROM opened,
+          LATERAL pg_notify('`+windowChannelPrefix+`' || opened.region, opened.id)
   `, region, windowID, localDate, seconds); err != nil {
 			return err
 		}
