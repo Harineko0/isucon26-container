@@ -1,4 +1,6 @@
-CREATE INDEX IF NOT EXISTS login_sessions_token_hash ON login_sessions(token_hash);
+-- 認証では有効なトークンを完全一致で引く。失効後は照合しないので索引から外す。
+CREATE INDEX IF NOT EXISTS login_sessions_active_token ON login_sessions USING hash (token_hash) WHERE active;
+DROP INDEX IF EXISTS login_sessions_token_hash;
 CREATE INDEX IF NOT EXISTS login_sessions_user_id_active ON login_sessions(user_id) WHERE active;
 CREATE INDEX IF NOT EXISTS administrator_sessions_token_hash ON administrator_sessions(token_hash);
 DROP INDEX IF EXISTS users_username;
@@ -11,8 +13,11 @@ CREATE INDEX IF NOT EXISTS friendships_high_low ON friendships(user_high_id, use
 DROP INDEX IF EXISTS friendships_user_high_id;
 CREATE INDEX IF NOT EXISTS follows_followee_id ON follows(followee_id);
 CREATE INDEX IF NOT EXISTS block_relations_blocked_id ON block_relations(blocked_id);
-CREATE INDEX IF NOT EXISTS friend_requests_recipient_status ON friend_requests(recipient_id, status);
-CREATE INDEX IF NOT EXISTS friend_requests_requester_status ON friend_requests(requester_id, status);
+-- 未処理の受信・送信一覧には各索引の先頭列を使う。二人の間の申請を探すときは
+-- 両列で照合し、同じ人がほかの相手に出した申請の行を読まない。履歴は主キーで取得する。
+CREATE INDEX IF NOT EXISTS friend_requests_pending_outgoing ON friend_requests (requester_id, recipient_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS friend_requests_pending_incoming ON friend_requests (recipient_id, requester_id) WHERE status = 'pending';
+DROP INDEX IF EXISTS friend_requests_recipient_status, friend_requests_requester_status;
 CREATE INDEX IF NOT EXISTS posts_image_id ON posts(image_id);
 -- 著者の投稿は投稿期間ごとに 1 件なので、(著者, 投稿期間) で引けば Memories や当日投稿済みの判定が
 -- 著者の全投稿 (最大 365 件、それぞれ別ページ) を読まずに済む。author_id 単独の索引はこれで代わる。
