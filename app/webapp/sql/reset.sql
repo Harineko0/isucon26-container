@@ -64,6 +64,12 @@ SELECT id, follower_id, followee_id, created_at, updated_at FROM initial_follows
 INSERT INTO block_relations (id, blocker_id, blocked_id, created_at)
 SELECT id, blocker_id, blocked_id, created_at FROM initial_block_relations;
 
+-- 利用者表のアプリ内レプリカ (009-users-cache.sql、go/users_cache.go) に全件読み直しを伝える。
+-- このファイルはトリガーを止めて users を書き換えるので、変更ログの代わりに '*' の行を入れ、版を進める。
+TRUNCATE users_changes;
+UPDATE cache_versions SET version = version + 1 WHERE name = 'users';
+INSERT INTO users_changes (version, user_id) SELECT version, '*' FROM cache_versions WHERE name = 'users';
+
 COMMIT;
 
 -- 上で消した user_search_norms の行を回収し、空になった末尾のページを切り詰める。残る初期データの利用者の

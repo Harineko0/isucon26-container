@@ -69,6 +69,8 @@ func NewServer(config *Config) *echo.Echo {
 	go cleanSearchDirtyLoop(db)
 	go loadInitialDataBoundary(db)
 	go loadProfileImageHints(db)
+	// users のアプリ内レプリカ (users_cache.go)。失敗しても最初の検索で読み直す。
+	go loadUsersCache(db, "startup")
 	// 再起動 (デプロイ・追試) 直後の DB のキャッシュを埋める。DB と同じリージョンの asia だけが行う
 	// (3 台が同時に読まない。initialize も asia1 に来る)。prewarm.go
 	if config.Region == "asia" {
@@ -79,7 +81,7 @@ func NewServer(config *Config) *echo.Echo {
 	e.POST("/api/auth/register", registerHandler(handlerContext))
 	e.POST("/api/auth/login", loginHandler(handlerContext))
 	e.POST("/api/auth/logout", logoutHandler(handlerContext), SessionMiddleware(handlerContext, true))
-	e.GET("/api/users", searchUsersHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/users", searchUsersMemHandler(handlerContext, searchUsersHandler(handlerContext)), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.GET("/api/users/:userId", getUserHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.GET("/api/me/export", exportPostsHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.GET("/api/me", getMeHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))

@@ -44,6 +44,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		go loadInitialDataBoundary(h.DB)
 		go loadProfileImageHints(h.DB)
 		go refreshSearchNorms(h.DB)
+		// users のアプリ内レプリカを読み直す (他のリージョンは reset.sql が残す '*' の変更ログで読み直す。users_cache.go)。
+		go loadUsersCache(h.DB, "initialize")
 		// ベンチで読む表と索引を DB のキャッシュに載せておく (prewarm.go)。応答は待たない。
 		go prewarmDB(h.DB, "initialize")
 
