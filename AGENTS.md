@@ -51,6 +51,14 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 - DB 接続: `. ~/env.sh && PGPASSWORD="$ISUREAL_DB_PASSWORD" psql -h "$ISUREAL_DB_HOST" -p "$ISUREAL_DB_PORT" -U "$ISUREAL_DB_USER" -d "$ISUREAL_DB_NAME"`
 - 動作確認用ユーザーと管理者アカウントは manual.md「アプリケーションの表示確認」「データベース」を参照。**管理者 `admin` はベンチが投稿期間の開始に使うので変更・削除しない**。
 
+## 課題管理（GitHub Issues）
+
+改善対象の課題は <https://github.com/Harineko0/isucon26-container/issues> で管理する。
+
+- **記録**: ボトルネックや不具合、改善案を見つけたら Issue を立てる。タイトルは `[優先度][分類] 内容`（例: `[P1][DB] ...`、`[P2][Performance] ...`）。本文には根拠（計測結果・該当コード `file:line`）と、守ることへの影響（read-after-write、initialize など）を書く。立てる前に重複を `gh issue list -R Harineko0/isucon26-container --search <語>` で確かめる。
+- **着手**: 実装する前に Open の Issue から 1 つ選び、assignee に自分の GitHub アカウントを設定してから始める（`gh issue edit <番号> -R Harineko0/isucon26-container --add-assignee @me`）。既に他人が assign されている Issue には手を出さない。
+- **完了**: 実装・デプロイ・ベンチ確認が終わったら、結果（スコアの変化、コミット）をコメントして close する（`gh issue close <番号> -R Harineko0/isucon26-container --comment "..."`）。見送った場合は理由を書いて `--reason "not planned"` で close する。
+
 ## 守ること（違反は FAIL か失格）
 
 - **read-after-write**: 書き込み後の読み取りはリージョンをまたいでも即反映。非同期レプリカや TTL キャッシュで古い値を返すのは不可。例外は削除済み投稿の画像だけで、5 秒以内に 403 にする。
