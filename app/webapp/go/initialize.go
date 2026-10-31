@@ -24,6 +24,7 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		imageDataStore.reset()
+		go loadInitialDataBoundary(h.DB)
 		go refreshSearchNorms(h.DB)
 
 		// Set language to the implementation language.

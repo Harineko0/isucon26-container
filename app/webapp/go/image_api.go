@@ -100,6 +100,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			object.Data = cached
 		} else {
 			imageDataStore.put(input.ImageID, object.Data)
+			saveInitialImageToDisk(input.ImageID, object.CreatedAt, object.Data)
 		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")

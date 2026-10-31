@@ -56,6 +56,7 @@ func NewServer(config *Config) *echo.Echo {
 	}
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)
+	go loadInitialDataBoundary(db)
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
 	e.POST("/api/auth/register", registerHandler(handlerContext))
