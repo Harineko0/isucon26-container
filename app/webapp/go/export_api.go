@@ -87,12 +87,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		if len(missingIDs) > 0 {
 			// 投稿画像の created_at は投稿時刻と同じなので、(id, created_at) で引いてパーティションを絞る。
 			// 一致しないものがあれば id だけで引き直す。
-			var rows []struct {
-				ID           string    `db:"id"`
-				Data         []byte    `db:"data"`
-				StoredRegion *string   `db:"stored_region"`
-				CreatedAt    time.Time `db:"created_at"`
-			}
+			var rows []exportImageRow
 			if err := h.DB.SelectContext(ctx, &rows, `
     SELECT i.id, i.data, i.stored_region, i.created_at FROM unnest($1::text[], $2::timestamptz[]) AS k(id, created_at)
     JOIN image_objects i ON i.id = k.id AND i.created_at = k.created_at
@@ -111,38 +106,22 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			if len(rest) > 0 {
 				// 固定の SQL にして、件数ごとに文が変わって Prepare の往復が増えるのを避ける。
-				// rows に追記される (sqlx の Select はスライスに append する) ので、下のループで両方をまとめて扱う。
-				if err := h.DB.SelectContext(ctx, &rows, `SELECT id, data, stored_region, created_at FROM image_objects WHERE id = ANY($1)`, rest); err != nil {
+				// sqlx の Select は受け取るスライスを 0 長にしてから詰めるので、別のスライスに読んで足す
+				// (同じ rows に読むと 1 回目の結果が消え、その投稿が export から落ちる。#167)。
+				var more []exportImageRow
+				if err := h.DB.SelectContext(ctx, &more, `SELECT id, data, stored_region, created_at FROM image_objects WHERE id = ANY($1)`, rest); err != nil {
 					return err
 				}
+				rows = append(rows, more...)
 			}
-			// 本体が stored_region のサーバーのディスクにあるもの (image_store.go) は並行して取る。
-			var mu sync.Mutex
-			var wg sync.WaitGroup
-			var fetchErr error
-			for _, row := range rows {
-				if row.StoredRegion == nil || len(row.Data) > 0 {
-					images[row.ID] = row.Data
-					imageDataStore.put(row.ID, row.Data)
-					saveInitialImageToDisk(row.ID, row.CreatedAt, row.Data)
-					continue
-				}
-				wg.Add(1)
-				go func(id, region string) {
-					defer wg.Done()
-					data, err := loadStoredImage(id, region, h.Config.Region)
-					mu.Lock()
-					defer mu.Unlock()
-					if err != nil {
-						fetchErr = err
-						return
-					}
-					images[id] = data
-				}(row.ID, *row.StoredRegion)
-			}
-			wg.Wait()
-			if fetchErr != nil {
-				return fetchErr
+			region := h.Config.Region
+			if err := collectExportImages(rows, images, func(id, storedRegion string) ([]byte, error) {
+				return loadStoredImage(id, storedRegion, region)
+			}, func(row exportImageRow) {
+				imageDataStore.put(row.ID, row.Data)
+				saveInitialImageToDisk(row.ID, row.CreatedAt, row.Data)
+			}); err != nil {
+				return err
 			}
 		}
 
@@ -196,4 +175,47 @@ func writeExportZip(w io.Writer, posts []Post, images map[string][]byte, author 
 		return err
 	}
 	return writer.Close()
+}
+
+// exportImageRow は export で引く image_objects の 1 行。
+type exportImageRow struct {
+	ID           string    `db:"id"`
+	Data         []byte    `db:"data"`
+	StoredRegion *string   `db:"stored_region"`
+	CreatedAt    time.Time `db:"created_at"`
+}
+
+// collectExportImages は rows の画像本体を images に入れる。DB に本体がある行は先に全部入れて onLocal を呼び、
+// 本体が stored_region のサーバーのディスクにある行 (image_store.go) だけを並行して fetch で取る。
+// images への書き込みは、goroutine を始める前の同期部分と、mu を取った goroutine だけにする
+// (以前は goroutine の書き込みと後続行の同期書き込みが並び、concurrent map writes で落ちえた。#167)。
+func collectExportImages(rows []exportImageRow, images map[string][]byte, fetch func(id, storedRegion string) ([]byte, error), onLocal func(exportImageRow)) error {
+	remote := make([]exportImageRow, 0, len(rows))
+	for _, row := range rows {
+		if row.StoredRegion == nil || len(row.Data) > 0 {
+			images[row.ID] = row.Data
+			onLocal(row)
+			continue
+		}
+		remote = append(remote, row)
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var fetchErr error
+	for _, row := range remote {
+		wg.Add(1)
+		go func(id, storedRegion string) {
+			defer wg.Done()
+			data, err := fetch(id, storedRegion)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				fetchErr = err
+				return
+			}
+			images[id] = data
+		}(row.ID, *row.StoredRegion)
+	}
+	wg.Wait()
+	return fetchErr
 }

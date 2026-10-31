@@ -31,7 +31,6 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to prepare image store: " + err.Error())
 	}
 	go removeImageStoreTrash()
-	startImagePushers(config.Region)
 
 	ipBans := newIPBanList()
 	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, ipBans.observeActionLog))
