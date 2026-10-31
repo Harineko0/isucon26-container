@@ -20,10 +20,10 @@ type fakeNotificationDB struct {
 
 func (f *fakeNotificationDB) watcher() *postingWindowWatcher {
 	return newPostingWindowWatcherWith("asia",
-		func(ctx context.Context, region string) (string, error) {
+		func(ctx context.Context, region string) (activeWindowInfo, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
-			return f.window, nil
+			return activeWindowInfo{ID: f.window}, nil
 		},
 		func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error) {
 			f.mu.Lock()

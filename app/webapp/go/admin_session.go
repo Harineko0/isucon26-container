@@ -56,7 +56,8 @@ func getAdminSessionFromHeader(c *echo.Context, db *sqlx.DB) (*AdminSession, err
 func AdminSessionMiddleware(h *HandlerContext, authRequired bool) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
-			session, err := getAdminSessionFromHeader(c, h.DB)
+			// 管理 API は投稿期間の開始に使われ、頻度は数秒に 1 回なので、専用プールで待たずに通す (#44)。
+			session, err := getAdminSessionFromHeader(c, h.BgDB)
 			if err != nil {
 				return err
 			}

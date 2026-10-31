@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -103,11 +104,17 @@ func (s *notificationSubscriber) next(ctx context.Context, after time.Time) (get
 	}
 }
 
+// activeWindowInfo は有効な投稿期間 (無ければ ID が "")。StartsAt は検知の遅れの計測にだけ使う。
+type activeWindowInfo struct {
+	ID       string    `db:"id"`
+	StartsAt time.Time `db:"starts_at"`
+}
+
 type postingWindowWatcher struct {
 	region string
 
 	// DB へのアクセス (テストでは差し替える)。
-	activeWindow  func(ctx context.Context, region string) (string, error)
+	activeWindow  func(ctx context.Context, region string) (activeWindowInfo, error)
 	notifications func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error)
 	inactiveUsers func(ctx context.Context, userIDs []string, region string) ([]string, error)
 
@@ -119,13 +126,13 @@ type postingWindowWatcher struct {
 
 func newPostingWindowWatcher(db *sqlx.DB, region string) *postingWindowWatcher {
 	w := newPostingWindowWatcherWith(region,
-		func(ctx context.Context, region string) (string, error) {
-			var id string
-			err := db.GetContext(ctx, &id, `SELECT id FROM posting_windows WHERE region = $1 AND ended_at IS NULL`, region)
+		func(ctx context.Context, region string) (activeWindowInfo, error) {
+			var w activeWindowInfo
+			err := db.GetContext(ctx, &w, `SELECT id, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL`, region)
 			if errors.Is(err, sql.ErrNoRows) {
-				return "", nil
+				return activeWindowInfo{}, nil
 			}
-			return id, err
+			return w, err
 		},
 		func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error) {
 			var rows []windowNotification
@@ -152,7 +159,7 @@ func newPostingWindowWatcher(db *sqlx.DB, region string) *postingWindowWatcher {
 
 func newPostingWindowWatcherWith(
 	region string,
-	activeWindow func(ctx context.Context, region string) (string, error),
+	activeWindow func(ctx context.Context, region string) (activeWindowInfo, error),
 	notifications func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error),
 	inactiveUsers func(ctx context.Context, userIDs []string, region string) ([]string, error),
 ) *postingWindowWatcher {
@@ -217,10 +224,13 @@ func (w *postingWindowWatcher) runWindowLoop() {
 // checkWindow は有効な投稿期間を確認し、変わっていればその期間の通知を接続中の利用者に配る。
 // 失敗したときは last を進めず、次の周期でやり直す。
 func (w *postingWindowWatcher) checkWindow(ctx context.Context) error {
-	id, err := w.activeWindow(ctx, w.region)
+	queryStart := time.Now()
+	info, err := w.activeWindow(ctx, w.region)
 	if err != nil {
 		return err
 	}
+	detected := time.Now()
+	id := info.ID
 	w.mu.Lock()
 	unchanged := id == w.last
 	w.mu.Unlock()
@@ -234,6 +244,13 @@ func (w *postingWindowWatcher) checkWindow(ctx context.Context) error {
 			rows, err := w.notifications(ctx, id, userIDs)
 			if err != nil {
 				return err
+			}
+			// 計測 (#44): starts_at から検知までの遅れ (開始処理のコミット待ち + 取り出し待ち + 照会) と配布の所要時間。
+			// stderr → journal (action log の stdout とは別)。
+			if !info.StartsAt.IsZero() {
+				fmt.Fprintf(os.Stderr, "windetect region=%s window=%s lag=%s query=%s fanout=%s subs=%d rows=%d\n",
+					w.region, id, detected.Sub(info.StartsAt).Round(time.Millisecond), detected.Sub(queryStart).Round(time.Millisecond),
+					time.Since(detected).Round(time.Millisecond), len(userIDs), len(rows))
 			}
 			for _, row := range rows {
 				ev := notificationEvent{notification: getNotificationsResponse{

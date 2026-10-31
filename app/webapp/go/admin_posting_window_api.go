@@ -1,7 +1,9 @@
 package isureal
 
 import (
+	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,11 +40,15 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 			seconds = *input.OnTimeSeconds
 		}
 		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
+		// 投稿期間の開始はリージョン全体の投稿の起点なので、リクエスト用プールの取り出し待ちに並ばせず
+		// 専用プールで行う (#44)。同じ DB への同じトランザクションで、整合性は変わらない。
+		began := time.Now()
+		tx, err := h.BgDB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
+		acquired := time.Now()
 		// 通知の対象は INSERT ... SELECT の 1 文のスナップショットで決まるので、users のテーブルロックは取らない
 		// (同時に行われた地域変更・登録は、この投稿期間の開始より後に起きた場合と同じ結果になる)。
 		var conflict bool
@@ -92,6 +98,11 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		// 計測 (#44): 接続の取り出し、行ロック待ち (starts_at はロック後の時刻)、starts_at からコミットまで。
+		committed := time.Now()
+		fmt.Fprintf(os.Stderr, "windowopen region=%s window=%s acquire=%s lock=%s commit=%s total=%s\n",
+			region, windowID, acquired.Sub(began).Round(time.Millisecond), startsAt.Sub(acquired).Round(time.Millisecond),
+			committed.Sub(startsAt).Round(time.Millisecond), committed.Sub(began).Round(time.Millisecond))
 		return c.JSON(http.StatusCreated, openPostingWindowResponse{
 			ID: window.ID, Region: window.Region, LocalDate: window.LocalDate.Format(time.DateOnly),
 			StartsAt: window.StartsAt, OnTimeDeadline: window.OnTimeDeadline,

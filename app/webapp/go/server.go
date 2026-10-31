@@ -11,7 +11,9 @@ import (
 )
 
 type HandlerContext struct {
-	DB      *sqlx.DB
+	DB *sqlx.DB
+	// BgDB は監視・BAN 再読込・管理 API 用の専用プール (db_background.go)。同じ DB なので整合性は変わらない。
+	BgDB    *sqlx.DB
 	Config  *Config
 	IPBans  *IPBanList
 	Windows *postingWindowWatcher
@@ -37,22 +39,30 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to ping database: " + err.Error())
 	}
 	go warmUpDBPool(db)
+	bgDB, err := openBackgroundDB(config)
+	if err != nil {
+		panic("failed to open background database pool: " + err.Error())
+	}
+	go warmUpBackgroundDB(bgDB)
 
 	go func() {
 		// 接続プールの待ちを観測する (stderr → journal。guard は JSON の行しか読まない)。
 		for range time.Tick(5 * time.Second) {
 			st := db.Stats()
-			if st.WaitCount > 0 || st.InUse > 0 {
-				fmt.Fprintf(os.Stderr, "dbstats open=%d inuse=%d idle=%d wait=%d waitdur=%s\n", st.OpenConnections, st.InUse, st.Idle, st.WaitCount, st.WaitDuration)
+			bg := bgDB.Stats()
+			if st.WaitCount > 0 || st.InUse > 0 || bg.WaitCount > 0 {
+				fmt.Fprintf(os.Stderr, "dbstats open=%d inuse=%d idle=%d wait=%d waitdur=%s bgopen=%d bginuse=%d bgwait=%d bgwaitdur=%s\n",
+					st.OpenConnections, st.InUse, st.Idle, st.WaitCount, st.WaitDuration, bg.OpenConnections, bg.InUse, bg.WaitCount, bg.WaitDuration)
 			}
 		}
 	}()
 
 	handlerContext := &HandlerContext{
 		DB:      db,
+		BgDB:    bgDB,
 		Config:  config,
 		IPBans:  &IPBanList{},
-		Windows: newPostingWindowWatcher(db, config.Region),
+		Windows: newPostingWindowWatcher(bgDB, config.Region),
 	}
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)

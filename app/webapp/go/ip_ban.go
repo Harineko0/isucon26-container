@@ -32,6 +32,7 @@ func (l *IPBanList) Banned(ctx context.Context, db *sqlx.DB, ip string) (bool, e
 	snapshot := l.snapshot.Load()
 	if snapshot == nil && l.reloading.TryLock() {
 		// 初回だけ同期で読み、以降は裏で 200ms ごとに読み直す(リクエストに DB 往復を乗せない)。
+		// db は専用プール (BgDB) で、リクエスト用プールの取り出し待ちに並ばない (#44)。
 		defer l.reloading.Unlock()
 		loaded, err := loadIPBans(ctx, db)
 		if err != nil {
@@ -83,7 +84,7 @@ func extractClientIP(req *http.Request) string {
 func IPBanMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
-			banned, err := h.IPBans.Banned(c.Request().Context(), h.DB, c.RealIP())
+			banned, err := h.IPBans.Banned(c.Request().Context(), h.BgDB, c.RealIP())
 			if err != nil {
 				return err
 			}
