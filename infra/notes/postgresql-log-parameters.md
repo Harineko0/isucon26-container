@@ -36,8 +36,8 @@ team still wants:
 
     sudo truncate -s 0 /var/log/postgresql/postgresql-16-main.log
 
-PostgreSQL keeps writing to the same file descriptor, which is opened with
-O_APPEND by pg_ctlcluster, so truncation is safe.
+The postmaster's stderr (fd 2) points at this file with flags `0102001`, which include O_APPEND.
+So after truncation, PostgreSQL writes from offset 0 and leaves no sparse gap.
 
 # journald rate limit and isureal-guard (#38): no change needed
 
