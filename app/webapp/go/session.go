@@ -93,8 +93,10 @@ func (w *bufferedResponseWriter) Write(b []byte) (int, error) {
 }
 
 // deferredSessionRoutes の GET はハンドラの 1 文でセッションを確認するので、投機的には処理しない。
-func speculativeSessionAllowed(c *echo.Context) bool {
-	return c.Request().Method == http.MethodGet && !deferredSessionRoutes[c.Request().Method+" "+c.RouteInfo().Path]
+// asia は DB との往復が 1ms なので、並行にしても 1ms しか縮まないのに GET 1 回で接続を 2 本使い、
+// プール待ちの最大要因になっていた (#68)。往復 100ms の EU/US だけで使う。
+func speculativeSessionAllowed(c *echo.Context, region string) bool {
+	return region != "asia" && c.Request().Method == http.MethodGet && !deferredSessionRoutes[c.Request().Method+" "+c.RouteInfo().Path]
 }
 
 func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.MiddlewareFunc {
@@ -105,7 +107,7 @@ func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.M
 				return err
 			}
 			ctx := c.Request().Context()
-			if ok && speculativeSessionAllowed(c) {
+			if ok && speculativeSessionAllowed(c, handlerContext.Config.Region) {
 				if cached, found := knownSessions.Load(tokenHash); found {
 					known := cached.(Session)
 					type result struct {
