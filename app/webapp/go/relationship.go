@@ -74,9 +74,11 @@ func requireRelationshipChange(result sql.Result, err error, status int, code st
 	return nil
 }
 
+// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、ポインタで受ける
+// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
 type relationshipResult struct {
 	SessRegion *string    `db:"sess_region"`
-	Result     string     `db:"o_result"`
+	Result     *string    `db:"o_result"`
 	ID         *string    `db:"o_id"`
 	Status     *string    `db:"o_status"`
 	UpdatedAt  *time.Time `db:"o_updated_at"`
@@ -92,7 +94,10 @@ func runRelationship(c *echo.Context, h *HandlerContext, action, target string) 
 	if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_relationship($1, {user}, $2, $3)`, action, target, uuid.NewString()); err != nil {
 		return row, err
 	}
-	return row, relationshipResultError(row.Result)
+	if row.Result == nil {
+		return row, errors.New("relationship function returned no result")
+	}
+	return row, relationshipResultError(*row.Result)
 }
 
 func relationshipResultError(result string) error {

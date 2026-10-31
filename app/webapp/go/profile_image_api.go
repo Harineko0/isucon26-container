@@ -39,7 +39,8 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			Result     *string `db:"result"`
 		}
 		if err := callWithSessionAnyRegion(c, h, &row, `(SELECT isureal_put_profile_image({user}, $1, $2, $3) AS result)`, imageID, dbData, storedRegion); err != nil {
-			discardUploadedImage(imageID, storedRegion)
+			// コミット済みかどうか分からない (応答の読み取り中の切断など) ので、ファイルは消さない
+			// (投稿・RealMoji と同じ。残っても id は使い回さないのでディスクを使うだけ)。
 			return err
 		}
 		if row.Result == nil || *row.Result != "ok" {

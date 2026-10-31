@@ -124,6 +124,7 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusConflict, "username_taken")
 		}
 		user := row.user()
+		saveSearchNormsAsync(h.DB, user)
 		return c.JSON(http.StatusCreated, registerResponse{SecretKey: secretKey, User: newSessionUserResponse(user)})
 	}
 }
@@ -142,9 +143,15 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		hash := sha256.Sum256([]byte(input.SecretKey))
 		token := uuid.NewString()
 		tokenHash := sha256.Sum256([]byte(token))
+		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
+		if err != nil {
+			return err
+		}
 		var row sessionUserRow
-		if err := h.DB.GetContext(ctx, &row, `SELECT * FROM isureal_login($1, $2, $3, $4)`,
-			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hex.EncodeToString(tokenHash[:])); err != nil {
+		err = conn.GetContext(ctx, &row, `SELECT * FROM isureal_login($1, $2, $3, $4)`,
+			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hex.EncodeToString(tokenHash[:]))
+		conn.Close()
+		if err != nil {
 			return err
 		}
 		if row.Result != "ok" {
@@ -222,6 +229,9 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		user := User{ID: *row.ID, Username: *row.Username, SecretKeyHash: *row.SecretKeyHash, DisplayName: *row.DisplayName, Bio: *row.Bio,
 			ProfileImageID: row.ProfileImageID, Region: *row.Region, AccountType: *row.AccountType, Status: *row.Status}
+		if input.DisplayName != nil {
+			saveSearchNormsAsync(h.DB, user)
+		}
 		if err := user.setImageKey(); err != nil {
 			return err
 		}

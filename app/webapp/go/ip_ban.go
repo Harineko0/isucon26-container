@@ -56,6 +56,34 @@ func (l *IPBanList) Banned(ctx context.Context, db *sqlx.DB, ip string) (bool, e
 	return ok && time.Now().Before(until), nil
 }
 
+// bannedCached は DB を読まずに、アプリ内の BAN と読み込み済みの ip_bans だけで判定する。
+func (l *IPBanList) bannedCached(ip string, now time.Time) bool {
+	if l.abuse != nil && l.abuse.bannedAt(ip, now) {
+		return true
+	}
+	snapshot := l.snapshot.Load()
+	if snapshot == nil {
+		return false
+	}
+	until, ok := snapshot.bans[ip]
+	return ok && now.Before(until)
+}
+
+// connUnlessBanned は DB 接続を取ってから BAN をもう一度確かめる。攻撃は何十件も同時に送られ、
+// 入口の判定を通ったあと接続を待つ間に BAN されることが多いので、その分を DB に流さない (#109)。
+// BAN 中なら入口と同じ 403 ip_banned を返す。呼び出し側は conn.Close() で接続をプールに返す。
+func (l *IPBanList) connUnlessBanned(ctx context.Context, db *sqlx.DB, ip string) (*sqlx.Conn, error) {
+	conn, err := db.Connx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if l.bannedCached(ip, time.Now()) {
+		conn.Close()
+		return nil, NewAPIError(http.StatusForbidden, "ip_banned")
+	}
+	return conn, nil
+}
+
 func (l *IPBanList) reloadLoop(db *sqlx.DB) {
 	ticker := time.NewTicker(ipBanReloadInterval)
 	defer ticker.Stop()

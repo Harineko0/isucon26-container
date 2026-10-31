@@ -70,6 +70,7 @@ func NewServer(config *Config) *echo.Echo {
 	go ipBans.abuse.writeLoop(db)
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)
+	go cleanSearchDirtyLoop(db)
 	go loadInitialDataBoundary(db)
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))

@@ -55,7 +55,10 @@ type createPostGate chan struct{}
 
 // createPostGateSize はサーバ (リージョン) ごとの同時実行数。asia は EU/US の約 5 倍の投稿を受ける。
 // 3 台合計で 8 + 4 + 4 = 16 本 (待ちが 0 だった 12 本に近い値。asia に寄せる)。
-var createPostGateSize = map[string]int{"asia": 8, "europe": 4, "america": 4}
+// asia 8 のベンチ (main 91832e2, 64,912) では画像 INSERT が 390→88 ms に下がった一方、asia の POST /api/posts が
+// 平均 1.9 s (最大 4.7 s) と gate 待ちが支配的になり、グランプリの投稿は 400 人中 125 人だった。
+// 待ちが 0 だった同時 12 本まで asia を広げる (#81)。3 台合計 12 + 4 + 4 = 20。
+var createPostGateSize = map[string]int{"asia": 12, "europe": 4, "america": 4}
 
 func newCreatePostGate(region string) createPostGate {
 	n, ok := createPostGateSize[region]
@@ -123,9 +126,11 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
 		imageID := newImageID(h.Config.Region)
 		postID := newTimeID()
+		// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、全部ポインタで受ける
+		// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
 		var row struct {
 			SessRegion     *string    `db:"sess_region"`
-			Result         string     `db:"o_result"`
+			Result         *string    `db:"o_result"`
 			WindowID       *string    `db:"o_window_id"`
 			OnTimeDeadline *time.Time `db:"o_on_time_deadline"`
 			PostedAt       *time.Time `db:"o_posted_at"`
@@ -156,7 +161,10 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		switch row.Result {
+		if row.Result == nil {
+			return sql.ErrNoRows
+		}
+		switch *row.Result {
 		case "ok":
 		case "slot_unavailable":
 			discardUploadedImage(imageID, storedRegion)
