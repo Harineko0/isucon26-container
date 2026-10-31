@@ -221,11 +221,15 @@ func (c *imageDataCache) get(id string) ([]byte, bool) {
 		return data, true
 	}
 	if data, ok := readImageFromDisk(id); ok {
-		c.put(id, data)
+		if !imageAccelEnabled {
+			c.put(id, data)
+		}
 		return data, true
 	}
 	if data, ok := readImageFromStore(id); ok {
-		c.put(id, data)
+		if !imageAccelEnabled {
+			c.put(id, data)
+		}
 		return data, true
 	}
 	return nil, false

@@ -171,7 +171,9 @@ func (d *decoder) processDHT(n int) error {
 			c <<= 1
 		}
 
-		h.buildSeqLut(tc == acTable)
+		// A short code is independent of trailing bits only in a prefix-free
+		// table. c is twice the next code at the maximum code length.
+		h.buildSeqLut(tc == acTable, c <= 1<<(maxCodeLength+1))
 	}
 	return nil
 }

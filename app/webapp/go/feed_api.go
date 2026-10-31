@@ -183,8 +183,9 @@ const feedFriendsCTE = `
 
 const feedBlockedCTE = `
   blocked AS (
-    SELECT CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END AS id
-    FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+    SELECT blocked_id AS id FROM block_relations WHERE blocker_id = $1
+    UNION ALL
+    SELECT blocker_id AS id FROM block_relations WHERE blocked_id = $1
   )`
 
 // feedOpenPostsCTE はどのフィードにも共通する条件（期間中・未削除・本人以外・閲覧者が投稿済み）の投稿。
@@ -213,6 +214,14 @@ var feedCandidateBase = `
     ) u
     WHERE p.author_id NOT IN (SELECT id FROM blocked)`
 
+// feedUnrankedCandidateBase は非ランキングフィード（public / friends / following）用の候補抽出。
+// ここでは users をまだ引かず、feedUnrankedTail で posted_at, id 降順に並べてから先頭 51 件分の有効な著者だけを主キーで引く
+// （open_posts 全件に対して先に users_pkey を引くと、51 件より後ろの候補まで毎回 users を引いていた）。
+var feedUnrankedCandidateBase = `
+    SELECT p.* FROM open_posts p
+    WHERE p.author_id NOT IN (SELECT id FROM blocked)
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))`
+
 // 非ランキングのフィードは score が常に 0 なので posted_at, id の降順だけで並ぶ。
 // viewer から LEFT JOIN LATERAL して、一覧が 0 件でも有効なセッションなら番兵の 1 行を返す。
 var feedUnrankedTail = `
@@ -221,9 +230,16 @@ var feedUnrankedTail = `
     0::bigint AS score
   FROM viewer v
   LEFT JOIN LATERAL (
-    SELECT c.* FROM candidates c
-    WHERE $2::timestamptz IS NULL OR (c.posted_at, c.id) < ($2, $3)
-    ORDER BY c.posted_at DESC, c.id DESC
+    SELECT c.*, u.*
+    FROM (
+      SELECT * FROM candidates c
+      ORDER BY c.posted_at DESC, c.id DESC
+      OFFSET 0
+    ) c
+    CROSS JOIN LATERAL (
+      SELECT ` + userColumnsAs("u", "author") + ` FROM users u
+      WHERE u.id = c.author_id AND u.status = 'active' OFFSET 0
+    ) u
     LIMIT 51
   ) r ON true
   ORDER BY r.posted_at DESC, r.id DESC
@@ -233,7 +249,7 @@ var feedUnrankedTail = `
 func buildFeedPublicQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
+  candidates AS (` + feedUnrankedCandidateBase + `
       AND p.visibility = 'public'
   )` + feedUnrankedTail
 }
@@ -242,7 +258,7 @@ func buildFeedPublicQuery(regionParam, tokenParam int) string {
 func buildFeedFriendsQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
+  candidates AS (` + feedUnrankedCandidateBase + `
       AND (p.author_id IN (SELECT id FROM friends)) IS TRUE
       AND p.visibility IN ('public', 'friends', 'friends_of_friends')
   )` + feedUnrankedTail
@@ -253,7 +269,7 @@ func buildFeedFriendsQuery(regionParam, tokenParam int) string {
 func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
+  candidates AS (` + feedUnrankedCandidateBase + `
       AND (p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)) IS TRUE
       AND (p.visibility = 'public'
            OR (p.visibility = 'friends' AND p.author_id IN (SELECT id FROM friends))

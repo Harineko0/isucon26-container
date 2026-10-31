@@ -71,6 +71,9 @@ func TestRoundTripHandlersOnPostgres(t *testing.T) {
 	e.PATCH("/api/posts/:postId", updatePostHandler(h), auth...)
 	e.DELETE("/api/posts/:postId", deletePostHandler(h), auth...)
 	e.DELETE("/api/comments/:commentId", deleteCommentHandler(h), auth...)
+	e.GET("/api/me/export", exportPostsHandler(h), auth...)
+	imageDataStore.put("i1", []byte("jpeg-bytes"))
+	t.Cleanup(func() { imageDataStore.reset() })
 
 	// 各トークンで 1 回 GET して覚えさせ (2 回目以降の deferred 経路にする)、以降は 1 文の経路を通す。
 	for _, token := range []string{"t1", "t2", "t3", "t4"} {
@@ -109,6 +112,11 @@ func TestRoundTripHandlersOnPostgres(t *testing.T) {
 		{"author deletes a post", "t2", http.MethodDelete, "/api/posts/p2", "", http.StatusNoContent, ""},
 		{"deleted post is gone", "t2", http.MethodGet, "/api/posts/p2", "", http.StatusNotFound, ""},
 		{"deleted post cannot be deleted again", "t2", http.MethodDelete, "/api/posts/p2", "", http.StatusNotFound, ""},
+
+		{"export own posts in one statement", "t1", http.MethodGet, "/api/me/export", "", http.StatusOK, ""},
+		{"export empty posts in one statement", "t2", http.MethodGet, "/api/me/export", "", http.StatusOK, ""},
+		{"export other region is 403", "t3", http.MethodGet, "/api/me/export", "", http.StatusForbidden, ""},
+		{"export invalid session is 401", "nope", http.MethodGet, "/api/me/export", "", http.StatusUnauthorized, ""},
 	}
 	for _, step := range steps {
 		rec := serveRoundTrip(e, step.token, step.method, step.target, step.body)

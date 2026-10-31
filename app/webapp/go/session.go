@@ -260,15 +260,15 @@ func getLoginSession(ctx context.Context, db sqlx.QueryerContext, sessionID stri
 // 書き込みでは投機的に処理できないので、覚えているセッションがあれば確認を書き込みの SQL に
 // 同居させる (1 往復減らす)。対象のルートは deferredSessionRoutes に限る。
 var deferredSessionRoutes = map[string]bool{
-	"POST /api/posts":                     true,
-	"POST /api/posts/:postId/comments":    true,
-	"POST /api/posts/:postId/realmojis":   true,
-	"POST /api/friend-requests":           true,
-	"PUT /api/follows/:userId":            true,
-	"DELETE /api/follows/:userId":         true,
-	"PUT /api/blocks/:userId":             true,
-	"DELETE /api/blocks/:userId":          true,
-	"DELETE /api/friendships/:userId":     true,
+	"POST /api/posts":                   true,
+	"POST /api/posts/:postId/comments":  true,
+	"POST /api/posts/:postId/realmojis": true,
+	"POST /api/friend-requests":         true,
+	"PUT /api/follows/:userId":          true,
+	"DELETE /api/follows/:userId":       true,
+	"PUT /api/blocks/:userId":           true,
+	"DELETE /api/blocks/:userId":        true,
+	"DELETE /api/friendships/:userId":   true,
 }
 
 // 読み取りだが、セッションの確認をハンドラの SQL に同居させるルート (notification_api.go, posting_window_api.go)。
@@ -284,6 +284,8 @@ func init() {
 	deferredSessionRoutes["GET /api/posts/:postId/realmojis"] = true
 	deferredSessionRoutes["GET /api/memories"] = true
 	deferredSessionRoutes["GET /api/memories/:date"] = true
+	deferredSessionRoutes["GET /api/me/export"] = true
+	deferredSessionRoutes["GET /api/users"] = true
 }
 
 // deferredSessionCheckedKey は、deferred 経路でハンドラがセッションを確認する SQL を実行したことを示す。
