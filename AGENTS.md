@@ -5,7 +5,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 ## 競技の基本
 
 - 10:00 開始 / 17:00 リーダーボード凍結 / 18:00 終了。**最終スコア = 最後に回したベンチ**（FAIL なら記録なし）。17:30 以降は安定版のみ回す。
-- ベンチはポータルから実行（<https://portal.isucon.net/contestant/benchmark_jobs>）。WAITING/RUNNING の間は次を投げられない＝チームで同時に 1 本。
+- ベンチはポータルから実行（<https://portal.isucon.net/contestant/benchmark_jobs>）。WAITING/RUNNING の間は次を投げられない＝チームで同時に 1 本。1 回あたり約 2 分。初回スコアは #448 の **3465**（10:17、無改修）。
 - スコア = Σ(採点件数 × 配点 × リージョン倍率)。倍率は asia 1 / **europe 1.5 / america 1.5**。配点表は manual.md「スコアの計算」。
 
 ## 環境（CloudFormation スタック `isucon-prod-2`、ap-northeast-1）
@@ -18,8 +18,10 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 | asia2 | DatabasePublicIP | 3.115.193.33 | 192.168.4.10 | c5.large | 共有 PostgreSQL 16 |
 | ルーター | RouterPublicIP | 35.73.68.236 | — | — | 国別転送・遅延/帯域制限。**ログイン・設定変更禁止** |
 
+- チーム ID: 120107。ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）の 4 台と上表の IP が一致していることを確認済み（2026-10-31 時点で全台 RUNNING）。
+- 表示確認用 URL（ルーター経由）: <http://35.73.68.236:8080>
 - BenchmarkHost: `app.team120107-aws.127.0.0.1.nip.io`
-- SSH は `isucon@<Public IP>`（GitHub 登録鍵）。ポータルのサーバリストにある 4 台以外へは SSH しない。
+- SSH は `ssh isucon@<Public IP>`（GitHub 登録鍵）。ポータルのサーバリストにある 4 台以外へは SSH しない。
 - ルーターは `X-Country-Code`（JP/KR/CN/AU→asia1、GB/DE/FR→europe1、US/CA/MX→america1、省略時 JP）で振り分ける。クライアント IP は `X-Client-IP` を使う。
 - europe1/america1 → asia2 はリージョン間通信で遅延と帯域制限がある。asia1 と asia2 は同一リージョン扱い。
 
