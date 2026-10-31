@@ -1,7 +1,6 @@
 package isureal
 
 import (
-	"bytes"
 	"net/http"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
@@ -21,7 +20,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		// Validate first: the abuse flag must be set exactly when
 		// image/jpeg.Decode would fail, including for oversized images.
-		width, height, err := jpegcheck.Validate(bytes.NewReader(data))
+		width, height, err := jpegcheck.ValidateBytes(data)
 		if err != nil {
 			c.Set("abuse", "invalid_image")
 			return NewAPIError(http.StatusBadRequest, "invalid_profile_image")

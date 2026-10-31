@@ -4,6 +4,13 @@
 
 package jpegcheck
 
+// scanComponent is one component's entry in a scan header.
+type scanComponent struct {
+	compIndex uint8
+	td        uint8 // DC table selector.
+	ta        uint8 // AC table selector.
+}
+
 // Specified in section B.2.3.
 func (d *decoder) processSOS(n int) error {
 	if d.nComp == 0 {
@@ -19,11 +26,7 @@ func (d *decoder) processSOS(n int) error {
 	if n != 4+2*nComp {
 		return FormatError("SOS length inconsistent with number of components")
 	}
-	var scan [maxComponents]struct {
-		compIndex uint8
-		td        uint8 // DC table selector.
-		ta        uint8 // AC table selector.
-	}
+	var scan [maxComponents]scanComponent
 	totalHV := 0
 	for i := 0; i < nComp; i++ {
 		cs := d.tmp[1+2*i] // Component selector.
@@ -114,6 +117,11 @@ func (d *decoder) processSOS(n int) error {
 	}
 
 	d.bits = bits{}
+	if !d.progressive {
+		// Sequential scans take the fast path (sequential.go); the loop
+		// below is only reached for progressive scans.
+		return d.validateSequentialScan(&scan, nComp, mxx, myy)
+	}
 	mcu, expectedRST := 0, uint8(rst0Marker)
 	var (
 		// b is the decoded coefficients, in natural (not zig-zag) order.
@@ -169,12 +177,6 @@ func (d *decoder) processSOS(n int) error {
 						}
 					}
 
-					if !d.progressive {
-						if err := d.validateSequentialBlock(&d.huff[dcTable][scan[i].td], &d.huff[acTable][scan[i].ta]); err != nil {
-							return err
-						}
-						continue
-					}
 					b = d.progCoeffs[compIndex][by*mxx*hi+bx]
 
 					if ah != 0 {
