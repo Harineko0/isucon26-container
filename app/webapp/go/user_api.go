@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
@@ -65,6 +64,21 @@ type sessionUserRow struct {
 	Region      *string `db:"o_region"`
 	AccountType *string `db:"o_account_type"`
 	Status      *string `db:"o_status"`
+}
+
+// isureal_update_me の 1 行。関数が呼ばれなかったときは o_* が NULL なのでポインタで受ける。
+type updateMeRow struct {
+	SessRegion     *string `db:"sess_region"`
+	Result         *string `db:"o_result"`
+	ID             *string `db:"o_id"`
+	Username       *string `db:"o_username"`
+	SecretKeyHash  *string `db:"o_secret_key_hash"`
+	DisplayName    *string `db:"o_display_name"`
+	Bio            *string `db:"o_bio"`
+	ProfileImageID *string `db:"o_profile_image_id"`
+	Region         *string `db:"o_region"`
+	AccountType    *string `db:"o_account_type"`
+	Status         *string `db:"o_status"`
 }
 
 func (row sessionUserRow) user() User {
@@ -149,7 +163,15 @@ func logoutHandler(h *HandlerContext) echo.HandlerFunc {
 		if session == nil {
 			return NewAPIError(http.StatusUnauthorized, "invalid_session")
 		}
-		if err := InvalidateLoginSession(h.DB, session.UserID, session.TokenHash); err != nil {
+		// InvalidateLoginSession と同じ処理を、セッションの確認と同じ 1 文で行う (#17)。
+		// スカラーを返す関数は (SELECT f(...) AS result) で包む: 素の `FROM f(...) r` だと列名が r になり、
+		// deferred の LATERAL 形 (列名が関数名) と一致しない。
+		knownSessions.Delete(session.TokenHash)
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSessionAnyRegion(c, h, &row, `(SELECT isureal_logout({user}, $1) AS result)`, session.TokenHash); err != nil {
 			return err
 		}
 		return c.NoContent(http.StatusNoContent)
@@ -189,22 +211,22 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 			(input.Region != nil && !validRegion(*input.Region)) {
 			return NewAPIError(http.StatusBadRequest, "invalid_profile")
 		}
-		ctx := c.Request().Context()
-		var user User
-		err := h.DB.GetContext(ctx, &user, `
-   UPDATE users SET display_name = COALESCE($2, display_name), bio = COALESCE($3, bio), region = COALESCE($4, region),
-                    updated_at = clock_timestamp()
-   WHERE id = $1
-   RETURNING `+strings.Join(userColumns, ", "), session.UserID, input.DisplayName, input.Bio, input.Region)
-		if errors.Is(err, sql.ErrNoRows) || (err == nil && user.Status != "active") {
-			return NewAPIError(http.StatusNotFound, "account_not_found")
-		}
-		if err != nil {
+		// UPDATE users ... RETURNING を isureal_update_me にして、セッションの確認と同じ 1 文で行う (#17)。
+		// このルートにはリージョンの確認が無い (リージョンを変える操作でもある) ので callWithSessionAnyRegion。
+		var row updateMeRow
+		if err := callWithSessionAnyRegion(c, h, &row, `isureal_update_me({user}, $1, $2, $3)`, input.DisplayName, input.Bio, input.Region); err != nil {
 			return err
 		}
+		if row.Result == nil || *row.Result != "ok" || *row.Status != "active" {
+			return NewAPIError(http.StatusNotFound, "account_not_found")
+		}
+		user := User{ID: *row.ID, Username: *row.Username, SecretKeyHash: *row.SecretKeyHash, DisplayName: *row.DisplayName, Bio: *row.Bio,
+			ProfileImageID: row.ProfileImageID, Region: *row.Region, AccountType: *row.AccountType, Status: *row.Status}
 		if err := user.setImageKey(); err != nil {
 			return err
 		}
+		// リージョンが変わっていることがあるので、覚えているセッションも更新する。
+		knownSessions.Store(session.TokenHash, Session{UserID: user.ID, TokenHash: session.TokenHash, CreatedAt: session.CreatedAt, Region: user.Region})
 		return c.JSON(http.StatusOK, updateMeResponse(newGetMeResponse(user)))
 	}
 }
