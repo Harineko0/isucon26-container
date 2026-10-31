@@ -66,13 +66,16 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 
-		id, imageID := newTimeID(), newTimeID()
+		id, imageID := newTimeID(), newImageID(h.Config.Region)
+		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
 		var row interactionRow
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_replace_realmoji({user}, $1, $2, $3, $4, $5)`,
-			input.PostID, id, imageID, data, input.ReactionType); err != nil {
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_replace_realmoji({user}, $1, $2, $3, $4, $5, $6)`,
+			input.PostID, id, imageID, dbData, input.ReactionType, storedRegion); err != nil {
 			return err
 		}
 		if err := row.err(); err != nil {
+			discardUploadedImage(imageID, storedRegion)
 			return err
 		}
 		user, err := row.user()
@@ -80,6 +83,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		imageDataStore.put(imageID, data)
+		enqueueImagePush(imageID, data, storedRegion, h.Config.Region)
 		reaction := RealMoji{ID: id, PostID: input.PostID, ReactorID: user.ID, ImageID: imageID, ReactionType: input.ReactionType, CreatedAt: *row.CreatedAt}
 		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))
 	}
@@ -179,11 +183,16 @@ func deleteRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_delete_realmoji($1, $2)`, actor, input.RealMojiID); err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_realmoji({user}, $1) AS result)`, input.RealMojiID); err != nil {
 			return err
+		}
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
 		}
 		switch result {
 		case "ok":

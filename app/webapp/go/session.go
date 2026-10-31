@@ -282,6 +282,8 @@ func init() {
 	deferredSessionRoutes["GET /api/relationships/:kind"] = true
 	deferredSessionRoutes["GET /api/posts/:postId/comments"] = true
 	deferredSessionRoutes["GET /api/posts/:postId/realmojis"] = true
+	deferredSessionRoutes["GET /api/memories"] = true
+	deferredSessionRoutes["GET /api/memories/:date"] = true
 }
 
 // deferredSessionCheckedKey は、deferred 経路でハンドラがセッションを確認する SQL を実行したことを示す。
@@ -301,6 +303,10 @@ func verifyDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string,
 	region := ""
 	if session != nil {
 		region = session.Region
+		if anyRegionDeferredRoutes[c.Request().Method+" "+c.RouteInfo().Path] {
+			// RegionMiddleware の無いルートなので、リージョンが違っても 403 にしない。
+			region = h.Config.Region
+		}
 	}
 	if err := rejectDeferredSession(c, h, tokenHash, session != nil, region); err != nil {
 		return err
@@ -333,22 +339,29 @@ func deferredSession(c *echo.Context) (string, bool) {
 // セッションの確認と同じ 1 文で実行する。{user} はセッションの利用者 id に置き換わる。
 // 結果の行は sess_region 列を持つ構造体で受ける。セッションが無効なら 401、リージョン違いなら 403。
 func callWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion func() *string, call string, args ...any) error {
+	return callWithSessionColumns(c, h, dest, sessRegion, "r.*", call, args...)
+}
+
+// callWithSessionColumns は callWithSession の、結果の選択リスト (既定 `r.*`) を差し替えられる版。
+// リージョン違いでは関数が呼ばれず r の列が NULL になるので、NOT NULL の列を COALESCE で埋めれば
+// 値の型 (string など) のまま受けられる (#17 PATCH /api/posts/:postId)。
+func callWithSessionColumns(c *echo.Context, h *HandlerContext, dest any, sessRegion func() *string, columns, call string, args ...any) error {
 	ctx := c.Request().Context()
 	tokenHash, deferred := deferredSession(c)
 	if !deferred {
 		args = append(args, GetSession(c).UserID)
-		query := `SELECT NULL::text AS sess_region, r.* FROM ` + strings.ReplaceAll(call, "{user}", fmt.Sprintf("$%d", len(args))) + ` r`
+		query := `SELECT NULL::text AS sess_region, ` + columns + ` FROM ` + strings.ReplaceAll(call, "{user}", fmt.Sprintf("$%d", len(args))) + ` r`
 		return h.DB.GetContext(ctx, dest, query, args...)
 	}
 	args = append(args, tokenHash, h.Config.Region)
 	n := len(args)
 	query := fmt.Sprintf(`
-		SELECT s.sess_region, r.* FROM (
+		SELECT s.sess_region, %s FROM (
 			SELECT s.user_id AS sess_user_id, u.region AS sess_region
 			FROM login_sessions s JOIN users u ON u.id = s.user_id
 			WHERE s.token_hash = $%d AND s.active = true AND u.status = 'active'
 		) s LEFT JOIN LATERAL (SELECT * FROM %s WHERE s.sess_region = $%d OFFSET 0) r ON true`,
-		n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
+		columns, n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
 	err := h.DB.GetContext(ctx, dest, query, args...)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.Set(deferredSessionCheckedKey, true)

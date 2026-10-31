@@ -40,6 +40,14 @@ FROM initial_users i
 WHERE u.id = i.id
   AND (u.display_name, u.bio, u.profile_image_id, u.region, u.account_type, u.status, u.deleted_at, u.updated_at)
       IS DISTINCT FROM (i.display_name, i.bio, i.profile_image_id, i.region, i.account_type, i.status, i.deleted_at, i.updated_at);
+-- 上の UPDATE は session_replication_role = replica なので users_search_dirty_update トリガーが発火しない。
+-- ベンチが変えた表示名を初期値に戻した利用者は user_search_norms が古い名前のままになり、initialize 後の
+-- refreshSearchNorms (非同期) が終わるまで、初期の名前で検索しても見つからない。トリガーの代わりにここで dirty に入れる
+-- (検索はアプリで照合する)。002-indexes.sql の末尾と同じ文で、5.6k 行の結合なので数 ms。
+INSERT INTO user_search_dirty (user_id)
+SELECT u.id FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
+WHERE s.display_name IS DISTINCT FROM u.display_name
+ON CONFLICT DO NOTHING;
 
 INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
 SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM initial_friend_requests;
@@ -57,3 +65,9 @@ COMMIT;
 -- Seq Scan が読むページも減る。autovacuum に任せるとベンチ中になり、検索と競合して切り詰めを諦めることがある。
 -- VACUUM はトランザクションの外でしか流せない。ほかの VACUUM が動いていれば待たずに飛ばす (SKIP_LOCKED)。
 VACUUM (SKIP_LOCKED) user_search_norms;
+
+-- friendships / friend_requests / follows / block_relations は上で TRUNCATE してから入れ直したので、可視性マップが
+-- 空で統計も古い。autovacuum が回るまで（実測でベンチ開始から約55秒）Index Only Scan でも heap を読み、
+-- プランナーも古い統計で計画する（friendships_high_low を入れた #122 の後、friends-of-friends のフィードが読む
+-- ページが 269 → 482 に増えた）。合計約6.5万行の小さい表なので、ここで VACUUM (ANALYZE) しておく。
+VACUUM (ANALYZE, SKIP_LOCKED) friendships, friend_requests, follows, block_relations;

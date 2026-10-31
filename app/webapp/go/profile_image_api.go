@@ -30,19 +30,25 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_profile_image")
 		}
 
-		imageID := newTimeID()
+		imageID := newImageID(h.Config.Region)
+		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
 		// セッションの確認と同じ 1 文で呼ぶ (#17)。このルートにはリージョンの確認が無い。
 		var row struct {
 			SessRegion *string `db:"sess_region"`
 			Result     *string `db:"result"`
 		}
-		if err := callWithSessionAnyRegion(c, h, &row, `(SELECT isureal_put_profile_image({user}, $1, $2) AS result)`, imageID, data); err != nil {
+		if err := callWithSessionAnyRegion(c, h, &row, `(SELECT isureal_put_profile_image({user}, $1, $2, $3) AS result)`, imageID, dbData, storedRegion); err != nil {
+			// コミット済みかどうか分からない (応答の読み取り中の切断など) ので、ファイルは消さない
+			// (投稿・RealMoji と同じ。残っても id は使い回さないのでディスクを使うだけ)。
 			return err
 		}
 		if row.Result == nil || *row.Result != "ok" {
+			discardUploadedImage(imageID, storedRegion)
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		imageDataStore.put(imageID, data)
+		enqueueImagePush(imageID, data, storedRegion, h.Config.Region)
 		return c.NoContent(http.StatusNoContent)
 	}
 }

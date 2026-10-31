@@ -20,11 +20,11 @@ BEGIN
     VALUES(b,b,repeat('b',64),'Bob','asia'),(mid,mid,repeat('c',64),'Middle','asia');
   INSERT INTO posting_windows(id,region,local_date,starts_at,on_time_deadline)
     VALUES(w,'asia',CURRENT_DATE,clock_timestamp()-interval '1 hour',clock_timestamp()+interval '1 hour');
-  SELECT * INTO r FROM isureal_create_post(a,'function-reads-image',p,'\x1234','hello','public','exact',12.34,56.78,NULL);
+  SELECT * INTO r FROM isureal_create_post(a,'function-reads-image',p,'\x1234','hello','public','exact',12.34,56.78,NULL,NULL);
   ASSERT r.o_result = 'ok' AND r.o_id = a AND r.o_window_id = w;
   ASSERT (SELECT (posted_at,latitude::float8,longitude::float8,locality) IS NOT DISTINCT FROM
                  (r.o_posted_at,r.o_latitude,r.o_longitude,r.o_locality) FROM posts WHERE id=p);
-  ASSERT (SELECT o_result = 'slot_unavailable' FROM isureal_create_post(a,'unused-image','unused-post','\x12','','public','none',NULL,NULL,NULL));
+  ASSERT (SELECT o_result = 'slot_unavailable' FROM isureal_create_post(a,'unused-image','unused-post','\x12','','public','none',NULL,NULL,NULL,NULL));
   ASSERT NOT EXISTS(SELECT 1 FROM image_objects WHERE id='unused-image');
   ASSERT isureal_update_post(a,p,'changed','friends')='ok';
   ASSERT (SELECT caption='changed' AND visibility='friends' FROM posts WHERE id=p);
@@ -46,10 +46,10 @@ BEGIN
   SELECT * INTO r FROM isureal_create_comment(b,p,'function-reads-comment','body');
   ASSERT r.o_result='ok' AND r.o_id=b;
   ASSERT (SELECT created_at=r.o_created_at FROM comments WHERE id='function-reads-comment');
-  SELECT * INTO r FROM isureal_replace_realmoji(b,p,'function-reads-realmoji','function-reads-realmoji-image','\x12','like');
+  SELECT * INTO r FROM isureal_replace_realmoji(b,p,'function-reads-realmoji','function-reads-realmoji-image','\x12','like',NULL);
   ASSERT r.o_result='ok' AND r.o_id=b;
   ASSERT (SELECT created_at=r.o_created_at FROM realmojis WHERE id='function-reads-realmoji');
-  SELECT * INTO r FROM isureal_replace_realmoji(b,p,'function-reads-realmoji2','function-reads-realmoji-image2','\x12','smile');
+  SELECT * INTO r FROM isureal_replace_realmoji(b,p,'function-reads-realmoji2','function-reads-realmoji-image2','\x12','smile',NULL);
   ASSERT r.o_result='ok';
   ASSERT (SELECT replaced_at IS NOT NULL FROM realmojis WHERE id='function-reads-realmoji');
 

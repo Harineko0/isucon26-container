@@ -17,7 +17,9 @@ const imageSignatureIterations = 1000
 
 // 署名は 1000 回の HMAC で重いので、exp を丸めて (鍵, 画像, exp) ごとに使い回す。
 // exp は常に「今 + 24 時間」以上に切り上げるので、URL の有効期間は短くならない。
-const imageURLExpBucket = 10
+// 丸めの幅を 10 秒から 30 秒にした: 幅ごとに全画像の署名を計算し直すので、asia1 (SHA 命令なし) では
+// フィード 1 回あたり最大 100 署名 × 1000 回の HMAC を 10 秒ごとに払っていた。URL の期限は 24 時間 + 最大 30 秒。
+const imageURLExpBucket = 30
 
 func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	key, err := hex.DecodeString(secretKeyHash)

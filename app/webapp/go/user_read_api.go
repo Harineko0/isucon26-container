@@ -4,7 +4,9 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -101,7 +103,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 		}
 		if len(staleUsers) > 0 {
-			go saveSearchNorms(context.Background(), h.DB, staleUsers)
+			saveSearchNormsOnce(h.DB, staleUsers)
 		}
 		hasMore := len(items) > 50
 		if hasMore {
@@ -224,13 +226,129 @@ func cleanSearchDirtyLoop(db *sqlx.DB) {
 // saveSearchNormsAsync は登録・表示名の変更のあとに正規化を保存する。応答は待たせない。
 // 保存までの間はトリガーが入れた dirty の行があるので、検索はアプリで照合する。
 func saveSearchNormsAsync(db *sqlx.DB, user User) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := saveSearchNorms(ctx, db, []User{user}); err != nil {
-			log.Printf("failed to save search norms: %v", err)
+	saveSearchNormsOnce(db, []User{user})
+}
+
+// searchNormsSaver は検索用の正規化の保存を 1 本の goroutine にまとめる。
+// 以前は検索・登録・表示名の変更ごとに goroutine を立てて保存していたため、ベンチ中は保存 (1 回 13〜44ms) が
+// 同時に何本も走り、その分だけ共有プールの接続を占めていた (#68: プール 80/80 のまま 1 ベンチで
+// 25,000 回・1.5 時間の接続待ち)。ここでは保存待ちの利用者を溜め、1 本の goroutine が溜まった分を
+// まとめて 1 文で保存する。保存に使う接続は常に高々 1 本で、文の数も減る (DB の CPU も減る)。
+// 正しさは変わらない: 保存が済むまでの間は dirty / stale の利用者として検索がアプリで照合する。
+// 保存の間に名前が変わっていれば dirty に残る (saveSearchNorms)。
+type searchNormsSaver struct {
+	save func(ctx context.Context, users []User) error
+
+	mu       sync.Mutex
+	pending  map[string]User   // 保存待ち (同じ利用者は新しい内容で上書き)
+	inflight map[string]string // 保存中の利用者 id → 表示名
+	wake     chan struct{}
+}
+
+// searchNormsBatchLimit は 1 文で保存する利用者数の上限。
+const searchNormsBatchLimit = 500
+
+func newSearchNormsSaver(save func(ctx context.Context, users []User) error) *searchNormsSaver {
+	s := &searchNormsSaver{
+		save:     save,
+		pending:  map[string]User{},
+		inflight: map[string]string{},
+		wake:     make(chan struct{}, 1),
+	}
+	go s.run()
+	return s
+}
+
+// add は users を保存待ちに入れる。同じ表示名で保存中の利用者は積まない (同時に走る検索が同じ利用者の
+// 保存を何度も積んでいた: 1 ベンチで登録 560 件に対し保存 1318 回)。
+func (s *searchNormsSaver) add(users []User) {
+	added := false
+	s.mu.Lock()
+	for _, user := range users {
+		if _, ok := s.pending[user.ID]; !ok {
+			if name, saving := s.inflight[user.ID]; saving && name == user.DisplayName {
+				continue
+			}
 		}
-	}()
+		s.pending[user.ID] = user
+		added = true
+	}
+	s.mu.Unlock()
+	if !added {
+		return
+	}
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// take は保存待ちを id 順に最大 searchNormsBatchLimit 件取り出し、保存中にする。
+// id 順にそろえるのは、3 台が同時に保存したときに行ロックを同じ順で取るため。
+func (s *searchNormsSaver) take() []User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(s.pending))
+	for id := range s.pending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) > searchNormsBatchLimit {
+		ids = ids[:searchNormsBatchLimit]
+	}
+	batch := make([]User, len(ids))
+	for i, id := range ids {
+		batch[i] = s.pending[id]
+		delete(s.pending, id)
+		s.inflight[id] = batch[i].DisplayName
+	}
+	return batch
+}
+
+func (s *searchNormsSaver) done(batch []User) {
+	s.mu.Lock()
+	for _, user := range batch {
+		delete(s.inflight, user.ID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *searchNormsSaver) run() {
+	for range s.wake {
+		for {
+			batch := s.take()
+			if len(batch) == 0 {
+				break
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := s.save(ctx, batch); err != nil {
+				log.Printf("failed to save search norms: %v", err)
+			}
+			cancel()
+			s.done(batch)
+		}
+	}
+}
+
+var (
+	searchNorms     *searchNormsSaver
+	searchNormsOnce sync.Once
+)
+
+// saveSearchNormsOnce は users の正規化を保存待ちに入れる。保存は searchNormsSaver の 1 本の goroutine が行う。
+func saveSearchNormsOnce(db *sqlx.DB, users []User) {
+	if len(users) == 0 {
+		return
+	}
+	searchNormsOnce.Do(func() {
+		searchNorms = newSearchNormsSaver(func(ctx context.Context, users []User) error {
+			return saveSearchNorms(ctx, db, users)
+		})
+	})
+	searchNorms.add(users)
 }
 
 // refreshSearchNorms は正規化が無い・古い利用者をまとめて保存し直す (起動時と初期化後)。

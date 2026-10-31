@@ -78,3 +78,55 @@ func TestDeferredSessionRejectsBeforeHandlerError(t *testing.T) {
 		})
 	}
 }
+
+// RegionMiddleware の無い deferred ルート (logout、PATCH /api/me、profile-image) では、参照実装と同じく
+// リージョンの違う利用者にも 403 を返さず、ハンドラのエラー (400 など) を返すこと。401 は従来どおり先に返す。
+func TestDeferredSessionAnyRegionRoutesSkipRegionCheck(t *testing.T) {
+	const token = "deferred-any-region-test-token"
+	sum := sha256.Sum256([]byte(token))
+	tokenHash := hex.EncodeToString(sum[:])
+	h := &HandlerContext{Config: &Config{Region: "asia"}}
+
+	badRequest := func(c *echo.Context) error {
+		return NewAPIError(http.StatusBadRequest, "invalid_profile_image")
+	}
+	routes := []struct{ method, path string }{
+		{http.MethodPut, "/api/me/profile-image"},
+		{http.MethodDelete, "/api/me/profile-image"},
+		{http.MethodPatch, "/api/me"},
+		{http.MethodPost, "/api/auth/logout"},
+	}
+	cases := []struct {
+		name       string
+		lookup     *Session
+		wantStatus int
+	}{
+		{"region mismatch returns the handler error", &Session{UserID: "u1", Region: "europe"}, http.StatusBadRequest},
+		{"same region returns the handler error", &Session{UserID: "u1", Region: "asia"}, http.StatusBadRequest},
+		{"invalid session beats the handler error", nil, http.StatusUnauthorized},
+	}
+	defer func() { lookupSessionFunc = lookupSession }()
+	for _, route := range routes {
+		if !deferredSessionRoutes[route.method+" "+route.path] {
+			t.Fatalf("%s %s should be a deferred route", route.method, route.path)
+		}
+		for _, tc := range cases {
+			t.Run(route.method+" "+route.path+": "+tc.name, func(t *testing.T) {
+				knownSessions.Store(tokenHash, Session{UserID: "u1", TokenHash: tokenHash, Region: "asia"})
+				lookupSessionFunc = func(ctx context.Context, db *sqlx.DB, hash string) (*Session, error) {
+					return tc.lookup, nil
+				}
+				e := echo.New()
+				e.HTTPErrorHandler = APIErrorHandler
+				e.Add(route.method, route.path, badRequest, SessionMiddleware(h, true))
+				req := httptest.NewRequest(route.method, route.path, nil)
+				req.Header.Set(echo.HeaderAuthorization, "Bearer "+token)
+				rec := httptest.NewRecorder()
+				e.ServeHTTP(rec, req)
+				if rec.Code != tc.wantStatus {
+					t.Fatalf("status = %d (%s), want %d", rec.Code, rec.Body.String(), tc.wantStatus)
+				}
+			})
+		}
+	}
+}
