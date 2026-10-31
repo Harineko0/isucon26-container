@@ -117,6 +117,12 @@ func memoryAnyOf(column, src string) string {
 // 空ページでもセッションの行を残し、401/403 と空の200を区別する。
 // 投稿・リアクション・コメントはそれぞれ 1 回の Bitmap Heap Scan でまとめて引き (memoryAnyOf)、
 // 投稿ごとの並べ替えと 50 件の上限は、引いた行 (rx, cx) に対して以前と同じ式で行う。
+// posts は OFFSET 0 の副問い合わせに閉じ込め、wins との結合条件で投稿期間ごとの索引引き (ヒープを同期で
+// 1 件ずつ読む) に戻されないようにする (汎用プランでは wins の件数を 5 件程度と見積もってそちらを選ぶため)。
+// 読む索引は以前と同じ (posts_author_window, realmojis_post_id, comments_post_id)。リアクションの
+// `COALESCE(replaced_at, deleted_at) IS NULL` は `replaced_at IS NULL AND deleted_at IS NULL` と同じ意味だが、
+// 部分索引 realmojis_one_active (重複排除が効かず realmojis_post_id の約 3 倍の大きさで、キャッシュに
+// 載りにくい。本番の idx_blks_read 84 万 vs 9 万) をプランナに選ばせないためにこう書く。
 var memoriesQuery = `
   WITH sess AS MATERIALIZED (SELECT * FROM {session}),
   wins AS MATERIALIZED (
@@ -124,11 +130,13 @@ var memoriesQuery = `
   ),
   page AS MATERIALIZED (
     SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
-    FROM posts p
+    FROM (
+      SELECT * FROM posts p WHERE p.author_id = $1 AND ` + memoryAnyOf("p.posting_window_id", "wins") + ` OFFSET 0
+    ) p
     JOIN wins w ON w.id = p.posting_window_id
     JOIN users u ON u.id = p.author_id AND u.status = 'active'
     JOIN sess s ON s.sess_user_id = p.author_id
-    WHERE p.deleted_at IS NULL AND p.author_id = $1 AND ` + memoryAnyOf("p.posting_window_id", "wins") + `
+    WHERE p.deleted_at IS NULL AND p.author_id = $1
       AND ($4::timestamptz IS NULL OR (p.posted_at, p.id) < ($4, $5))
     ORDER BY p.posted_at DESC, p.id DESC LIMIT 51
   ),
@@ -137,7 +145,7 @@ var memoriesQuery = `
     SELECT r.post_id, r.id AS "ID", r.image_id AS "ImageID", r.reaction_type AS "ReactionType",
       r.created_at AS "CreatedAt", ` + memoryInteractionUser + `
     FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
-    WHERE ` + memoryAnyOf("r.post_id", "top") + ` AND r.replaced_at IS NULL AND r.deleted_at IS NULL
+    WHERE ` + memoryAnyOf("r.post_id", "top") + ` AND COALESCE(r.replaced_at, r.deleted_at) IS NULL
   ),
   cx AS MATERIALIZED (
     SELECT c.post_id, c.id AS "ID", c.body AS "Body", c.created_at AS "CreatedAt", ` + memoryInteractionUser + `
