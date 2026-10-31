@@ -348,18 +348,14 @@ func callWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion fu
 // リージョン違いでは関数が呼ばれず r の列が NULL になるので、NOT NULL の列を COALESCE で埋めれば
 // 値の型 (string など) のまま受けられる (#17 PATCH /api/posts/:postId)。
 func callWithSessionColumns(c *echo.Context, h *HandlerContext, dest any, sessRegion func() *string, columns, call string, args ...any) error {
-	return callWithSessionOnDB(c, h.DB, h.Config.Region, dest, sessRegion, columns, call, args...)
-}
-
-func callWithSessionOnDB(c *echo.Context, db *sqlx.DB, region string, dest any, sessRegion func() *string, columns, call string, args ...any) error {
 	ctx := c.Request().Context()
 	tokenHash, deferred := deferredSession(c)
 	if !deferred {
 		args = append(args, GetSession(c).UserID)
 		query := `SELECT NULL::text AS sess_region, ` + columns + ` FROM ` + strings.ReplaceAll(call, "{user}", fmt.Sprintf("$%d", len(args))) + ` r`
-		return db.GetContext(ctx, dest, query, args...)
+		return h.DB.GetContext(ctx, dest, query, args...)
 	}
-	args = append(args, tokenHash, region)
+	args = append(args, tokenHash, h.Config.Region)
 	n := len(args)
 	query := fmt.Sprintf(`
 		SELECT s.sess_region, %s FROM (
@@ -368,7 +364,7 @@ func callWithSessionOnDB(c *echo.Context, db *sqlx.DB, region string, dest any, 
 			WHERE s.token_hash = $%d AND s.active = true AND u.status = 'active'
 		) s LEFT JOIN LATERAL (SELECT * FROM %s WHERE s.sess_region = $%d OFFSET 0) r ON true`,
 		columns, n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
-	err := db.GetContext(ctx, dest, query, args...)
+	err := h.DB.GetContext(ctx, dest, query, args...)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.Set(deferredSessionCheckedKey, true)
 		knownSessions.Delete(tokenHash)
@@ -379,7 +375,7 @@ func callWithSessionOnDB(c *echo.Context, db *sqlx.DB, region string, dest any, 
 		return err
 	}
 	c.Set(deferredSessionCheckedKey, true)
-	if current := sessRegion(); current == nil || *current != region {
+	if region := sessRegion(); region == nil || *region != h.Config.Region {
 		knownSessions.Delete(tokenHash)
 		return NewAPIError(http.StatusForbidden, "region_mismatch")
 	}

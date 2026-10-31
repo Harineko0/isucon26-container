@@ -68,8 +68,8 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans:  ipBans,
 		Windows: newPostingWindowWatcher(primary, config.Region),
 	}
-	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, requests []imageReadRequest) []imageReadResult {
-		return loadImageReadBatch(ctx, handlerContext, rel, requests)
+	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
+		return loadImageReadBatch(ctx, handlerContext, rel, takeRequests)
 	}}
 	e.Pre(InternalMiddleware(handlerContext))
 	go ipBans.abuse.writeLoop(db)
@@ -96,7 +96,7 @@ func NewServer(config *Config) *echo.Echo {
 	e.PUT("/api/me/profile-image", putProfileImageHandler(handlerContext), SessionMiddleware(handlerContext, true))
 	e.DELETE("/api/me/profile-image", deleteProfileImageHandler(handlerContext), SessionMiddleware(handlerContext, true))
 	e.POST("/api/me/account-deletion", deleteAccountHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.POST("/api/posts", createPostHandler(handlerContext, primary), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.POST("/api/posts", createPostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.GET("/api/posting-window/current", getCurrentPostingWindowHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.GET("/api/posts/me/current", getMyCurrentPostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.GET("/api/posts/:postId", getPostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))

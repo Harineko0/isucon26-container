@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
-	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
 
@@ -86,52 +85,8 @@ func (g createPostGate) acquire(ctx context.Context) error {
 
 func (g createPostGate) release() { <-g }
 
-// A burst of uploads can occupy every post slot waiting for the shared request
-// pool while the separate primary pool still has room. On the local region at
-// most two metadata-only inserts can use that pool. Its other two connections
-// remain available to the window listener and its subscriber check.
-type postWritePools struct {
-	request, primary           *sqlx.DB
-	requestSlots, primarySlots createPostGate
-}
-
-func newPostWritePools(region string, request, primary *sqlx.DB) postWritePools {
-	slots := newCreatePostGate(region)
-	p := postWritePools{request: request, requestSlots: slots}
-	if region == "asia" && primary != nil && primary != request {
-		p.primary = primary
-		p.primarySlots = make(createPostGate, 2)
-		p.requestSlots = make(createPostGate, cap(slots)-cap(p.primarySlots))
-	}
-	return p
-}
-
-func (p postWritePools) acquire(ctx context.Context, fileBacked bool) (*sqlx.DB, createPostGate, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	if !fileBacked || p.primarySlots == nil {
-		return p.request, p.requestSlots, p.requestSlots.acquire(ctx)
-	}
-	// Prefer a free primary slot. A free request slot can still be waiting
-	// for a connection used by a completely different handler.
-	select {
-	case p.primarySlots <- struct{}{}:
-		return p.primary, p.primarySlots, nil
-	default:
-	}
-	select {
-	case p.primarySlots <- struct{}{}:
-		return p.primary, p.primarySlots, nil
-	case p.requestSlots <- struct{}{}:
-		return p.request, p.requestSlots, nil
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	}
-}
-
-func createPostHandler(h *HandlerContext, primary *sqlx.DB) echo.HandlerFunc {
-	pools := newPostWritePools(h.Config.Region, h.DB, primary)
+func createPostHandler(h *HandlerContext) echo.HandlerFunc {
+	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
 		var input createPostRequest
 		formImage, err := bindImageForm(c, &input)
@@ -195,13 +150,12 @@ func createPostHandler(h *HandlerContext, primary *sqlx.DB) echo.HandlerFunc {
 		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
 		// ディスクへの書き込みは gate の外で済ませ、gate では DB の呼び出しだけを絞る。
 		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
-		db, gate, err := pools.acquire(c.Request().Context(), storedRegion != nil)
-		if err != nil {
+		if err := gate.acquire(c.Request().Context()); err != nil {
 			discardUploadedImage(imageID, storedRegion)
 			return err
 		}
 		proofs := committedPostImages.Load()
-		err = callWithSessionOnDB(c, db, h.Config.Region, &row, func() *string { return row.SessRegion }, "r.*", `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 			imageID, postID, dbImageData, input.Caption, input.Visibility,
 			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion)
 		gate.release()
@@ -231,7 +185,7 @@ func createPostHandler(h *HandlerContext, primary *sqlx.DB) echo.HandlerFunc {
 			ID: postID, AuthorID: user.ID, PostingWindowID: *row.WindowID, ImageID: imageID,
 			Caption: input.Caption, Visibility: input.Visibility,
 			PostLocation: PostLocation{Kind: location.Kind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: row.Locality},
-			PostedAt:     *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
+			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		// The same committed SQL statement created the JPEG object and its post.
 		proofs.Store(imageID, postImageProof{postID: postID, ownerID: user.ID})
