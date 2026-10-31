@@ -45,7 +45,7 @@ type createPostResponse struct {
 	LateSeconds     int64              `json:"lateSeconds"`
 }
 
-// createPostGate は isureal_create_post (image_objects への画像 INSERT を含む) のサーバごとの同時実行数を
+// createPostGate は isureal_create_post のサーバごとの同時実行数を
 // 絞る。image_objects の TOAST の拡張ロック (Lock:extend) は、同時に走る backend が 12 本以下なら
 // 待ちがほぼ 0 で、asia のプール 80 本では最大 50 本ほどがロック待ちのままプールの接続を占めていた
 // (DB の wait の 28%、INSERT の平均 390 ms)。待ちは DB のロックではなく、接続を取り出す前の goroutine で
@@ -57,8 +57,13 @@ type createPostGate chan struct{}
 // asia 8 のベンチ (main 91832e2, 64,912) では画像 INSERT が 390→88 ms に下がった一方、asia の POST /api/posts が
 // 平均 1.9 s (最大 4.7 s) と gate 待ちが支配的になり、グランプリの投稿は 400 人中 125 人だった。
 // asia 12 のベンチ (main b48193a, 63,766) では asia の POST /api/posts が平均 4.1 s (最大 10.7 s) になり、
-// グランプリの投稿は 374 人中 19 人に落ちた (8 のときは 400 人中 125 人)。8 に戻す。3 台合計 8 + 4 + 4 = 16。
-var createPostGateSize = map[string]int{"asia": 8, "europe": 4, "america": 4}
+// グランプリの投稿は 374 人中 19 人に落ちた (8 のときは 400 人中 125 人)。8 に戻した。
+// #128 (画像の本体をリージョンのディスクに置く) 以降、投稿画像は image_objects に data を入れない
+// (storeUploadedImage が空の data と stored_region を返す) ので、この枠が避けていた TOAST の拡張ロックは
+// 起きない。一方で asia の最終日の POST /api/posts は枠待ちで平均 4.4 s かかり、グランプリの人数を決めていた
+// (#97)。枠はプール (asia 80, EU/US 40) より十分小さい値まで広げる。ディスク保存に失敗して DB に data を
+// 入れる場合だけは TOAST に書くが、その経路はまれ。
+var createPostGateSize = map[string]int{"asia": 24, "europe": 12, "america": 12}
 
 func newCreatePostGate(region string) createPostGate {
 	n, ok := createPostGateSize[region]
@@ -317,33 +322,49 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 				return NewAPIError(http.StatusBadRequest, "invalid_post")
 			}
 		}
-		ctx := c.Request().Context()
+		// 更新と更新後の投稿・投稿者の取得を、セッションとリージョンの確認と同じ 1 文で行う (#17)。
+		// 以前は callWithSession(isureal_update_post) → getPostWithAuthor の 2 往復だった。
 		var row struct {
 			SessRegion *string `db:"sess_region"`
-			Result     *string `db:"result"`
+			Result     string  `db:"result"`
+			PostWithAuthor
 		}
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_update_post({user}, $1, $2, $3) AS result)`, input.PostID, input.Caption, input.Visibility); err != nil {
+		if err := callWithSessionColumns(c, h, &row, func() *string { return row.SessRegion }, updatePostReturningColumns,
+			`isureal_update_post_returning({user}, $1, $2, $3)`, input.PostID, input.Caption, input.Visibility); err != nil {
 			return err
 		}
-		result := ""
-		if row.Result != nil {
-			result = *row.Result
-		}
-		switch result {
+		switch row.Result {
 		case "ok":
 		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		default:
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
-		updated, err := getPostWithAuthor(ctx, h.DB, input.PostID)
-		if err != nil {
+		if row.ID == "" {
+			// 更新できたのに投稿者が active でない (以前の getPostWithAuthor の sql.ErrNoRows と同じく 500)。
+			return sql.ErrNoRows
+		}
+		if err := row.Author.setImageKey(); err != nil {
 			return err
 		}
-		post, user := updated.Post, updated.Author
-		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(post, user)))
+		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(row.Post, row.Author)))
 	}
 }
+
+// updatePostReturningColumns は isureal_update_post_returning の o_* を PostWithAuthor の列名で受ける選択リスト。
+// リージョン違いや 'ok' 以外では列が NULL になるので、NOT NULL の列は COALESCE で埋める (値は使わない)。
+const updatePostReturningColumns = `COALESCE(r.o_result, '') AS result,
+  COALESCE(r.o_id, '') AS id, COALESCE(r.o_author_id, '') AS author_id,
+  COALESCE(r.o_posting_window_id, '') AS posting_window_id, COALESCE(r.o_image_id, '') AS image_id,
+  COALESCE(r.o_caption, '') AS caption, COALESCE(r.o_visibility, '') AS visibility,
+  COALESCE(r.o_location_kind, '') AS location_kind, r.o_latitude AS latitude, r.o_longitude AS longitude,
+  r.o_locality AS locality, COALESCE(r.o_posted_at, 'epoch') AS posted_at,
+  COALESCE(r.o_on_time_deadline, 'epoch') AS on_time_deadline, r.o_window_ended_at AS window_ended_at,
+  COALESCE(r.o_user_id, '') AS "author.id", COALESCE(r.o_username, '') AS "author.username",
+  COALESCE(r.o_secret_key_hash, '') AS "author.secret_key_hash", COALESCE(r.o_display_name, '') AS "author.display_name",
+  COALESCE(r.o_bio, '') AS "author.bio", r.o_profile_image_id AS "author.profile_image_id",
+  COALESCE(r.o_region, '') AS "author.region", COALESCE(r.o_account_type, '') AS "author.account_type",
+  COALESCE(r.o_status, '') AS "author.status"`
 
 type deletePostRequest struct {
 	PostID string `param:"postId" json:"-"`

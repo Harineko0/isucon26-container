@@ -41,7 +41,7 @@ func TestCreatePostGateLimitsConcurrencyAndReleases(t *testing.T) {
 }
 
 func TestNewCreatePostGateSizes(t *testing.T) {
-	for region, want := range map[string]int{"asia": 8, "europe": 4, "america": 4, "other": 6} {
+	for region, want := range map[string]int{"asia": 24, "europe": 12, "america": 12, "other": 6} {
 		if got := cap(newCreatePostGate(region)); got != want {
 			t.Fatalf("%s: want %d, got %d", region, want, got)
 		}

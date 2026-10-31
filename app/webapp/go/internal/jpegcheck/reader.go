@@ -6,9 +6,8 @@
 // of image/jpeg.Decode, without producing pixels.
 //
 // reader.go, scan.go and huffman.go are copied from the Go 1.26 standard
-// library (src/image/jpeg); the only changes are the removal of image
-// reconstruction (makeImg, reconstructBlock, reconstructProgressiveImage,
-// applyBlack, convertToRGB) and of Decode/DecodeConfig in favour of Validate.
+// library (src/image/jpeg); validation omits image reconstruction and
+// sequential coefficient values, retaining the entropy and marker checks.
 // jpegcheck_test.go checks the equivalence differentially against
 // image/jpeg.Decode.
 package jpegcheck
