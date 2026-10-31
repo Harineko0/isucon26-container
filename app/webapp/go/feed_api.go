@@ -299,7 +299,7 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
       GROUP BY a.author_id
     ) t
   ),
-  scored AS (
+  scored AS MATERIALIZED (
     SELECT c.*, (
       10 * (SELECT count(*) FROM (
               SELECT r.reactor_id AS user_id FROM realmojis r
