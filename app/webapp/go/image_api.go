@@ -41,6 +41,14 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
+		// 所有者の署名鍵を覚えていれば、署名の確認は DB に問い合わせる前に済ませる (#95)。
+		// 鍵は不変なので判定は DB で確かめた場合と同じ。無効な署名は asia1 で 1 ベンチ 550 件あり、
+		// 満杯のプール (#68) で接続を待ってから 403 にしていた。
+		knownKey, hasKey := loadImageKey(input.ImageID)
+		if hasKey && !hmac.Equal(sig, imageSignature(knownKey, input.ImageID, exp)) {
+			c.Set("abuse", "invalid_signature")
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
 		// 本体の在り処: メモリ (cached)、ディスク (accelURI。本体は Go では読まず nginx に返させる)、どちらでもない。
 		cached, accelURI, hasData := imageDataStore.locate(input.ImageID)
 		if !hasData {
@@ -75,6 +83,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		key, err := imageSigningKey(object.SecretKeyHash)
 		if err != nil {
 			return err
+		}
+		if !hasKey {
+			rememberImageKey(input.ImageID, key)
 		}
 		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
 			c.Set("abuse", "invalid_signature")

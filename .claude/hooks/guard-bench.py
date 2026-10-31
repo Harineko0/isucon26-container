@@ -15,8 +15,18 @@ ROUTER = r"35\.73\.68\.236"
 PSQL = r"\bpsql\b[^\n]*\s-[cfhdU]\b|\bpsql\b[^\n]*<|\|\s*psql\b|PGPASSWORD"
 CMD_START = r"(^|[;&|(]\s*|(?<![\w./-])(bash|sh|zsh|exec|time|nohup)\s+)([A-Z_]+=\S*\s+)*"
 
+# asia2 で重い読み取りをすると、走っているベンチの計測 (スコア、pg_stat_*、shared_buffers の中身) が汚れる (#84)。
+PG_LOG = r"postgresql-16-main\.log|/var/log/postgresql"
+BIG_TABLES = r"(realmojis|notifications|comments|posts|image_objects|users|friendships|login_sessions)"
+
 RULES = [
     # (対象, パターン, 理由)
+    (SERVERS, r"(^|[\s;&|(])(grep|egrep|zgrep|rg|ag|less|more|cat|awk|sed|wc|sort|tac)\s[^|;&]*(" + PG_LOG + ")",
+     "PostgreSQL のログ (数 GB) を全部読むとベンチ中の asia2 の I/O とページキャッシュを汚す (#84)。tail -n で末尾だけ読む"),
+    (PSQL, r"\bcount\s*\((?![^;]*\bwhere\b)[^;]*\bfrom\s+" + BIG_TABLES + r"\b"
+           r"|\bfrom\s+" + BIG_TABLES + r"\b(?![^;]*\bwhere\b)[^;]*\b(group\s+by|order\s+by|distinct)\b",
+     "大きい表の全件 count / GROUP BY / ORDER BY はベンチ中の asia2 を汚す (#84)。件数は pg_stat_user_tables.n_live_tup か "
+     "pg_class.reltuples、計画は EXPLAIN (ANALYZE なし) で見る。WHERE で絞るか、ベンチが走っていないときに人が流す"),
     (None, r"ALLOW_LOCAL_DEPLOY", "ALLOW_LOCAL_DEPLOY は人間が緊急時に使うもの"),
     (None, CMD_START + r"\S*(?<![\w-])(deploy|smoke)\.sh(?!\s+-n\b)",
      "deploy.sh / smoke.sh は CI から実行する（infra/deploy.sh -n の差分表示は可）"),

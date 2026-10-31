@@ -109,6 +109,26 @@ func WriteImageToDisk(id string, data []byte) error {
 	return err
 }
 
+// imageOwnerKeys は画像 id → 所有者の署名鍵 (users.secret_key_hash を decode したもの)。
+// image_objects.owner_user_id も secret_key_hash も UPDATE されない (git grep で確認) ので不変。
+// 署名が合わないリクエストを DB に問い合わせる前に 403 にするために使う (#95)。
+// 投稿・RealMoji の作成時と、画像取得で DB から読んだときに覚える。上限を超えて捨てても DB での確認に戻るだけ。
+var imageOwnerKeys = &boundedMap{limit: 2_000_000}
+
+func rememberImageKey(id string, key []byte) {
+	if len(key) != 0 {
+		imageOwnerKeys.Store(id, key)
+	}
+}
+
+func loadImageKey(id string) ([]byte, bool) {
+	v, ok := imageOwnerKeys.Load(id)
+	if !ok {
+		return nil, false
+	}
+	return v.([]byte), true
+}
+
 func readImageFromDisk(id string) ([]byte, bool) {
 	path, ok := imageDiskPath(id)
 	if !ok {
