@@ -21,8 +21,10 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
 		// 投稿一覧は利用者の取得に依存しないので並行に取り、往復を 1 回分に重ねる。
-		// 投稿画像の created_at は posted_at と同じ(isureal_create_post)なので、EXISTS も (id, created_at) で引いて
-		// image_objects のパーティションを 1 つに絞る。
+		// 参照実装は image_objects と内部結合するので、画像の行が無い投稿は含めない。以前はここで
+		// EXISTS (image_objects) を投稿ごとに評価していたが、image_objects は 40 余りのパーティションなので
+		// 投稿ごとに全パーティションの Append を再走査し、1 回 189ms (ベンチ中の平均) かかっていた。
+		// 画像の行の有無は、下で本体を取るときに分かる (手元に無い画像だけ DB に聞く) ので、そこで除く。
 		var posts []Post
 		postsDone := make(chan error, 1)
 		go func() {
@@ -31,7 +33,6 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
    FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
    WHERE p.author_id = $1 AND p.deleted_at IS NULL
-     AND EXISTS (SELECT 1 FROM image_objects i WHERE i.id = p.image_id AND i.created_at = p.posted_at)
    ORDER BY p.posted_at, p.id
   `, userID)
 		}()
@@ -92,6 +93,17 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 					saveInitialImageToDisk(row.ID, row.CreatedAt, row.Data)
 				}
 			}
+		}
+
+		// 画像の行が無い投稿は除く (参照実装の内部結合と同じ)。投稿画像は消されないので通常は 0 件。
+		if len(images) < len(posts) {
+			kept := make([]Post, 0, len(images))
+			for _, post := range posts {
+				if _, ok := images[post.ImageID]; ok {
+					kept = append(kept, post)
+				}
+			}
+			posts = kept
 		}
 
 		plan := newSignaturePlan()

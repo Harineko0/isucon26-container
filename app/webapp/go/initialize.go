@@ -29,6 +29,7 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		// ip_bans は TRUNCATE された。アプリ内の BAN も捨てる (他のリージョンの分は localBanTTL で切れる)。
 		h.IPBans.abuse.reset()
 		go loadInitialDataBoundary(h.DB)
+		go loadProfileImageHints(h.DB)
 		go refreshSearchNorms(h.DB)
 
 		// Set language to the implementation language.
