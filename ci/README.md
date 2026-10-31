@@ -15,7 +15,7 @@ PR は isucon26-container に作る。このリポジトリは monorepo なの�
 | main を手で測る | `gh workflow run bench.yml -R Harineko0/isucon26-container` | 同上 |
 | 任意の commit | `gh workflow run bench.yml -R Harineko0/isucon26-container -f container_ref=<ref>` | 指定した commit |
 
-- 3 台とも `app/webapp` を配る。`app-europe/` `app-america/` には各台の `env.sh` の写しがあるだけで、配らない。
+- 3 台とも `app/webapp` を配る。`app-europe` `app-america` は `app` への symlink で、配らない。
 - 結果は PR のコメント（キュー待ち → デプロイ中 → 実行中 → 結果、と 1 つのコメントが書き換わる）と、`bench-results` ブランチの `results.jsonl` に残る。
 - ベンチした commit には commit status `Benchmark` が付き、PR の status checks に出る（`/bench` での測り直しも、その時点の head に付く）。pending（キュー待ち・デプロイ中・実行中）→ success（`PASS 45500（前回比 +534 (+1.2%)）`）/ failure（ベンチ FAIL、17:30 以降の拒否）/ error（デプロイ等で失敗、またはベンチ中にサーバの状態が変わった）。Details から run に飛べる。
   `git fetch origin bench-results && git show FETCH_HEAD:results.jsonl | jq -c '{job_id,score,passed,label,app_sha}'`

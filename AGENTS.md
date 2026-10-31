@@ -53,8 +53,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
   |---|---|---|
   | `app/webapp/` | アプリ本体。`deploy.sh` が `go/` と `sql/` を 3 台すべてに rsync してビルド・再起動する（CI だけが実行する） | asia1 / europe1 / america1 共通 |
   | `app/env.sh` | asia1 の `~/env.sh`（`ISUREAL_REGION=asia`） | asia1 |
-  | `app-europe/env.sh` | europe1 の `~/env.sh`（`ISUREAL_REGION=europe`、`ISUREAL_LOG_LEVEL=info`） | europe1 |
-  | `app-america/env.sh` | america1 の `~/env.sh`（`ISUREAL_REGION=america`） | america1 |
+  | `app-europe` / `app-america` | `app` への symlink。europe1 / america1 の `~/env.sh` は `ISUREAL_REGION` だけが違う（europe / america） | europe1 / america1 |
 
   `env.sh` は参照用の写しで、`deploy.sh` は配らない。サーバのホーム直下にある主催者のファイル（`.claude/` `.codex/` など）や `~/go` のモジュールキャッシュ、`~/.ssh` は取り込んでいない。
 - `/home` 以外の設定（nginx、systemd unit、sysctl、PostgreSQL）は `infra/` で管理する。サーバ上で直接編集せず、`infra/` を直して PR にし、`/bench` で配る（`infra/deploy.sh` は CI が実行する）。使い方は [infra/README.md](infra/README.md)。
