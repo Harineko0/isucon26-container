@@ -52,14 +52,20 @@ type abuseDetector struct {
 	failures  map[string]map[string][]time.Time // kind -> ip -> 時刻
 	lastSweep map[string]time.Time
 	local     sync.Map // ip -> time.Time (アプリ内の BAN の期限)
-	pending   chan string
+	pending   chan pendingBan
+}
+
+// A barrier is acknowledged by the sole writer after all earlier INSERTs finish.
+type pendingBan struct {
+	ip      string
+	flushed chan struct{}
 }
 
 func newAbuseDetector() *abuseDetector {
 	return &abuseDetector{
 		failures:  make(map[string]map[string][]time.Time),
 		lastSweep: make(map[string]time.Time),
-		pending:   make(chan string, 1024),
+		pending:   make(chan pendingBan, 1024),
 	}
 }
 
@@ -93,17 +99,15 @@ func (d *abuseDetector) observe(kind, ip string, at time.Time) bool {
 	banned := len(kept) >= rule.threshold
 	if banned {
 		delete(byIP, ip)
+		d.local.Store(ip, at.Add(localBanTTL))
+		select {
+		case d.pending <- pendingBan{ip: ip}:
+		default: // 詰まっていれば guard の書き込みに任せる
+		}
 	} else {
 		byIP[ip] = kept
 	}
 	d.mu.Unlock()
-	if banned {
-		d.local.Store(ip, at.Add(localBanTTL))
-		select {
-		case d.pending <- ip:
-		default: // 詰まっていれば guard の書き込みに任せる
-		}
-	}
 	return banned
 }
 
@@ -124,13 +128,36 @@ func (d *abuseDetector) reset() {
 	d.mu.Lock()
 	d.failures = make(map[string]map[string][]time.Time)
 	d.lastSweep = make(map[string]time.Time)
-	d.mu.Unlock()
 	d.local.Clear()
+	d.mu.Unlock()
+}
+
+func (d *abuseDetector) flush(ctx context.Context) error {
+	// Order the barrier after any observation already publishing a ban.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	done := make(chan struct{})
+	select {
+	case d.pending <- pendingBan{flushed: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // writeLoop は BAN を ip_bans に書き、他のサーバーにも伝える (guard と同じ SQL)。
 func (d *abuseDetector) writeLoop(db *sqlx.DB) {
-	for ip := range d.pending {
+	for write := range d.pending {
+		if write.flushed != nil {
+			close(write.flushed)
+			continue
+		}
+		ip := write.ip
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_, err := db.ExecContext(ctx, `
   INSERT INTO ip_bans (ip, banned_until)

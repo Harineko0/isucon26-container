@@ -72,7 +72,7 @@ func TestAbuseDetectorThresholds(t *testing.T) {
 			if d.bannedAt("5.6.7.8", last) {
 				t.Fatal("another IP is banned")
 			}
-			if got := <-d.pending; got != "1.2.3.4" {
+			if got := (<-d.pending).ip; got != "1.2.3.4" {
 				t.Fatalf("ban queued for %q, want 1.2.3.4", got)
 			}
 
@@ -136,7 +136,7 @@ func TestAbuseDetectorPendingQueueFullDoesNotBlock(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	d := newAbuseDetector()
-	d.pending = make(chan string) // 受け手なし
+	d.pending = make(chan pendingBan) // 受け手なし
 	d.observe("invalid_image", "1.2.3.4", base)
 	if !d.observe("invalid_image", "1.2.3.4", base) {
 		t.Fatal("not banned")

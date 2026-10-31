@@ -223,6 +223,7 @@ func removeImageStoreTrash() {
 }
 
 var peerHTTPClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	Transport: &http.Transport{
 		Proxy:               nil,
 		DialContext:         (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -238,41 +239,6 @@ func peerURL(region, path string) (string, bool) {
 		return "", false
 	}
 	return "http://" + host + path, true
-}
-
-// resetPeerImageStores は initialize を受けたサーバーから、ほかのリージョンのストアも消させる
-// (initialize はルーター経由で 1 台にしか来ない)。画像の id は使い回されないので、
-// 届かなくても正しさには影響しない (ディスクの掃除だけ)。待ってから返すので、ベンチの新しい画像を消すことはない。
-func resetPeerImageStores(selfRegion string) {
-	var wg sync.WaitGroup
-	for region := range regionPeerHosts {
-		if region == selfRegion {
-			continue
-		}
-		wg.Add(1)
-		go func(region string) {
-			defer wg.Done()
-			url, _ := peerURL(region, "/api/internal/images/reset")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-			if err != nil {
-				return
-			}
-			req.Header.Set(internalSecretHeader, *internalSecret.Load())
-			resp, err := peerHTTPClient.Do(req)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "imgstore: reset %s failed: %v\n", region, err)
-				return
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusNoContent {
-				fmt.Fprintf(os.Stderr, "imgstore: reset %s status %d\n", region, resp.StatusCode)
-			}
-		}(region)
-	}
-	wg.Wait()
 }
 
 type imageFetchCall struct {
@@ -312,6 +278,12 @@ func init() {
 // loadStoredImage は stored_region に置かれた画像の本体を返す。手元 (メモリ・ディスク) に無ければ、
 // 置き場のリージョン → ほかのリージョンの順に取りに行く。同じ id の取得は 1 本にまとめる。
 func loadStoredImage(id, storedRegion, selfRegion string) ([]byte, error) {
+	beginImageTransfer()
+	defer imageTransfers.jobs.Done()
+	return fetchAndCacheImage(id, storedRegion, selfRegion)
+}
+
+func fetchAndCacheImage(id, storedRegion, selfRegion string) ([]byte, error) {
 	if data, ok := imageDataStore.get(id); ok {
 		return data, nil
 	}
@@ -335,14 +307,14 @@ func loadStoredImage(id, storedRegion, selfRegion string) ([]byte, error) {
 	close(call.done)
 	if call.err == nil {
 		data := call.data
-		go func() {
+		imageTransfers.jobs.Go(func() {
 			if path, ok := imageStorePath(id); ok {
 				if _, err := os.Stat(path); err == nil {
 					return
 				}
 				writeImageFileDurable(path, data)
 			}
-		}()
+		})
 	}
 	return call.data, call.err
 }
@@ -416,10 +388,9 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 			}
 			path := strings.TrimPrefix(r.URL.Path, "/api/internal/")
 			switch {
-			case r.Method == http.MethodPost && path == "images/reset":
-				if err := resetImageStore(); err != nil {
-					fmt.Fprintf(os.Stderr, "imgstore: reset failed: %v\n", err)
-					return c.NoContent(http.StatusInternalServerError)
+			case r.Method == http.MethodPost && (path == prepareRegionPath || path == resetRegionPath):
+				if err := applyRegionPhase(r.Context(), h, path); err != nil {
+					return err
 				}
 				return c.NoContent(http.StatusNoContent)
 			case r.Method == http.MethodPut && strings.HasPrefix(path, "images/"):
@@ -482,7 +453,11 @@ func imageRegionHint(id string) (string, bool) {
 // (取った本体はメモリに入るだけで、返すかどうかは DB の結果で決める)。
 func prefetchStoredImage(id, selfRegion string) {
 	if region, ok := imageRegionHint(id); ok && region != selfRegion {
-		go loadStoredImage(id, region, selfRegion)
+		beginImageTransfer()
+		go func() {
+			defer imageTransfers.jobs.Done()
+			fetchAndCacheImage(id, region, selfRegion)
+		}()
 	}
 }
 
@@ -498,6 +473,34 @@ type imagePush struct {
 
 var imagePushQueue = make(chan imagePush, 1024)
 
+// Count work before enqueueing or starting a goroutine. A pull stays counted
+// through its asynchronous disk write, and a push through the peer's response.
+var imageTransfers struct {
+	gate sync.Mutex
+	jobs sync.WaitGroup
+}
+
+func beginImageTransfer() {
+	imageTransfers.gate.Lock()
+	imageTransfers.jobs.Add(1)
+	imageTransfers.gate.Unlock()
+}
+
+// Before rotating any store, discard unsent replicas and finish active transfers.
+func drainImageTransfers() {
+	imageTransfers.gate.Lock()
+	defer imageTransfers.gate.Unlock()
+	for {
+		select {
+		case <-imagePushQueue:
+			imageTransfers.jobs.Done()
+		default:
+			imageTransfers.jobs.Wait()
+			return
+		}
+	}
+}
+
 func startImagePushers(selfRegion string) {
 	if selfRegion == imageReplicaRegion {
 		return
@@ -506,6 +509,7 @@ func startImagePushers(selfRegion string) {
 		go func() {
 			for p := range imagePushQueue {
 				pushStoredImage(p)
+				imageTransfers.jobs.Done()
 			}
 		}()
 	}
@@ -515,9 +519,11 @@ func enqueueImagePush(id string, data []byte, storedRegion *string, selfRegion s
 	if storedRegion == nil || selfRegion == imageReplicaRegion {
 		return
 	}
+	beginImageTransfer()
 	select {
 	case imagePushQueue <- imagePush{id: id, data: data}:
 	default:
+		imageTransfers.jobs.Done()
 	}
 }
 
