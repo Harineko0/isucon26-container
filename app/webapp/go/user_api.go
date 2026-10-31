@@ -131,6 +131,7 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 }
 
 func loginHandler(h *HandlerContext) echo.HandlerFunc {
+	logins := &loginQueue{h: h}
 	return func(c *echo.Context) error {
 		var input loginRequest
 		if err := c.Bind(&input); err != nil {
@@ -144,14 +145,10 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		hash := sha256.Sum256([]byte(input.SecretKey))
 		token := uuid.NewString()
 		tokenHash := sha256.Sum256([]byte(token))
-		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
-		if err != nil {
-			return err
-		}
-		var row sessionUserRow
-		err = conn.GetContext(ctx, &row, `SELECT * FROM isureal_login($1, $2, $3, $4)`,
-			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hex.EncodeToString(tokenHash[:]))
-		conn.Close()
+		hashedToken := hex.EncodeToString(tokenHash[:])
+		row, err := logins.login(ctx, c.RealIP(), [4]string{
+			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hashedToken,
+		})
 		if err != nil {
 			return err
 		}
@@ -159,9 +156,8 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
 		}
 		user := row.user()
-		session := &Session{Token: token}
-		knownSessions.Store(hex.EncodeToString(tokenHash[:]), Session{UserID: user.ID, TokenHash: hex.EncodeToString(tokenHash[:]), Region: user.Region})
-		return c.JSON(http.StatusOK, loginResponse{Token: session.Token, User: newSessionUserResponse(user)})
+		knownSessions.Store(hashedToken, Session{UserID: user.ID, TokenHash: hashedToken, Region: user.Region})
+		return c.JSON(http.StatusOK, loginResponse{Token: token, User: newSessionUserResponse(user)})
 	}
 }
 
