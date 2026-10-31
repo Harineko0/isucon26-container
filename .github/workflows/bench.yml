@@ -35,6 +35,7 @@ permissions:
   contents: write # bench-results ブランチへの記録
   issues: write
   pull-requests: write
+  statuses: write # PR の status checks に「Benchmark」を出す
   actions: read # queue.sh が run 一覧を読む
 
 env:

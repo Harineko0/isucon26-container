@@ -176,6 +176,34 @@ def record():
     }, ensure_ascii=False)
 
 
+def status():
+    """commit status（context: Benchmark）の state と description。description は 140 字まで。"""
+    kind, _, arg = stage.partition(":")
+    if kind == "queued":
+        state, desc = "pending", f"キュー待ち（前に {arg or '?'} 件）"
+    elif kind == "deploying":
+        state, desc = "pending", "デプロイ中"
+    elif kind == "benchmarking":
+        state, desc = "pending", f"ベンチ実行中 #{arg}"
+    elif kind == "rejected":
+        state, desc = "failure", arg
+    elif kind == "done" and job:
+        res = job.get("result") or {}
+        score = job.get("score", 0)
+        if res.get("passed"):
+            base = baseline([h for h in history() if h.get("job_id") != job["id"]])
+            state, desc = "success", f"PASS {score}" + (f"（main 比 {delta(score, base)}）" if base else "")
+        else:
+            state, desc = "failure", f"FAIL: {res.get('reason') or job['status']}"
+        if integrity:
+            state, desc = "error", "ベンチ中にサーバの状態が変化（結果は信用できない）: " + desc
+    else:
+        state = "error"
+        desc = f"{arg or kind} で失敗" + ("" if job else "（ベンチなし）")
+    return json.dumps({"state": state, "description": desc[:140]}, ensure_ascii=False)
+
+
 if __name__ == "__main__":
     {"render": lambda: sys.stdout.write(render()),
-     "record": lambda: print(record())}[sys.argv[1]]()
+     "record": lambda: print(record()),
+     "status": lambda: print(status())}[sys.argv[1]]()

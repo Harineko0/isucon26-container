@@ -16,6 +16,7 @@ PR は isucon26-container に作る。app のコード変更は、`app/` サブ�
 
 - `app/` の commit は isucon26 に push 済みである必要がある（CI はそこから取る）。`app-europe/` `app-america/` は使わない（3 台とも `app/` を配る）。
 - 結果は PR のコメント（キュー待ち → デプロイ中 → 実行中 → 結果、と 1 つのコメントが書き換わる）と、`bench-results` ブランチの `results.jsonl` に残る。
+- ベンチした commit には commit status `Benchmark` が付き、PR の status checks に出る（`/bench` での測り直しも、その時点の head に付く）。pending（キュー待ち・デプロイ中・実行中）→ success（`PASS 45500（main 比 +534 (+1.2%)）`）/ failure（ベンチ FAIL、17:30 以降の拒否）/ error（デプロイ等で失敗、またはベンチ中にサーバの状態が変わった）。Details から run に飛べる。
   `git fetch origin bench-results && git show FETCH_HEAD:results.jsonl | jq -c '{job_id,score,passed,label,app_sha}'`
 - コメントには「main の直近の PASS」と「直前の CI ベンチ」との比較、FAIL の理由、リージョン別の人数推移、ベンチャーの stdout が載る。
 - `BENCH_FREEZE_AT`（既定 2026-10-31 17:30 JST）以降は main 以外を拒否する。最終スコア = 最後のベンチなので、終盤に PR のコードがサーバに残らないようにするため。

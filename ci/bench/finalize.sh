@@ -39,6 +39,7 @@ case $stage in
 esac
 python3 "$B/report.py" render >"$STATE_DIR/comment.md"
 "$B/comment.sh" "$STATE_DIR/comment.md" || echo "warn: comment update failed"
+"$B/status.sh" || echo "warn: status update failed"
 cat "$STATE_DIR/comment.md" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 [ "$(cat "$STATE_DIR/stage")" = done ] && jq -e '.result.passed' "$STATE_DIR/job.json" >/dev/null
