@@ -282,14 +282,14 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
       AND p.author_id NOT IN (SELECT id FROM friends) AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
       AND p.visibility IN ('public', 'friends_of_friends')
   ),
-  author_fof AS (
+  author_fof AS MATERIALIZED (
     SELECT a.author_id, sum(m.n) AS s
     FROM (SELECT DISTINCT author_id FROM candidates) a
     JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
     JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
     GROUP BY a.author_id
   ),
-  scored AS (
+  scored AS MATERIALIZED (
     SELECT c.*, (
       10 * (SELECT count(*) FROM (
               SELECT r.reactor_id AS user_id FROM realmojis r JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
