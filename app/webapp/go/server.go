@@ -68,6 +68,7 @@ func NewServer(config *Config) *echo.Echo {
 	go refreshSearchNorms(db)
 	go cleanSearchDirtyLoop(db)
 	go loadInitialDataBoundary(db)
+	go loadProfileImageHints(db)
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
 	e.POST("/api/auth/register", registerHandler(handlerContext))

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -101,7 +102,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 		}
 		if len(staleUsers) > 0 {
-			go saveSearchNorms(context.Background(), h.DB, staleUsers)
+			saveSearchNormsOnce(h.DB, staleUsers)
 		}
 		hasMore := len(items) > 50
 		if hasMore {
@@ -224,10 +225,34 @@ func cleanSearchDirtyLoop(db *sqlx.DB) {
 // saveSearchNormsAsync は登録・表示名の変更のあとに正規化を保存する。応答は待たせない。
 // 保存までの間はトリガーが入れた dirty の行があるので、検索はアプリで照合する。
 func saveSearchNormsAsync(db *sqlx.DB, user User) {
+	saveSearchNormsOnce(db, []User{user})
+}
+
+// searchNormsSaving は保存中の利用者 id。登録直後は正規化が保存されるまで stale なので、同時に走る検索が
+// 同じ利用者の保存を何度も積んでいた (1 ベンチで登録 560 件に対し保存 1318 回、1 回 44ms)。
+// 保存中の利用者は飛ばす。保存の間に名前が変わっていれば dirty に残る (saveSearchNorms) ので正しさは変わらない。
+var searchNormsSaving sync.Map
+
+// saveSearchNormsOnce は users のうち保存中でないものを別 goroutine で保存する。
+func saveSearchNormsOnce(db *sqlx.DB, users []User) {
+	pending := make([]User, 0, len(users))
+	for _, user := range users {
+		if _, loaded := searchNormsSaving.LoadOrStore(user.ID, struct{}{}); !loaded {
+			pending = append(pending, user)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
 	go func() {
+		defer func() {
+			for _, user := range pending {
+				searchNormsSaving.Delete(user.ID)
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := saveSearchNorms(ctx, db, []User{user}); err != nil {
+		if err := saveSearchNorms(ctx, db, pending); err != nil {
 			log.Printf("failed to save search norms: %v", err)
 		}
 	}()
