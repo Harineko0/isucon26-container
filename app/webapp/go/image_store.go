@@ -202,6 +202,7 @@ func discardUploadedImage(id string, storedRegion *string) {
 // resetImageStore は initialize で、ベンチが投稿した画像のファイルを捨てる (初期データの imageDiskDir は残す)。
 // ディレクトリごと退避してから作り直すので、すぐに返る。消すのは裏で行う。
 func resetImageStore() error {
+	resetCommittedPostImages()
 	imageDataStore.reset()
 	trash := fmt.Sprintf("%s.trash-%d", imageStoreDir, time.Now().UnixNano())
 	if err := os.Rename(imageStoreDir, trash); err != nil && !errors.Is(err, os.ErrNotExist) {

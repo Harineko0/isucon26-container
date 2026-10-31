@@ -19,7 +19,8 @@ func TestImageReadsSeparateSnapshotsAndCancellation(t *testing.T) {
 			reply chan bool
 		}
 		queries := make(chan query, 3)
-		r := &imageReads{load: func(ctx context.Context, _ string, requests []imageReadRequest) []imageReadResult {
+		r := &imageReads{load: func(ctx context.Context, _ string, takeRequests func() []imageReadRequest) []imageReadResult {
+			requests := takeRequests()
 			q := query{ctx: ctx, count: len(requests), reply: make(chan bool)}
 			queries <- q
 			results := make([]imageReadResult, len(requests))
@@ -83,11 +84,77 @@ func TestImageReadsSeparateSnapshotsAndCancellation(t *testing.T) {
 	})
 }
 
+func TestImageReadsAdmitDuringPoolWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		type checkout struct {
+			rel     string
+			release chan struct{}
+		}
+		checkouts := make(chan checkout, 3)
+		counts := make(chan int, 3)
+		r := &imageReads{load: func(ctx context.Context, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
+			c := checkout{rel, make(chan struct{})}
+			checkouts <- c
+			select {
+			case <-ctx.Done():
+			case <-c.release:
+			}
+			requests := takeRequests()
+			counts <- len(requests)
+			results := make([]imageReadResult, len(requests))
+			for i, req := range requests {
+				results[i].object.MediaType = req.id
+				results[i].err = ctx.Err()
+			}
+			return results
+		}}
+		get := func(ctx context.Context, rel, id string) <-chan imageReadResult {
+			out := make(chan imageReadResult, 1)
+			go func() {
+				obj, err := r.get(ctx, rel, imageReadRequest{id: id})
+				out <- imageReadResult{obj, err}
+			}()
+			return out
+		}
+		first := get(t.Context(), "leaf-a", "A")
+		held := <-checkouts
+		if held.rel != "leaf-a" {
+			t.Fatal(held.rel)
+		}
+		// The initial 1 ms window is long over but no SELECT has started.
+		time.Sleep(5 * time.Millisecond)
+		late := get(t.Context(), "leaf-a", "B")
+		ctx, cancel := context.WithCancel(t.Context())
+		other := get(ctx, "leaf-b", "C")
+		second := <-checkouts
+		if second.rel != "leaf-b" {
+			t.Fatalf("queued requests for leaf-a started another checkout: %s", second.rel)
+		}
+		cancel()
+		if got := <-other; !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("last waiter cancellation during checkout: %+v", got)
+		}
+		if n := <-counts; n != 1 {
+			t.Fatalf("canceled partition took %d requests", n)
+		}
+		close(held.release)
+		if n := <-counts; n != 2 {
+			t.Fatalf("expected 2 requests on the held connection, got %d", n)
+		}
+		for id, out := range map[string]<-chan imageReadResult{"A": first, "B": late} {
+			if got := <-out; got.err != nil || got.object.MediaType != id {
+				t.Fatalf("wrong result for %s: %+v", id, got)
+			}
+		}
+	})
+}
+
 func TestImageReadsBoundBatchSizeAndSeparateRelations(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex
 		counts := map[string][]int{}
-		r := &imageReads{load: func(_ context.Context, rel string, requests []imageReadRequest) []imageReadResult {
+		r := &imageReads{load: func(_ context.Context, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
+			requests := takeRequests()
 			mu.Lock()
 			counts[rel] = append(counts[rel], len(requests))
 			mu.Unlock()

@@ -22,6 +22,7 @@ type imageObject struct {
 }
 
 type imageReadRequest struct {
+	post    postImageProof
 	id      string
 	hasData bool
 	ip      string
@@ -37,7 +38,7 @@ type imageReadResult struct {
 type imageReads struct {
 	mu      sync.Mutex
 	pending map[string]*imageReadBatch
-	load    func(context.Context, string, []imageReadRequest) []imageReadResult
+	load    func(context.Context, string, func() []imageReadRequest) []imageReadResult
 }
 
 type imageReadBatch struct {
@@ -104,14 +105,16 @@ func (r *imageReads) read(ctx context.Context, rel string, b *imageReadBatch) {
 	case <-b.full:
 	case <-ctx.Done():
 	}
-	r.mu.Lock()
-	if r.pending[rel] == b {
-		delete(r.pending, rel)
-	}
-	// Freeze the request set under the same lock used for admission.
-	requests := b.requests
-	r.mu.Unlock()
-	b.results = r.load(ctx, rel, requests)
+	// The loader checks out a connection before taking the requests. Arrivals
+	// while the pool is full can still share the upcoming database snapshot.
+	b.results = r.load(ctx, rel, func() []imageReadRequest {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.pending[rel] == b {
+			delete(r.pending, rel)
+		}
+		return b.requests
+	})
 }
 
 // Derive the batch SELECT from the single-image SELECT so its visibility and
@@ -130,9 +133,10 @@ func imageBatchQueryFor(rel string) string {
 	return query
 }
 
-func loadImageReadBatch(ctx context.Context, h *HandlerContext, rel string, requests []imageReadRequest) []imageReadResult {
-	results := make([]imageReadResult, len(requests))
+func loadImageReadBatch(ctx context.Context, h *HandlerContext, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
 	conn, err := h.DB.Connx(ctx)
+	requests := takeRequests()
+	results := make([]imageReadResult, len(requests))
 	if err != nil {
 		for i := range results {
 			results[i].err = err
@@ -159,6 +163,10 @@ func loadImageReadBatch(ctx context.Context, h *HandlerContext, rel string, requ
 	}
 	imageReadStats.Add("requests", int64(len(ids)))
 	imageReadStats.Add("queries", 1)
+	if rel == postImageBatchKey {
+		loadCommittedPostImages(ctx, conn, requests, indices, results)
+		return results
+	}
 	// Sparse traffic should reuse the original prepared statement and plan.
 	// Only a batch that actually combines requests needs the array query.
 	if len(ids) == 1 {

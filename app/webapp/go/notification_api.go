@@ -2,9 +2,7 @@ package isureal
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -280,6 +278,7 @@ type notificationConnectState struct {
 }
 
 func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
+	connects := &notificationConnectQueue{db: h.DB, region: h.Config.Region}
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		session := GetSession(c)
@@ -290,13 +289,9 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 		var start notificationConnectState
 		if tokenHash, deferred := deferredSession(c); deferred {
 			// セッションの確認 (401 → 403) も同じ 1 文で行い、ヘッダを送る前に判定する。
-			err := h.DB.GetContext(ctx, &start, `
-   SELECT true AS found, u.region,
-          (SELECT starts_at FROM posting_windows WHERE region = $3 AND ended_at IS NULL) AS active_window_starts_at
-   FROM login_sessions s JOIN users u ON u.id = s.user_id
-   WHERE s.token_hash = $1 AND s.active = true AND u.status = 'active' AND u.id = $2
-  `, tokenHash, userID, h.Config.Region)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			var err error
+			start, err = connects.get(ctx, tokenHash, userID)
+			if err != nil {
 				return err
 			}
 			region := ""

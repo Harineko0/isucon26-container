@@ -41,19 +41,20 @@ func TestLoginPipelineTransactions(t *testing.T) {
 
 	key1, key2 := strings.Repeat("0", 63)+"1", strings.Repeat("0", 63)+"2"
 	inputs := []struct {
-		args   [4]string
+		args   []any
 		expect string // user ID on success, invalid credentials, or SQLSTATE on failure
 	}{
-		{[4]string{"user1", key1, "session1", "first"}, "u1"},
-		{[4]string{"user2", key2, "session1", "second"}, "23505"},    // statement fails
-		{[4]string{"user1", key1, "rollback", "forbidden"}, "23503"}, // commit fails
-		{[4]string{"user1", key2, "invalid", "unused"}, "invalid"},
-		{[4]string{"user2", key2, "session2", "second"}, "u2"},
-		{[4]string{"user1", key1, "session3", "third"}, "u1"},
+		{[]any{"user1", key1, "session1", "first"}, "u1"},
+		{[]any{"user2", key2, "session1", "second"}, "23505"},    // statement fails
+		{[]any{"user1", key1, "rollback", "forbidden"}, "23503"}, // commit fails
+		{[]any{"user1", key1, "bad-arg", make(chan int)}, "encoding error"},
+		{[]any{"user1", key2, "invalid", "unused"}, "invalid"},
+		{[]any{"user2", key2, "session2", "second"}, "u2"},
+		{[]any{"user1", key1, "session3", "third"}, "u1"},
 	}
-	var calls []*loginCall
+	var calls []*writeCall[sessionUserRow]
 	for _, input := range inputs {
-		calls = append(calls, &loginCall{args: input.args, reply: make(chan loginResult, 1)})
+		calls = append(calls, &writeCall[sessionUserRow]{args: input.args, reply: make(chan writeResult[sessionUserRow], 1)})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -62,7 +63,8 @@ func TestLoginPipelineTransactions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	pipelineLogins(ctx, conn, calls)
+	q := writeQueue[sessionUserRow]{sql: loginSQL}
+	q.pipeline(ctx, conn, calls)
 	for i, call := range calls {
 		result := <-call.reply
 		var pgErr *pgconn.PgError
@@ -70,6 +72,8 @@ func TestLoginPipelineTransactions(t *testing.T) {
 		switch {
 		case errors.As(result.err, &pgErr):
 			got = pgErr.Code
+		case result.err != nil && strings.Contains(result.err.Error(), "failed to encode args[3]"):
+			got = "encoding error"
 		case result.err != nil:
 			t.Fatalf("login %d: %v", i, result.err)
 		case got == "ok":
@@ -95,7 +99,7 @@ func TestLoginQueueRechecksBanAndCancellation(t *testing.T) {
 	}
 	defer conn.Close()
 	bans := newIPBanList()
-	q := &loginQueue{h: &HandlerContext{DB: db, IPBans: bans}}
+	q := &writeQueue[sessionUserRow]{db: db, bans: bans, sql: loginSQL}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	waiting, cancelWaiting := context.WithCancel(ctx)
@@ -105,7 +109,7 @@ func TestLoginQueueRechecksBanAndCancellation(t *testing.T) {
 		t.Helper()
 		done := make(chan error, 1)
 		go func() {
-			_, err := q.login(ctx, ip, [4]string{"user1", key, "s" + ip, "t" + ip})
+			_, err := q.execute(ctx, ip, "user1", key, "s"+ip, "t"+ip)
 			done <- err
 		}()
 		for {

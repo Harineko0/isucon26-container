@@ -117,7 +117,7 @@ func computeImageSignatures(requests []signatureRequest) {
 		return
 	}
 	if !useSIMDSignatures {
-		// SHA 命令がある CPU では標準ライブラリで 1 本ずつ計算する方が速い。
+		// SHA 命令を使える場合は 1 本ずつ固定長の反復を処理する。
 		for _, r := range pending {
 			imageSignatures.put(signatureCacheKey{key: string(r.key), imageID: r.imageID, exp: r.exp}, computeImageSignature(r.key, r.imageID, r.exp))
 		}

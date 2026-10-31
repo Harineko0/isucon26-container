@@ -54,9 +54,13 @@ func getAdminSessionFromHeader(c *echo.Context, db *sqlx.DB) (*AdminSession, err
 }
 
 func AdminSessionMiddleware(h *HandlerContext, authRequired bool) echo.MiddlewareFunc {
+	return checkAdminSession(h.DB, authRequired)
+}
+
+func checkAdminSession(db *sqlx.DB, authRequired bool) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
-			session, err := getAdminSessionFromHeader(c, h.DB)
+			session, err := getAdminSessionFromHeader(c, db)
 			if err != nil {
 				return err
 			}

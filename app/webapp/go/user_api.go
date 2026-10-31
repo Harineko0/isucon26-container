@@ -131,7 +131,7 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 }
 
 func loginHandler(h *HandlerContext) echo.HandlerFunc {
-	logins := &loginQueue{h: h}
+	logins := &writeQueue[sessionUserRow]{db: h.DB, bans: h.IPBans, sql: loginSQL}
 	return func(c *echo.Context) error {
 		var input loginRequest
 		if err := c.Bind(&input); err != nil {
@@ -146,9 +146,8 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		token := uuid.NewString()
 		tokenHash := sha256.Sum256([]byte(token))
 		hashedToken := hex.EncodeToString(tokenHash[:])
-		row, err := logins.login(ctx, c.RealIP(), [4]string{
-			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hashedToken,
-		})
+		row, err := logins.execute(ctx, c.RealIP(),
+			input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), hashedToken)
 		if err != nil {
 			return err
 		}

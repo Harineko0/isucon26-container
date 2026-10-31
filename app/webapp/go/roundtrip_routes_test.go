@@ -89,7 +89,7 @@ func routesServer(t *testing.T, conn *recordingConnector) *echo.Echo {
 	t.Cleanup(func() { knownSessions.Delete(hash) })
 	e := echo.New()
 	e.HTTPErrorHandler = APIErrorHandler
-	registerRoutes(e, h)
+	registerRoutes(e, h, h.DB)
 	return e
 }
 

@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -27,6 +28,7 @@ type getFeedResponse struct {
 }
 
 func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
+	var friends friendFeedQueue
 	return func(c *echo.Context) error {
 		var input getFeedRequest
 		if err := c.Bind(&input); err != nil {
@@ -49,27 +51,8 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		// 51 件だけを受け取る。フィードごとに別の SQL にして、不要な CTE（mutual など）の計画・実行を省く。
 		tokenHash, deferred := deferredSession(c)
 		userID := GetSession(c).UserID
-		var rows []feedRow
-		var query string
-		var args []any
-		if ranked {
-			if deferred {
-				query = feedDeferredQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore, h.Config.Region, tokenHash}
-			} else {
-				query = feedQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore}
-			}
-		} else {
-			if deferred {
-				query = feedDeferredQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID, h.Config.Region, tokenHash}
-			} else {
-				query = feedQueries[input.Feed]
-				args = []any{userID, input.BeforePostedAt, input.BeforeID}
-			}
-		}
-		if err := sqlx.SelectContext(ctx, h.DB, &rows, query, args...); err != nil {
+		rows, err := selectFeedRows(ctx, h, &friends, input, userID, tokenHash, deferred)
+		if err != nil {
 			return err
 		}
 		var sessRegion *string
@@ -110,6 +93,25 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, getFeedResponse{Items: items, HasMore: hasMore})
 	}
+}
+
+func selectFeedRows(ctx context.Context, h *HandlerContext, friends *friendFeedQueue, input getFeedRequest, userID, tokenHash string, deferred bool) ([]feedRow, error) {
+	if deferred && input.Feed == "friends" && input.BeforePostedAt == nil {
+		return friends.selectRows(ctx, h.DB, h.Config.Region, friendFeedRequest{userID: userID, tokenHash: tokenHash})
+	}
+
+	query := feedQueries[input.Feed]
+	args := []any{userID, input.BeforePostedAt, input.BeforeID}
+	if input.Feed == "friends-of-friends" {
+		args = append(args, input.BeforeScore)
+	}
+	if deferred {
+		query = feedDeferredQueries[input.Feed]
+		args = append(args, h.Config.Region, tokenHash)
+	}
+	var rows []feedRow
+	err := sqlx.SelectContext(ctx, h.DB, &rows, query, args...)
+	return rows, err
 }
 
 type feedRow struct {
@@ -255,22 +257,68 @@ func buildFeedPublicQuery(regionParam, tokenParam int) string {
 }
 
 // friends: 著者が友達なら public / friends / friends_of_friends のどれも閲覧できる。
+//
+// 以前は open_posts（開いている全期間・全リージョンの投稿）を MATERIALIZED で全件取り出してから友達で絞っていた。
+// 利用者が 1,000 人を超えると開いている投稿も 1,000 件を超え、投稿直後のフィード確認（1 走行で 7,000 回超）ごとに
+// その全件を組み立てて捨てていた（pg_stat_statements で平均 3.8ms、DB 時間の約 2 割）。
+// 友達は数十人なので、友達 × 開いている期間ごとに posts_author_window (author_id, posting_window_id) を 1 回ずつ引く。
+// 副問い合わせを LATERAL + OFFSET 0 にして平坦化を防ぎ、汎用プランでも必ず「友達 → 索引」の Nested Loop になるよう固定する
+// （平坦化されると posts の Seq Scan + Hash Join を選びうる）。判定条件（期間中・未削除・本人以外・閲覧者が投稿済み・
+// ブロック除外・ページング・公開範囲）は open_posts 版と同じで、結果の集合も並びも変わらない。
 func buildFeedFriendsQuery(regionParam, tokenParam int) string {
 	return `
-  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedUnrankedCandidateBase + `
-      AND (p.author_id IN (SELECT id FROM friends)) IS TRUE
-      AND p.visibility IN ('public', 'friends', 'friends_of_friends')
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
+  candidates AS (
+    SELECT p.* FROM friends f
+    CROSS JOIN posting_windows w
+    CROSS JOIN LATERAL (
+      SELECT ` + postColumns + `
+      FROM posts p
+      WHERE p.author_id = f.id AND p.posting_window_id = w.id
+        AND p.deleted_at IS NULL
+        AND p.visibility IN ('public', 'friends', 'friends_of_friends')
+      OFFSET 0
+    ) p
+    WHERE w.ended_at IS NULL
+      AND COALESCE((SELECT has_posted_today FROM viewer), false)
+      AND f.id <> $1
+      AND f.id NOT IN (SELECT id FROM blocked)
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
   )` + feedUnrankedTail
 }
 
-// following: 著者がフォロー先で、閲覧可否は canView と同じ。
-// 「著者が友達の友達（mutual）」は、著者と閲覧者の友達の間に友達関係があること（著者 <> 閲覧者は上で保証）。
+// フォローが少なければ著者×期間を posts_author_window で直接引く。多いときは
+// 全著者分の索引探索より開いている期間の投稿を一度読む方が安い。候補の絞り方だけを
+// 切り替え、公開範囲やブロック・カーソルの判定は共通にする。PG16・有効投稿約 2,000 件の
+// ローカル比較では 50 人で著者索引、500 人で期間索引が速かったので 64 人で切り替える。
 func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 	return `
-  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedUnrankedCandidateBase + `
-      AND (p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)) IS TRUE
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
+  followees AS MATERIALIZED (
+    SELECT followee_id FROM follows WHERE follower_id = $1
+  ),
+  many_followees AS (SELECT EXISTS(SELECT 1 FROM followees OFFSET 64) AS use_window_scan),
+  following_posts AS (
+    SELECT p.* FROM followees f
+    CROSS JOIN posting_windows w
+    CROSS JOIN LATERAL (
+      SELECT ` + postColumns + `
+      FROM posts p
+      WHERE p.author_id = f.followee_id AND p.posting_window_id = w.id AND p.deleted_at IS NULL
+      OFFSET 0
+    ) p
+    WHERE w.ended_at IS NULL AND NOT (SELECT use_window_scan FROM many_followees)
+    UNION ALL
+    SELECT ` + postColumns + `
+    FROM posting_windows w JOIN posts p ON p.posting_window_id = w.id
+    WHERE w.ended_at IS NULL AND p.deleted_at IS NULL AND (SELECT use_window_scan FROM many_followees)
+      AND (p.author_id IN (SELECT followee_id FROM followees)) IS TRUE
+  ),
+  candidates AS (
+    SELECT p.* FROM following_posts p
+    WHERE (SELECT has_posted_today FROM viewer) AND p.author_id <> $1
+      AND p.author_id NOT IN (SELECT id FROM blocked)
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
       AND (p.visibility = 'public'
            OR (p.visibility = 'friends' AND p.author_id IN (SELECT id FROM friends))
            OR (p.visibility = 'friends_of_friends' AND (
