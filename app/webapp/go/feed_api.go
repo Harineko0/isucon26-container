@@ -177,8 +177,9 @@ func feedViewerSessionCTE(regionParam, tokenParam int) string {
 
 const feedFriendsCTE = `
   friends AS (
-    SELECT CASE WHEN user_low_id = $1 THEN user_high_id ELSE user_low_id END AS id
-    FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
+    SELECT user_high_id AS id FROM friendships WHERE user_low_id = $1
+    UNION ALL
+    SELECT user_low_id AS id FROM friendships WHERE user_high_id = $1 AND user_low_id <> $1
   )`
 
 const feedBlockedCTE = `
@@ -285,8 +286,12 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
   author_fof AS (
     SELECT a.author_id, sum(m.n) AS s
     FROM (SELECT DISTINCT author_id FROM candidates) a
-    JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
-    JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
+    CROSS JOIN LATERAL (
+      SELECT user_high_id AS id FROM friendships WHERE user_low_id = a.author_id
+      UNION ALL
+      SELECT user_low_id AS id FROM friendships WHERE user_high_id = a.author_id AND user_low_id <> a.author_id
+    ) neighbors
+    JOIN mutual m ON m.id = neighbors.id
     GROUP BY a.author_id
   ),
   scored AS (

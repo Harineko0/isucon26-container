@@ -287,10 +287,12 @@ BEGIN
       can_view := is_friend;
     ELSIF p.visibility = 'friends_of_friends' THEN
       can_view := is_friend OR EXISTS(
-      SELECT 1 FROM friendships f1
-      CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = v.id THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
-      JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p.author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p.author_id)
-      WHERE f1.user_low_id = v.id OR f1.user_high_id = v.id);
+      SELECT 1 FROM (
+        SELECT user_high_id AS mid FROM friendships WHERE user_low_id = v.id
+        UNION ALL
+        SELECT user_low_id AS mid FROM friendships WHERE user_high_id = v.id AND user_low_id <> v.id
+      ) m
+      JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p.author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p.author_id));
     END IF;
   END IF;
   IF can_view AND w_ended IS NULL THEN
