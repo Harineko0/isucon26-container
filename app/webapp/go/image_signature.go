@@ -18,8 +18,12 @@ const imageSignatureIterations = 1000
 // 署名は 1000 回の HMAC で重いので、exp を丸めて (鍵, 画像, exp) ごとに使い回す。
 // exp は常に「今 + 24 時間」以上に切り上げるので、URL の有効期間は短くならない。
 // 丸めの幅を 10 秒から 30 秒にした: 幅ごとに全画像の署名を計算し直すので、asia1 (SHA 命令なし) では
-// フィード 1 回あたり最大 100 署名 × 1000 回の HMAC を 10 秒ごとに払っていた。URL の期限は 24 時間 + 最大 30 秒。
-const imageURLExpBucket = 30
+// フィード 1 回あたり最大 100 署名 × 1000 回の HMAC を 10 秒ごとに払っていた。
+// さらに 300 秒にした: 17:14 のベンチ中の asia1 の CPU プロファイルで、署名 (sha256x16 + HMAC) が Go の CPU の
+// 約 33% (Memories 28%、エクスポートの一部) を占め、asia1 の CPU が張り付いていた。30 秒ごとに切り替わると
+// 約 100 秒のベンチで同じ (鍵, 画像) を 3〜4 回署名し直す。300 秒なら多くても 2 回。URL の期限は 24 時間 + 最大 300 秒
+// (短くはならない。署名と期限の形式・検証は変えない)。
+const imageURLExpBucket = 300
 
 func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	key, err := hex.DecodeString(secretKeyHash)
