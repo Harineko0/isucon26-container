@@ -151,11 +151,15 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 				continue
 			}
 			reaction := row.RealMojiWithReactor
+			if len(reactions) == 50 {
+				break
+			}
 			if err := reaction.Reactor.setImageKey(); err != nil {
 				return err
 			}
 			reactions = append(reactions, reaction)
 		}
+		hasMore := len(rows) > 50
 		plan := newSignaturePlan()
 		for _, reaction := range reactions {
 			plan.add(reaction.Reactor, reaction.ImageID)
@@ -165,10 +169,6 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 		items := make([]replaceRealMojiResponse, 0, len(reactions))
 		for _, reaction := range reactions {
 			items = append(items, newRealMojiResponse(reaction.RealMoji, reaction.Reactor))
-		}
-		hasMore := len(items) > 50
-		if hasMore {
-			items = items[:50]
 		}
 		return c.JSON(http.StatusOK, getRealMojisResponse{Items: items, HasMore: hasMore})
 	}

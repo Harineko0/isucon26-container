@@ -14,7 +14,52 @@ import (
 )
 
 // 初期データの画像は cmd/imgsync でローカルディスクに書き出してある (不変なので内容は DB と同じ)。
-const imageDiskDir = "/home/isucon/imgcache"
+// 手元での確認用に ISUREAL_IMAGE_CACHE_DIR で差し替えられる (nginx の alias も合わせること)。
+var imageDiskDir = envOrDefault("ISUREAL_IMAGE_CACHE_DIR", "/home/isucon/imgcache")
+
+// ディスクにある画像の本体は Go が読まず、nginx に X-Accel-Redirect で返させる (image_api.go)。
+// nginx 側の internal location (infra/app/etc/nginx/sites-available/isureal.conf) が
+// imageDiskDir / imageStoreDir を alias で指している。ISUREAL_IMAGE_ACCEL=0 で止められる
+// (止めると従来どおり Go が読んで返す)。
+var imageAccelEnabled = envOrDefault("ISUREAL_IMAGE_ACCEL", "1") != "0"
+
+const (
+	imageDiskAccelPrefix  = "/_imgcache/"
+	imageStoreAccelPrefix = "/_imgstore/"
+)
+
+// imageFileExists はディスクの画像ファイルが読める状態 (長さ > 0) かを stat だけで確かめる。
+// 長さ 0 は書きかけ (強制停止など) とみなす。一時ファイルは別名なので、見えるのは書き終えたものだけ。
+func imageFileExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular() && fi.Size() > 0
+}
+
+// locate は画像の本体の在り処を返す。メモリにあれば data、ディスク (imgcache / imgstore) にあれば
+// nginx に渡す X-Accel-Redirect の URI (本体は読まない)。どちらも無ければ ok=false。
+// ディスクのファイルはメモリには載せない (Go のヒープを使わず、OS のページキャッシュに任せる)。
+func (c *imageDataCache) locate(id string) (data []byte, accelURI string, ok bool) {
+	c.mu.RLock()
+	data, ok = c.current[id]
+	if !ok {
+		data, ok = c.previous[id]
+	}
+	c.mu.RUnlock()
+	if ok && data != nil {
+		return data, "", true
+	}
+	if !imageAccelEnabled {
+		data, ok = c.get(id)
+		return data, "", ok
+	}
+	if path, ok := imageDiskPath(id); ok && imageFileExists(path) {
+		return nil, imageDiskAccelPrefix + id[:2] + "/" + id, true
+	}
+	if path, ok := imageStorePath(id); ok && imageFileExists(path) {
+		return nil, imageStoreAccelPrefix + id[:2] + "/" + id, true
+	}
+	return nil, "", false
+}
 
 var imageIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -62,21 +107,6 @@ func WriteImageToDisk(id string, data []byte) error {
 		os.Remove(tmp)
 	}
 	return err
-}
-
-// imageDiskAccelPath は画像がディスクにあれば、nginx の internal location (/_imgcache/, infra の isureal.conf)
-// から見たパスを返す。本体は Go のヒープに載せず、X-Accel-Redirect で nginx に sendfile させる (#94)。
-// 長さ 0 は書きかけ (強制停止など) とみなして無いことにする。
-func imageDiskAccelPath(id string) (string, bool) {
-	path, ok := imageDiskPath(id)
-	if !ok {
-		return "", false
-	}
-	fi, err := os.Stat(path)
-	if err != nil || fi.Size() == 0 {
-		return "", false
-	}
-	return "/_imgcache/" + id[:2] + "/" + id, true
 }
 
 // imageOwnerKeys は画像 id → 所有者の署名鍵 (users.secret_key_hash を decode したもの)。
@@ -200,20 +230,14 @@ func newImageDataCache() *imageDataCache {
 	return &imageDataCache{current: map[string][]byte{}, previous: map[string][]byte{}}
 }
 
-// getMemory はヒープにある画像だけを返す (ディスクは見ない)。
-func (c *imageDataCache) getMemory(id string) ([]byte, bool) {
+func (c *imageDataCache) get(id string) ([]byte, bool) {
 	c.mu.RLock()
 	data, ok := c.current[id]
 	if !ok {
 		data, ok = c.previous[id]
 	}
 	c.mu.RUnlock()
-	return data, ok && data != nil
-}
-
-// get はヒープに無ければディスクから読んでヒープに入れる。
-func (c *imageDataCache) get(id string) ([]byte, bool) {
-	if data, ok := c.getMemory(id); ok {
+	if ok && data != nil {
 		return data, true
 	}
 	if data, ok := readImageFromDisk(id); ok {

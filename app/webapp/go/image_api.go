@@ -20,14 +20,7 @@ type getImageRequest struct {
 	Sig     string `query:"sig" json:"-"`
 }
 
-// imageAccelRegions は、ディスク (imgcache) にある画像を Go のヒープに載せず X-Accel-Redirect で nginx に返させる (#94)
-// リージョン。PR #130 の初回ベンチ (job 21475) では、EU/US の画像取得は 0.235/0.206 → 0.175/0.178 秒と速くなった
-// 一方、asia1 は 0.161 → 0.265 秒に遅くなり iowait が 22% に上がった (16GB の imgcache に対してページキャッシュが
-// 小さく、ヒープのキャッシュが外れた分がディスク読みになったとみられる)。asia はヒープのキャッシュのまま。
-var imageAccelRegions = map[string]bool{"europe": true, "america": true}
-
 func getImageHandler(h *HandlerContext) echo.HandlerFunc {
-	useAccel := imageAccelRegions[h.Config.Region]
 	return func(c *echo.Context) error {
 		c.Response().Header().Set("Cache-Control", "no-store")
 		var input getImageRequest
@@ -56,23 +49,8 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			c.Set("abuse", "invalid_signature")
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		// 本体はヒープ → ディスク (imgcache) の順に探す。useAccel のリージョンでは、ディスクにある画像はヒープに
-		// 載せず、閲覧可否を確かめたあと X-Accel-Redirect で nginx に返させる (#94)。それ以外はヒープに読み込む。
-		var (
-			cached    []byte
-			inMemory  bool
-			accelPath string
-			onDisk    bool
-		)
-		if useAccel {
-			cached, inMemory = imageDataStore.getMemory(input.ImageID)
-			if !inMemory {
-				accelPath, onDisk = imageDiskAccelPath(input.ImageID)
-			}
-		} else {
-			cached, inMemory = imageDataStore.get(input.ImageID)
-		}
-		hasData := inMemory || onDisk
+		// 本体の在り処: メモリ (cached)、ディスク (accelURI。本体は Go では読まず nginx に返させる)、どちらでもない。
+		cached, accelURI, hasData := imageDataStore.locate(input.ImageID)
 		if !hasData {
 			prefetchStoredImage(input.ImageID, h.Config.Region)
 		}
@@ -133,18 +111,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if !object.Allowed {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		if onDisk {
-			// nginx は X-Accel-Redirect を受けると上流の本文と状態を捨て、internal location の実ファイルを
-			// sendfile で返す。Content-Type と Cache-Control (no-store、冒頭で設定済み) は上流の値が引き継がれる
-			// (手元の nginx で確認)。
-			if exp <= time.Now().Unix() {
-				return NewAPIError(http.StatusForbidden, "image_forbidden")
-			}
-			c.Response().Header().Set("Content-Type", object.MediaType)
-			c.Response().Header().Set("X-Accel-Redirect", accelPath)
-			return c.NoContent(http.StatusOK)
-		}
-		if inMemory {
+		if hasData {
 			object.Data = cached
 		} else if object.StoredRegion != nil && len(object.Data) == 0 {
 			// 本体は stored_region のサーバーのディスクにある (image_store.go)。
@@ -163,6 +130,14 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
+		if accelURI != "" {
+			// 本体はディスクのファイル。nginx の internal location が sendfile で返す
+			// (infra/app/etc/nginx/sites-available/isureal.conf)。Content-Type と Cache-Control は
+			// nginx が X-Accel-Redirect の応答から引き継ぐので、従来の応答と同じヘッダになる。
+			c.Response().Header().Set(echo.HeaderContentType, object.MediaType)
+			c.Response().Header().Set("X-Accel-Redirect", accelURI)
+			return c.NoContent(http.StatusOK)
 		}
 		return c.Blob(http.StatusOK, object.MediaType, object.Data)
 	}
