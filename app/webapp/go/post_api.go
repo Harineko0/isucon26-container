@@ -46,7 +46,7 @@ type createPostResponse struct {
 	LateSeconds     int64              `json:"lateSeconds"`
 }
 
-// createPostGate は isureal_create_post (image_objects への画像 INSERT を含む) のサーバごとの同時実行数を
+// createPostGate は isureal_create_post のサーバごとの同時実行数を
 // 絞る。image_objects の TOAST の拡張ロック (Lock:extend) は、同時に走る backend が 12 本以下なら
 // 待ちがほぼ 0 で、asia のプール 80 本では最大 50 本ほどがロック待ちのままプールの接続を占めていた
 // (DB の wait の 28%、INSERT の平均 390 ms)。待ちは DB のロックではなく、接続を取り出す前の goroutine で
@@ -58,8 +58,13 @@ type createPostGate chan struct{}
 // asia 8 のベンチ (main 91832e2, 64,912) では画像 INSERT が 390→88 ms に下がった一方、asia の POST /api/posts が
 // 平均 1.9 s (最大 4.7 s) と gate 待ちが支配的になり、グランプリの投稿は 400 人中 125 人だった。
 // asia 12 のベンチ (main b48193a, 63,766) では asia の POST /api/posts が平均 4.1 s (最大 10.7 s) になり、
-// グランプリの投稿は 374 人中 19 人に落ちた (8 のときは 400 人中 125 人)。8 に戻す。3 台合計 8 + 4 + 4 = 16。
-var createPostGateSize = map[string]int{"asia": 8, "europe": 4, "america": 4}
+// グランプリの投稿は 374 人中 19 人に落ちた (8 のときは 400 人中 125 人)。8 に戻した。
+// #128 (画像の本体をリージョンのディスクに置く) 以降、投稿画像は image_objects に data を入れない
+// (storeUploadedImage が空の data と stored_region を返す) ので、この枠が避けていた TOAST の拡張ロックは
+// 起きない。一方で asia の最終日の POST /api/posts は枠待ちで平均 4.4 s かかり、グランプリの人数を決めていた
+// (#97)。枠はプール (asia 80, EU/US 40) より十分小さい値まで広げる。ディスク保存に失敗して DB に data を
+// 入れる場合だけは TOAST に書くが、その経路はまれ。
+var createPostGateSize = map[string]int{"asia": 24, "europe": 12, "america": 12}
 
 func newCreatePostGate(region string) createPostGate {
 	n, ok := createPostGateSize[region]
