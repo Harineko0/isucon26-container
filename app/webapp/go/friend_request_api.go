@@ -1,7 +1,6 @@
 package isureal
 
 import (
-	"database/sql"
 	"errors"
 	"net/http"
 	"time"
@@ -20,15 +19,10 @@ type createFriendRequestResponse struct {
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
-// Region is checked inside the lateral subquery before the mutation; a wrong
-// region returns the session row without calling isureal_relationship.
-const friendRequestSQL = `
-	SELECT u.region AS sess_region, r.* FROM login_sessions s
-	JOIN users u ON u.id = s.user_id AND u.status = 'active'
-	LEFT JOIN LATERAL (
-		SELECT * FROM isureal_relationship('friend_request', s.user_id, $1, $2)
-		WHERE u.region = $4 OFFSET 0
-	) r ON true WHERE s.token_hash = $3 AND s.active`
+const transitionFriendRequestCall = `isureal_transition_friend_request_authorized({user}, $1, $2)`
+
+var friendRequestSQL = deferredMutationSQL("r.*", `isureal_relationship('friend_request', {user}, $1, $2)`, 2)
+var transitionFriendRequestSQL = deferredMutationSQL("r.*", transitionFriendRequestCall, 2)
 
 func createFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 	return createFriendRequestHandlerWithQueue(h, &writeQueue[relationshipResult]{db: h.DB, sql: friendRequestSQL})
@@ -56,20 +50,19 @@ func createFriendRequest(c *echo.Context, h *HandlerContext, writes *writeQueue[
 	if !deferred || recipient == "" || recipient == GetSession(c).UserID {
 		return runRelationship(c, h, "friend_request", recipient)
 	}
-	row, err := writes.execute(c.Request().Context(), "", [4]string{recipient, uuid.NewString(), token, h.Config.Region})
-	if errors.Is(err, sql.ErrNoRows) {
-		return row, rejectDeferredSession(c, h, token, false, "")
-	}
+	row, err := queuedFriendRequest(c, h, writes, token, recipient, uuid.NewString())
 	if err != nil {
-		return row, err
-	}
-	if err := rejectDeferredSession(c, h, token, true, *row.SessRegion); err != nil {
 		return row, err
 	}
 	if row.Result == nil {
 		return row, errors.New("relationship function returned no result")
 	}
 	return row, relationshipResultError(*row.Result)
+}
+
+func queuedFriendRequest(c *echo.Context, h *HandlerContext, writes *writeQueue[relationshipResult], token, first, second string) (relationshipResult, error) {
+	row, err := writes.execute(c.Request().Context(), "", first, second, token, h.Config.Region)
+	return row, finishDeferredMutation(c, h, token, row.SessRegion, err)
 }
 
 type transitionFriendRequestRequest struct {
@@ -80,6 +73,10 @@ type transitionFriendRequestRequest struct {
 type transitionFriendRequestResponse createFriendRequestResponse
 
 func transitionFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
+	return transitionFriendRequestHandlerWithQueue(h, &writeQueue[relationshipResult]{db: h.DB, sql: transitionFriendRequestSQL})
+}
+
+func transitionFriendRequestHandlerWithQueue(h *HandlerContext, writes *writeQueue[relationshipResult]) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input transitionFriendRequestRequest
 		if err := c.Bind(&input); err != nil {
@@ -111,16 +108,14 @@ func transitionFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			return NewAPIError(http.StatusForbidden, "relationship_action_forbidden")
 		}
-		// セッションとリージョンの確認と同じ 1 文で呼ぶ (#17)。関数が呼ばれなかったときは o_* が NULL なのでポインタで受ける。
-		var row struct {
-			SessRegion *string    `db:"sess_region"`
-			Result     *string    `db:"o_result"`
-			ID         *string    `db:"o_id"`
-			Status     *string    `db:"o_status"`
-			UpdatedAt  *time.Time `db:"o_updated_at"`
+		var row relationshipResult
+		var err error
+		if token, deferred := deferredSession(c); deferred {
+			row, err = queuedFriendRequest(c, h, writes, token, input.RequestID, status)
+		} else {
+			err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, transitionFriendRequestCall, input.RequestID, status)
 		}
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion },
-			`isureal_transition_friend_request_authorized({user}, $1, $2)`, input.RequestID, status); err != nil {
+		if err != nil {
 			return err
 		}
 		if row.Result == nil {

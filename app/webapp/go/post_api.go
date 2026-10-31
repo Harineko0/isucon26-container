@@ -85,7 +85,37 @@ func (g createPostGate) acquire(ctx context.Context) error {
 
 func (g createPostGate) release() { <-g }
 
+// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、全部ポインタで受ける
+// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
+type createPostRow struct {
+	SessRegion     *string    `db:"sess_region"`
+	Result         *string    `db:"o_result"`
+	WindowID       *string    `db:"o_window_id"`
+	OnTimeDeadline *time.Time `db:"o_on_time_deadline"`
+	PostedAt       *time.Time `db:"o_posted_at"`
+	Latitude       *float64   `db:"o_latitude"`
+	Longitude      *float64   `db:"o_longitude"`
+	Locality       *string    `db:"o_locality"`
+	ID             *string    `db:"o_id"`
+	Username       *string    `db:"o_username"`
+	SecretKeyHash  *string    `db:"o_secret_key_hash"`
+	DisplayName    *string    `db:"o_display_name"`
+	Bio            *string    `db:"o_bio"`
+	ProfileImageID *string    `db:"o_profile_image_id"`
+	Region         *string    `db:"o_region"`
+	AccountType    *string    `db:"o_account_type"`
+	Status         *string    `db:"o_status"`
+}
+
+const createPostCall = `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+
+var createPostSQL = deferredMutationSQL("r.*", createPostCall, 10)
+
 func createPostHandler(h *HandlerContext) echo.HandlerFunc {
+	return createPostHandlerWithQueue(h, &writeQueue[createPostRow]{db: h.DB, sql: createPostSQL})
+}
+
+func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPostRow]) echo.HandlerFunc {
 	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
 		var input createPostRequest
@@ -126,27 +156,6 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
 		imageID := newImageID(h.Config.Region)
 		postID := newTimeID()
-		// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、全部ポインタで受ける
-		// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
-		var row struct {
-			SessRegion     *string    `db:"sess_region"`
-			Result         *string    `db:"o_result"`
-			WindowID       *string    `db:"o_window_id"`
-			OnTimeDeadline *time.Time `db:"o_on_time_deadline"`
-			PostedAt       *time.Time `db:"o_posted_at"`
-			Latitude       *float64   `db:"o_latitude"`
-			Longitude      *float64   `db:"o_longitude"`
-			Locality       *string    `db:"o_locality"`
-			ID             *string    `db:"o_id"`
-			Username       *string    `db:"o_username"`
-			SecretKeyHash  *string    `db:"o_secret_key_hash"`
-			DisplayName    *string    `db:"o_display_name"`
-			Bio            *string    `db:"o_bio"`
-			ProfileImageID *string    `db:"o_profile_image_id"`
-			Region         *string    `db:"o_region"`
-			AccountType    *string    `db:"o_account_type"`
-			Status         *string    `db:"o_status"`
-		}
 		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
 		// ディスクへの書き込みは gate の外で済ませ、gate では DB の呼び出しだけを絞る。
 		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
@@ -155,9 +164,16 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		proofs := committedPostImages.Load()
-		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-			imageID, postID, dbImageData, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion)
+		var row createPostRow
+		args := []any{imageID, postID, dbImageData, input.Caption, input.Visibility,
+			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion}
+		if token, deferred := deferredSession(c); deferred && storedRegion != nil {
+			// Only the metadata of an already durable image can share a checkout.
+			row, err = writes.execute(c.Request().Context(), "", append(args, token, h.Config.Region)...)
+			err = finishDeferredMutation(c, h, token, row.SessRegion, err)
+		} else {
+			err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, createPostCall, args...)
+		}
 		gate.release()
 		if err != nil {
 			return err
@@ -185,7 +201,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			ID: postID, AuthorID: user.ID, PostingWindowID: *row.WindowID, ImageID: imageID,
 			Caption: input.Caption, Visibility: input.Visibility,
 			PostLocation: PostLocation{Kind: location.Kind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: row.Locality},
-			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
+			PostedAt:     row.PostedAt.Local(), OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		// The same committed SQL statement created the JPEG object and its post.
 		proofs.Store(imageID, postImageProof{postID: postID, ownerID: user.ID})
