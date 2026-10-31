@@ -25,6 +25,9 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 - チーム ID: 120107。ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）の 4 台と上表の IP が一致していることを確認済み（2026-10-31 時点で全台 RUNNING）。
 - 表示確認用 URL（ルーター経由）: <http://35.73.68.236:8080>
 - BenchmarkHost: `app.team120107-aws.127.0.0.1.nip.io`
+- AWS CLI が使える。競技アカウント（573111099202）には **`--profile AdministratorAccess-573111099202`** を付ける（default プロファイルの認証情報は無効で `InvalidClientTokenId` になる）。リージョンは ap-northeast-1。SSO のセッションが切れたら `aws sso login --profile AdministratorAccess-573111099202` をユーザーに頼む。
+  - 例: `aws cloudformation describe-stacks --stack-name isucon-prod-2 --profile AdministratorAccess-573111099202`（Outputs と状態の確認）
+  - インスタンスタイプの変更など、テンプレートの内容から外れるリソース変更は失格になる。
 - SSH は `~/.ssh/config` のエイリアスを使う: asia1 → `ssh isucon26-asia`、europe1 → `ssh isucon26-europe`、america1 → `ssh isucon26-america`。asia2 はエイリアスが無いので `ssh isucon@3.115.193.33`。ポータルのサーバリストにある 4 台以外へは SSH しない。
 - ルーターは `X-Country-Code`（JP/KR/CN/AU→asia1、GB/DE/FR→europe1、US/CA/MX→america1、省略時 JP）で振り分ける。クライアント IP は `X-Client-IP` を使う。
 - europe1/america1 → asia2 はリージョン間通信で遅延と帯域制限がある。asia1 と asia2 は同一リージョン扱い。
