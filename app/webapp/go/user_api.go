@@ -124,6 +124,7 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusConflict, "username_taken")
 		}
 		user := row.user()
+		saveSearchNormsAsync(h.DB, user)
 		return c.JSON(http.StatusCreated, registerResponse{SecretKey: secretKey, User: newSessionUserResponse(user)})
 	}
 }
@@ -222,6 +223,9 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		user := User{ID: *row.ID, Username: *row.Username, SecretKeyHash: *row.SecretKeyHash, DisplayName: *row.DisplayName, Bio: *row.Bio,
 			ProfileImageID: row.ProfileImageID, Region: *row.Region, AccountType: *row.AccountType, Status: *row.Status}
+		if input.DisplayName != nil {
+			saveSearchNormsAsync(h.DB, user)
+		}
 		if err := user.setImageKey(); err != nil {
 			return err
 		}
