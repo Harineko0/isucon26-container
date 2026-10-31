@@ -221,18 +221,6 @@ func cleanSearchDirtyLoop(db *sqlx.DB) {
 	}
 }
 
-// saveSearchNormsAsync は登録・表示名の変更のあとに正規化を保存する。応答は待たせない。
-// 保存までの間はトリガーが入れた dirty の行があるので、検索はアプリで照合する。
-func saveSearchNormsAsync(db *sqlx.DB, user User) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := saveSearchNorms(ctx, db, []User{user}); err != nil {
-			log.Printf("failed to save search norms: %v", err)
-		}
-	}()
-}
-
 // refreshSearchNorms は正規化が無い・古い利用者をまとめて保存し直す (起動時と初期化後)。
 func refreshSearchNorms(db *sqlx.DB) {
 	ctx := context.Background()
