@@ -30,6 +30,8 @@ func NewServer(config *Config) *echo.Echo {
 	if err := ensureImageStoreDirs(); err != nil {
 		panic("failed to prepare image store: " + err.Error())
 	}
+	// 投稿画像の fsync を要求の外で行う (image_store_sync.go)。SIGTERM では溜まった分を fsync してから終了する。
+	startImageFileSyncer()
 	go removeImageStoreTrash()
 	startImagePushers(config.Region)
 

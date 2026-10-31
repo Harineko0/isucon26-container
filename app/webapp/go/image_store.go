@@ -22,8 +22,10 @@ import (
 )
 
 // 新しく投稿された画像 (投稿・RealMoji・プロフィール画像) の本体は、受け付けたリージョンのサーバーの
-// ディスク (imageStoreDir) に fsync してから DB にメタデータだけを入れる (image_objects.data は空、
-// stored_region に置き場のリージョン)。閲覧可否は従来どおり毎回 DB で判定する。
+// ディスク (imageStoreDir) に書いてから DB にメタデータだけを入れる (image_objects.data は空、
+// stored_region に置き場のリージョン)。要求の中では一時ファイルへの書き込みと rename まで行い、
+// fsync は imageSyncer (image_store_sync.go) が要求の外でまとめて行う (write-behind。理由と耐久性はそちら)。
+// 閲覧可否は従来どおり毎回 DB で判定する。
 // 手元に無い画像は置き場のリージョンのサーバーから private IP (ルーター経由) で取り、ここに複製する。
 // 初期データの画像 (stored_region IS NULL) は従来どおり DB と imageDiskDir にある。
 var imageStoreDir = envOrDefault("ISUREAL_IMAGE_STORE_DIR", "/home/isucon/imgstore")
@@ -128,9 +130,17 @@ func ensureImageStoreDirs() error {
 }
 
 // writeImageFileDurable は一時ファイルに書いて fsync → rename → ディレクトリを fsync する
-// (応答・DB のコミットより前に呼べば、再起動しても消えない。途中で止まっても壊れたファイルを残さない)。
+// (返った時点で、再起動しても消えない。途中で止まっても壊れたファイルを残さない)。
+// 要求の経路では使わない (fsync を要求の外に出した writeImageFile を使う)。テストと移行前のファイルの用意に残す。
 func writeImageFileDurable(path string, data []byte) error {
-	return writeImageFileDurableFrom(path, bytes.NewReader(data))
+	return writeImageFileFrom(path, bytes.NewReader(data), true)
+}
+
+// writeImageFile は一時ファイルに書いて rename するところまでを行い、fsync は imageSyncer に任せる
+// (image_store_sync.go)。rename の時点で閲覧 (nginx の sendfile / readImageFromStore) はページキャッシュから読める。
+// 途中で止まっても壊れたファイルを残さない (見えるのは rename まで終えたものだけ)。
+func writeImageFile(path string, data []byte) error {
+	return writeImageFileFrom(path, bytes.NewReader(data), false)
 }
 
 const maxPeerImageBytes = 64 << 20
@@ -149,7 +159,9 @@ func (body peerImageBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func writeImageFileDurableFrom(path string, src io.Reader) error {
+// writeImageFileFrom は src を一時ファイルに書いて path に rename する。durable なら rename の前にファイルを、
+// 後にディレクトリを fsync して返る。そうでなければ fsync を imageSyncer に積んで返る。
+func writeImageFileFrom(path string, src io.Reader, durable bool) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if errors.Is(err, os.ErrNotExist) {
@@ -169,7 +181,7 @@ func writeImageFileDurableFrom(path string, src io.Reader) error {
 			err = errInvalidImageBody
 		}
 	}
-	if err == nil {
+	if err == nil && durable {
 		err = tmp.Sync()
 	}
 	if closeErr := tmp.Close(); err == nil {
@@ -181,6 +193,10 @@ func writeImageFileDurableFrom(path string, src io.Reader) error {
 	if err != nil {
 		os.Remove(tmpName)
 		return err
+	}
+	if !durable {
+		imageSyncer.enqueue(path)
+		return nil
 	}
 	return syncDir(dir)
 }
@@ -197,14 +213,15 @@ func readImageFromStore(id string) ([]byte, bool) {
 	return data, true
 }
 
-// storeUploadedImage はアップロードされた画像をこのサーバーのディスクに永続化する。
-// 戻り値は DB 関数に渡す data と stored_region。ディスクに書けなければ従来どおり DB に本体を入れる。
+// storeUploadedImage はアップロードされた画像をこのサーバーのディスクに置く (rename まで。fsync は imageSyncer が
+// 要求の外で行う。image_store_sync.go)。戻り値は DB 関数に渡す data と stored_region。
+// ディスクに書けなければ従来どおり DB に本体を入れる。
 func storeUploadedImage(id string, data []byte, region string) ([]byte, *string) {
 	path, ok := imageStorePath(id)
 	if !ok {
 		return data, nil
 	}
-	if err := writeImageFileDurable(path, data); err != nil {
+	if err := writeImageFile(path, data); err != nil {
 		fmt.Fprintf(os.Stderr, "imgstore: write %s failed, storing in DB: %v\n", id, err)
 		return data, nil
 	}
@@ -363,7 +380,8 @@ func loadStoredImage(id, storedRegion, selfRegion string) ([]byte, error) {
 				if _, err := os.Stat(path); err == nil {
 					return
 				}
-				writeImageFileDurable(path, data)
+				// 複製 (原本は置き場のリージョンにある) なので、fsync は要求の外でよい。
+				writeImageFile(path, data)
 			}
 		}()
 	}
@@ -459,7 +477,9 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 					return c.NoContent(http.StatusBadRequest)
 				}
 				body := http.MaxBytesReader(nil, r.Body, maxPeerImageBytes)
-				if err := writeImageFileDurableFrom(dst, peerImageBody{body}); err != nil {
+				// 複製なので fsync は imageSyncer に任せる (asia1 は欧米の全投稿の複製を受けるので、要求ごとの
+				// fsync が asia の投稿の書き込みと同じ EBS に並んでいた)。
+				if err := writeImageFileFrom(dst, peerImageBody{body}, false); err != nil {
 					if errors.Is(err, errInvalidImageBody) {
 						return c.NoContent(http.StatusBadRequest)
 					}

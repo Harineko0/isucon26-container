@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -147,7 +146,11 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if _, _, err := jpegcheck.ValidateBytes(imageData); err != nil {
+		// 検証は CPU を使い切る処理なので、同時に走る本数をコア数に絞る (cpu_admission.go)。
+		if _, _, err := validateJPEGBytes(c.Request().Context(), imageData); err != nil {
+			if c.Request().Context().Err() != nil {
+				return err
+			}
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
@@ -156,8 +159,9 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
 		imageID := newImageID(h.Config.Region)
 		postID := newTimeID()
-		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
-		// ディスクへの書き込みは gate の外で済ませ、gate では DB の呼び出しだけを絞る。
+		// 本体はこのサーバーのディスクに書いて (rename まで。fsync は要求の外で imageSyncer が行う)、
+		// DB にはメタデータだけを入れる (image_store.go)。ディスクへの書き込みは gate の外で済ませ、
+		// gate では DB の呼び出しだけを絞る。
 		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
 		if err := gate.acquire(c.Request().Context()); err != nil {
 			discardUploadedImage(imageID, storedRegion)

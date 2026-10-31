@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 
-	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -58,8 +57,13 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		// Validate first: the abuse flag must be set exactly when
 		// image/jpeg.Decode would fail, including for oversized images.
-		width, height, err := jpegcheck.ValidateBytes(data)
+		// 検証は CPU を使い切る処理なので、同時に走る本数をコア数に絞る (cpu_admission.go)。
+		// 枠を待つ間に要求が取り消されたときは検証していないので、abuse にはしない。
+		width, height, err := validateJPEGBytes(c.Request().Context(), data)
 		if err != nil {
+			if c.Request().Context().Err() != nil {
+				return err
+			}
 			c.Set("abuse", "invalid_image")
 			return NewAPIError(http.StatusBadRequest, "invalid_profile_image")
 		}
@@ -68,7 +72,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		imageID := newImageID(h.Config.Region)
-		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		// 本体はこのサーバーのディスクに書いて (fsync は要求の外で imageSyncer が行う)、DB にはメタデータだけを入れる (image_store.go)。
 		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
 		// セッションの確認と同じ 1 文で呼ぶ (#17)。このルートにはリージョンの確認が無い。
 		var row struct {
