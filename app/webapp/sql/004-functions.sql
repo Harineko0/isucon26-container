@@ -370,7 +370,9 @@ BEGIN
   END;
   UPDATE users SET profile_image_id = p_image_id, updated_at = clock_timestamp() WHERE id = p_user;
   IF v_old IS NOT NULL THEN
-    DELETE FROM image_objects WHERE id = v_old;
+    -- 初期データの画像行は消さない (reset.sql は消えた行を戻せない)。profile_image_id から外れた時点で
+    -- 画像取得の閲覧可否 (image_api.go の allowed) が偽になり 403 になるので、外から見える挙動は行を消した場合と同じ。
+    DELETE FROM image_objects WHERE id = v_old AND created_at > (SELECT created_at FROM initial_data_boundary);
   END IF;
   RETURN 'ok';
 END $$;
@@ -383,7 +385,8 @@ BEGIN
   SELECT profile_image_id INTO v_old FROM users WHERE id = p_user FOR NO KEY UPDATE;
   IF NOT FOUND OR v_old IS NULL THEN RETURN 'not_found'; END IF;
   UPDATE users SET profile_image_id = NULL, updated_at = clock_timestamp() WHERE id = p_user;
-  DELETE FROM image_objects WHERE id = v_old;
+  -- 初期データの画像行は消さない (isureal_put_profile_image と同じ理由)。
+  DELETE FROM image_objects WHERE id = v_old AND created_at > (SELECT created_at FROM initial_data_boundary);
   RETURN 'ok';
 END $$;
 
