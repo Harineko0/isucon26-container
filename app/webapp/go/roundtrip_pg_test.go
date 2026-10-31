@@ -31,6 +31,13 @@ func TestRoundTripHandlersOnPostgres(t *testing.T) {
 	}
 	db := sqlx.NewDb(stdlib.OpenDB(*connConfig), "pgx")
 	defer db.Close()
+	runRoundTripScenario(t, db)
+}
+
+// runRoundTripScenario は TestRoundTripHandlersOnPostgres の手順 (投入 → 各ハンドラ → 応答の確認) を db で行う。
+// prepared_warm_test.go でも、接続時に Prepare した接続で同じ応答になることを確かめるのに使う。
+func runRoundTripScenario(t *testing.T, db *sqlx.DB) {
+	t.Helper()
 	ctx := context.Background()
 
 	hash := func(token string) string {

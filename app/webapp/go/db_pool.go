@@ -37,9 +37,21 @@ func openDB(config *Config) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB := stdlib.OpenDB(*connConfig, stdlib.OptionShouldPing(func(_ context.Context, p stdlib.ShouldPingParams) bool {
+	options := []stdlib.OptionOpenDB{stdlib.OptionShouldPing(func(_ context.Context, p stdlib.ShouldPingParams) bool {
 		return p.IdleDuration > dbPingIdleThreshold
-	}))
+	})}
+	if preparedWarmEnabled(config.Region) {
+		// 前回のプロセスでよく実行した文面を、接続を張った直後に 1 往復で Prepare しておく (prepared_warm.go)。
+		if schema, err := schemaFingerprint(preparedWarmSchemaDir); err != nil {
+			fmt.Fprintf(os.Stderr, "prepared-warm: disabled: %v\n", err)
+		} else {
+			setWarmStatements(loadWarmStatementsFile(preparedWarmFile, schema))
+			connConfig.Tracer = executedStatements
+			options = append(options, stdlib.OptionAfterConnect(afterConnectWarm))
+			go saveHotStatementsLoop(preparedWarmFile, schema)
+		}
+	}
+	sqlDB := stdlib.OpenDB(*connConfig, options...)
 	sqlDB.SetMaxOpenConns(dbMaxConns(config.Region))
 	sqlDB.SetMaxIdleConns(dbMaxConns(config.Region))
 	sqlDB.SetConnMaxLifetime(dbConnMaxLifetime)
