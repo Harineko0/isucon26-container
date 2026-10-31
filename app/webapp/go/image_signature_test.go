@@ -150,8 +150,10 @@ func TestComputeImageSignatures_MatchesReference(t *testing.T) {
 			computeImageSignatures(requests)
 
 			for _, r := range requests {
-				got, ok := imageSignatures.get(signatureCacheKey{key: string(r.key), imageID: r.imageID, exp: r.exp})
-				if !ok {
+				imageSignatures.mu.RLock()
+				got := imageSignatures.cachedLocked(r.cacheKey())
+				imageSignatures.mu.RUnlock()
+				if got == nil {
 					t.Fatalf("signature for %s not cached", r.imageID)
 				}
 				if want := referenceImageSignature(r.key, r.imageID, r.exp); !bytes.Equal(got, want) {
