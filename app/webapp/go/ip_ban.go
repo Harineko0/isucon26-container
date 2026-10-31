@@ -13,6 +13,10 @@ import (
 
 const ipBanReloadInterval = 200 * time.Millisecond
 
+// ipBanPeerSettle は ip_bans を書き換えてから、ほかのリージョンの reloadLoop が新しい内容を
+// 読み終えるまでの上限。次の tick (ipBanReloadInterval) + asia2 との往復 (EU/US で約110ms) + 余裕。
+const ipBanPeerSettle = ipBanReloadInterval + 300*time.Millisecond
+
 type IPBanList struct {
 	reloading sync.Mutex
 	snapshot  atomic.Pointer[ipBanSnapshot]
@@ -24,7 +28,7 @@ func newIPBanList() *IPBanList {
 }
 
 type ipBanSnapshot struct {
-	loadedAt time.Time
+	loadedAt time.Time // SELECT を始めた時刻。これより後の書き込みは入っていないかもしれない
 	bans     map[string]time.Time
 }
 
@@ -45,8 +49,8 @@ func (l *IPBanList) Banned(ctx context.Context, db *sqlx.DB, ip string) (bool, e
 		if err != nil {
 			return false, err
 		}
-		l.snapshot.Store(loaded)
-		snapshot = loaded
+		l.store(loaded)
+		snapshot = l.snapshot.Load()
 		go l.reloadLoop(db)
 	}
 	if snapshot == nil {
@@ -92,12 +96,43 @@ func (l *IPBanList) reloadLoop(db *sqlx.DB) {
 		loaded, err := loadIPBans(ctx, db)
 		cancel()
 		if err == nil {
-			l.snapshot.Store(loaded)
+			l.store(loaded)
 		}
 	}
 }
 
+// store は s を、今あるものより後に読み始めたときだけ置く。reloadLoop の古い結果が
+// reloadNow の結果を上書きしないようにする。
+func (l *IPBanList) store(s *ipBanSnapshot) bool {
+	for {
+		cur := l.snapshot.Load()
+		if cur != nil && cur.loadedAt.After(s.loadedAt) {
+			return false
+		}
+		if l.snapshot.CompareAndSwap(cur, s) {
+			return true
+		}
+	}
+}
+
+// reloadNow は ip_bans をすぐ読み直す。initialize の TRUNCATE のあと、受けたサーバーが
+// 次の tick を待たずに前回のベンチの BAN を捨てるために使う (#41)。
+func (l *IPBanList) reloadNow(ctx context.Context, db *sqlx.DB) error {
+	loaded, err := loadIPBans(ctx, db)
+	if err != nil {
+		return err
+	}
+	l.store(loaded)
+	return nil
+}
+
+// ipBanPeerWait は ip_bans を since に書き換えたあと、ほかのリージョンが読み直し終えるまでの残り時間。
+func ipBanPeerWait(since, now time.Time) time.Duration {
+	return max(since.Add(ipBanPeerSettle).Sub(now), 0)
+}
+
 func loadIPBans(ctx context.Context, db *sqlx.DB) (*ipBanSnapshot, error) {
+	startedAt := time.Now()
 	var rows []ipBan
 	if err := db.SelectContext(ctx, &rows, `SELECT ip, banned_until FROM ip_bans WHERE banned_until > clock_timestamp()`); err != nil {
 		return nil, err
@@ -106,7 +141,7 @@ func loadIPBans(ctx context.Context, db *sqlx.DB) (*ipBanSnapshot, error) {
 	for _, row := range rows {
 		bans[row.IP] = row.BannedUntil
 	}
-	return &ipBanSnapshot{loadedAt: time.Now(), bans: bans}, nil
+	return &ipBanSnapshot{loadedAt: startedAt, bans: bans}, nil
 }
 
 func extractClientIP(req *http.Request) string {

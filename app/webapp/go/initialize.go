@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/labstack/echo/v5"
 )
@@ -23,6 +24,7 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := cmd.Run(); err != nil {
 			return err
 		}
+		resetAt := time.Now() // ip_bans の TRUNCATE はここまでに確定している
 		// ベンチが投稿した画像のファイルを、このサーバーと他のリージョンのサーバーの両方で捨てる
 		// (resetImageStore はメモリの imageDataStore も空にする)。
 		if err := resetImageStore(); err != nil {
@@ -33,6 +35,12 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		knownSessions.Clear()
 		// ip_bans は TRUNCATE された。アプリ内の BAN も捨てる (他のリージョンの分は localBanTTL で切れる)。
 		h.IPBans.abuse.reset()
+		// 前回のベンチの BAN を、このサーバーはすぐ、ほかのリージョンは次の読み直しで捨てる。
+		// 読み直し終わるまで待ってから返すので、応答の直後に来たリクエストが古い BAN で 403 にならない (#41)。
+		if err := h.IPBans.reloadNow(c.Request().Context(), h.DB); err != nil {
+			return err
+		}
+		time.Sleep(ipBanPeerWait(resetAt, time.Now()))
 		go loadInitialDataBoundary(h.DB)
 		go loadProfileImageHints(h.DB)
 		go refreshSearchNorms(h.DB)
