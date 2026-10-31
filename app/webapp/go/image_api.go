@@ -67,21 +67,26 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
    , false) AS allowed
    FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
    WHERE i.id = $1`
+		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
+		if err != nil {
+			return err
+		}
 		hinted := false
 		if createdAt, ok := imageCreatedAt.Load(input.ImageID); ok {
 			// 範囲の両端は STABLE な式 (timestamptz ± interval) にして、プラン時ではなく実行開始時に刈り込ませる。
 			// 定数 (= $3) のままだとプラン時に 1 パーティションへ刈り込めるカスタムプランの方が安く見えて
 			// 汎用プランに切り替わらず、毎回プランニング (実測 ~1ms) が走る。この形なら 5 回目以降は汎用プラン
 			// (プランニング ~0.05ms、実行開始時に 35 パーティションを除外) になる。
-			err = h.DB.GetContext(ctx, &object, imageQuery+` AND i.created_at BETWEEN $3::timestamptz - interval '1 hour' AND $3::timestamptz + interval '0 seconds'`, input.ImageID, hasData, createdAt.(time.Time))
+			err = conn.GetContext(ctx, &object, imageQuery+` AND i.created_at BETWEEN $3::timestamptz - interval '1 hour' AND $3::timestamptz + interval '0 seconds'`, input.ImageID, hasData, createdAt.(time.Time))
 			hinted = err == nil
 			if errors.Is(err, sql.ErrNoRows) {
 				// 手がかりが外れていた場合に備えて id だけで引き直す。
-				err = h.DB.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
+				err = conn.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
 			}
 		} else {
-			err = h.DB.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
+			err = conn.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
 		}
+		conn.Close()
 		if err == nil && !hinted {
 			imageCreatedAt.Store(input.ImageID, object.CreatedAt)
 		}
