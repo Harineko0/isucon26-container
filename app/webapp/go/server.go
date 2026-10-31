@@ -24,6 +24,13 @@ func NewServer(config *Config) *echo.Echo {
 	e := echo.New()
 	e.IPExtractor = extractClientIP
 
+	setInternalSecret(config)
+	if err := ensureImageStoreDirs(); err != nil {
+		panic("failed to prepare image store: " + err.Error())
+	}
+	go removeImageStoreTrash()
+	startImagePushers(config.Region)
+
 	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout))
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
@@ -54,6 +61,7 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans:  &IPBanList{},
 		Windows: newPostingWindowWatcher(db, config.Region),
 	}
+	e.Pre(InternalMiddleware(handlerContext))
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)
 

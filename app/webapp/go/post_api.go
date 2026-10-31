@@ -89,7 +89,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 投稿時刻 (posted_at) は isureal_create_post の中で DB の時計から決まり、o_posted_at で返る
 		// (投稿期間の starts_at / ended_at と同じ時計にそろえる。アプリの時計で先に決めると、
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
-		imageID := uuid.NewString()
+		imageID := newImageID(h.Config.Region)
 		postID := uuid.NewString()
 		var row struct {
 			SessRegion     *string    `db:"sess_region"`
@@ -110,16 +110,20 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			AccountType    *string    `db:"o_account_type"`
 			Status         *string    `db:"o_status"`
 		}
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			imageID, postID, imageData, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality); err != nil {
+		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			imageID, postID, dbImageData, input.Caption, input.Visibility,
+			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion); err != nil {
 			return err
 		}
 		switch row.Result {
 		case "ok":
 		case "slot_unavailable":
+			discardUploadedImage(imageID, storedRegion)
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
 		default:
+			discardUploadedImage(imageID, storedRegion)
 			return sql.ErrNoRows
 		}
 		user := User{
@@ -136,6 +140,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		imageDataStore.put(imageID, imageData)
+		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
 }

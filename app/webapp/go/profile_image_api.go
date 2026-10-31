@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -31,15 +30,19 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
-		imageID := uuid.NewString()
+		imageID := newImageID(h.Config.Region)
+		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
 		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_put_profile_image($1, $2, $3)`, GetSession(c).UserID, imageID, data); err != nil {
+		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_put_profile_image($1, $2, $3, $4)`, GetSession(c).UserID, imageID, dbData, storedRegion); err != nil {
 			return err
 		}
 		if result != "ok" {
+			discardUploadedImage(imageID, storedRegion)
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		imageDataStore.put(imageID, data)
+		enqueueImagePush(imageID, data, storedRegion, h.Config.Region)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
