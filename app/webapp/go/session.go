@@ -356,31 +356,32 @@ func callWithSessionColumns(c *echo.Context, h *HandlerContext, dest any, sessRe
 		query := `SELECT NULL::text AS sess_region, ` + columns + ` FROM ` + strings.ReplaceAll(call, "{user}", fmt.Sprintf("$%d", len(args))) + ` r`
 		return h.DB.GetContext(ctx, dest, query, args...)
 	}
+	query := deferredMutationSQL(columns, call, len(args))
 	args = append(args, tokenHash, h.Config.Region)
-	n := len(args)
-	query := fmt.Sprintf(`
+	err := h.DB.GetContext(ctx, dest, query, args...)
+	return finishDeferredMutation(c, h, tokenHash, sessRegion(), err)
+}
+
+// Check the token and region in the statement that performs the mutation.
+// Statements sent in a pipeline use the same shape as individual calls.
+func deferredMutationSQL(columns, call string, numArgs int) string {
+	return fmt.Sprintf(`
 		SELECT s.sess_region, %s FROM (
 			SELECT s.user_id AS sess_user_id, u.region AS sess_region
 			FROM login_sessions s JOIN users u ON u.id = s.user_id
 			WHERE s.token_hash = $%d AND s.active = true AND u.status = 'active'
 		) s LEFT JOIN LATERAL (SELECT * FROM %s WHERE s.sess_region = $%d OFFSET 0) r ON true`,
-		columns, n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
-	err := h.DB.GetContext(ctx, dest, query, args...)
+		columns, numArgs+1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), numArgs+2)
+}
+
+func finishDeferredMutation(c *echo.Context, h *HandlerContext, tokenHash string, region *string, err error) error {
 	if errors.Is(err, sql.ErrNoRows) {
-		c.Set(deferredSessionCheckedKey, true)
-		knownSessions.Delete(tokenHash)
-		c.Set("session", nil)
-		return NewAPIError(http.StatusUnauthorized, "invalid_session")
+		return rejectDeferredSession(c, h, tokenHash, false, "")
 	}
 	if err != nil {
 		return err
 	}
-	c.Set(deferredSessionCheckedKey, true)
-	if region := sessRegion(); region == nil || *region != h.Config.Region {
-		knownSessions.Delete(tokenHash)
-		return NewAPIError(http.StatusForbidden, "region_mismatch")
-	}
-	return nil
+	return finishWithSession(c, h, tokenHash, true, true, region)
 }
 
 // sessionSource は読み取りの 1 文に同居させるセッションの FROM 句の要素 `s` (sess_user_id, sess_region) を返す。

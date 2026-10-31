@@ -287,13 +287,38 @@ func buildFeedFriendsQuery(regionParam, tokenParam int) string {
   )` + feedUnrankedTail
 }
 
-// following: 著者がフォロー先で、閲覧可否は canView と同じ。
-// 「著者が友達の友達（mutual）」は、著者と閲覧者の友達の間に友達関係があること（著者 <> 閲覧者は上で保証）。
+// フォローが少なければ著者×期間を posts_author_window で直接引く。多いときは
+// 全著者分の索引探索より開いている期間の投稿を一度読む方が安い。候補の絞り方だけを
+// 切り替え、公開範囲やブロック・カーソルの判定は共通にする。PG16・有効投稿約 2,000 件の
+// ローカル比較では 50 人で著者索引、500 人で期間索引が速かったので 64 人で切り替える。
 func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 	return `
-  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedUnrankedCandidateBase + `
-      AND (p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)) IS TRUE
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
+  followees AS MATERIALIZED (
+    SELECT followee_id FROM follows WHERE follower_id = $1
+  ),
+  many_followees AS (SELECT EXISTS(SELECT 1 FROM followees OFFSET 64) AS use_window_scan),
+  following_posts AS (
+    SELECT p.* FROM followees f
+    CROSS JOIN posting_windows w
+    CROSS JOIN LATERAL (
+      SELECT ` + postColumns + `
+      FROM posts p
+      WHERE p.author_id = f.followee_id AND p.posting_window_id = w.id AND p.deleted_at IS NULL
+      OFFSET 0
+    ) p
+    WHERE w.ended_at IS NULL AND NOT (SELECT use_window_scan FROM many_followees)
+    UNION ALL
+    SELECT ` + postColumns + `
+    FROM posting_windows w JOIN posts p ON p.posting_window_id = w.id
+    WHERE w.ended_at IS NULL AND p.deleted_at IS NULL AND (SELECT use_window_scan FROM many_followees)
+      AND (p.author_id IN (SELECT followee_id FROM followees)) IS TRUE
+  ),
+  candidates AS (
+    SELECT p.* FROM following_posts p
+    WHERE (SELECT has_posted_today FROM viewer) AND p.author_id <> $1
+      AND p.author_id NOT IN (SELECT id FROM blocked)
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
       AND (p.visibility = 'public'
            OR (p.visibility = 'friends' AND p.author_id IN (SELECT id FROM friends))
            OR (p.visibility = 'friends_of_friends' AND (
