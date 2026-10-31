@@ -17,6 +17,32 @@ type exportPostResponse struct {
 	ImagePath string `json:"imagePath"`
 }
 
+type exportPostRow struct {
+	SessRegion *string `db:"sess_region"`
+	UserFound  bool    `db:"user_found"`
+	PostFound  bool    `db:"post_found"`
+	PostWithAuthor
+}
+
+// The archive has one author. Attach their columns only to the first post
+// (or the sentinel row for an empty archive), in the same session snapshot.
+var exportPostsQuery = `
+   SELECT s.sess_region, u.id IS NOT NULL AS user_found, p.id IS NOT NULL AS post_found,
+          ` + postWithAuthorColumnsCoalesced("r") + `
+   FROM {session}
+   LEFT JOIN users u ON u.id = s.sess_user_id AND u.status = 'active'
+     AND (s.sess_region IS NULL OR s.sess_region = $1)
+   LEFT JOIN LATERAL (
+     SELECT ` + postColumns + `, row_number() OVER (ORDER BY p.posted_at, p.id) AS position
+     FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+     WHERE p.author_id = u.id AND p.deleted_at IS NULL
+   ) p ON true
+   LEFT JOIN LATERAL (SELECT ` + userColumnsAs("u", "author") + `) a
+     ON p.position = 1 OR p.position IS NULL
+   CROSS JOIN LATERAL (SELECT p.*, a.*) r
+   ORDER BY p.posted_at, p.id
+`
+
 func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
@@ -25,37 +51,13 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		// 下で画像を集めたあとに画像が見つからなかった投稿を外す (結果は同じ)。SQL で EXISTS を引くと、投稿ごとに
 		// image_objects の索引を 1 回ずつ引き、export の読み取りの約 6 割 (実測 1 回 331 件で 206 ページを disk から) を占めていた。
 		// 投稿画像は isureal_create_post で投稿と同じトランザクションで作られ、投稿画像を消す処理は無いので、実際に外れる投稿は無い。
-		var exportRows []struct {
-			SessRegion *string `db:"sess_region"`
-			UserFound  bool    `db:"user_found"`
-			PostFound  bool    `db:"post_found"`
-			PostWithAuthor
-		}
+		var exportRows []exportPostRow
 		if err := selectWithSession(c, h, &exportRows, func() (int, *string) {
 			if len(exportRows) == 0 {
 				return 0, nil
 			}
 			return len(exportRows), exportRows[0].SessRegion
-		}, `
-   SELECT s.sess_region, u."author.id" IS NOT NULL AS user_found, p.id IS NOT NULL AS post_found,
-          `+postWithAuthorColumnsCoalesced("r")+`
-   FROM {session}
-   LEFT JOIN LATERAL (
-     SELECT `+userColumnsAs("u", "author")+`
-     FROM users u
-     WHERE (s.sess_region IS NULL OR s.sess_region = $1)
-       AND u.id = s.sess_user_id AND u.status = 'active'
-   ) u ON true
-   LEFT JOIN LATERAL (
-     SELECT `+postColumns+`
-     FROM posts p
-     JOIN posting_windows w ON w.id = p.posting_window_id
-     WHERE u."author.id" IS NOT NULL AND p.author_id = s.sess_user_id AND p.deleted_at IS NULL
-     ORDER BY p.posted_at, p.id
-   ) p ON true
-   CROSS JOIN LATERAL (SELECT p.*, u.*) r
-   ORDER BY p.posted_at, p.id
-  `, h.Config.Region); err != nil {
+		}, exportPostsQuery, h.Config.Region); err != nil {
 			return err
 		}
 		if len(exportRows) == 0 || !exportRows[0].UserFound {

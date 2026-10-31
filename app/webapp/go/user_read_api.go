@@ -32,6 +32,47 @@ func normalizeSearchText(value string) string {
 	return norm.NFC.String(cases.Fold().String(norm.NFC.String(value)))
 }
 
+// 正規化済みの一致は 51 件あれば足りる。登録・改名と同じトランザクションで dirty に
+// 入った利用者だけは Go で実際の名前を照合するので、51 件目より前の候補をすべて返す。
+// 51 件に満たなければ cutoff は空になり、該当する dirty の行をすべて調べる。
+// 名前の LIKE の内側に OFFSET 0 を置き、一致しない候補までブロック集合を照合しないようにする。
+var searchUsersQuery = `
+  SELECT s.sess_region, r.id IS NOT NULL AS found,
+         ` + userColumnsCoalesced("r", "") + `, COALESCE(r.stale, false) AS stale
+  FROM {session}
+  LEFT JOIN LATERAL (
+    WITH blocked AS (
+      SELECT blocked_id AS id FROM block_relations WHERE blocker_id = s.sess_user_id
+      UNION ALL
+      SELECT blocker_id AS id FROM block_relations WHERE blocked_id = s.sess_user_id
+    ), eligible AS NOT MATERIALIZED (
+      SELECT ` + strings.Join(userColumns, ", ") + ` FROM users u
+      WHERE (s.sess_region IS NULL OR s.sess_region = $4)
+        AND u.status = 'active' AND u.id <> s.sess_user_id
+        AND ($1 = '' OR (u.username, u.id) > ($1, $2))
+    ), matches AS MATERIALIZED (
+      SELECT u.* FROM (
+        SELECT user_id, display_name FROM user_search_norms
+        WHERE username_norm LIKE $3 OR display_name_norm LIKE $3
+        OFFSET 0
+      ) sn JOIN eligible u ON u.id = sn.user_id AND sn.display_name = u.display_name
+      WHERE sn.user_id NOT IN (SELECT id FROM blocked)
+      ORDER BY u.username, u.id LIMIT 51
+    )
+    SELECT m.*, false AS stale FROM matches m
+    UNION ALL
+    SELECT u.*, true AS stale FROM user_search_dirty d JOIN eligible u ON u.id = d.user_id
+    LEFT JOIN user_search_norms sn ON sn.user_id = d.user_id
+    WHERE sn.display_name IS DISTINCT FROM u.display_name
+      AND d.user_id NOT IN (SELECT id FROM blocked)
+      AND NOT EXISTS (
+        SELECT 1 FROM (SELECT username, id FROM matches ORDER BY username, id OFFSET 50) cutoff
+        WHERE (u.username, u.id) >= (cutoff.username, cutoff.id)
+      )
+  ) r ON true
+  ORDER BY r.username, r.id
+`
+
 func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input searchUsersRequest
@@ -45,63 +86,18 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		query := normalizeSearchText(input.Q)
-		// 正規化済みの名前 (user_search_norms) で DB 側で照合し、51 件目の一致までだけを返す。
-		// 正規化が古い・未作成の利用者 (stale) はアプリで照合する。
-		// 候補は trigram 索引で引いた一致と、名前が変わって正規化が追いついていない利用者
-		// (user_search_dirty、users のトリガーで記録) に限り、全 active 利用者は並べ替えない (#26)。
-		// dirty のうち正規化が今の名前に追いついている (または消えた) 利用者は候補にしない。
-		// 混ぜると候補が数百件になり、users と正規化の表を全件読むプランになる (#97)。
-		// 候補の 2 つの枝は重ならないように分け (UNION ALL)、正規化の行は枝の中で読んだものをそのまま使う。
-		// 以前は候補の id を UNION で重複除去してから users と正規化の表を引き直していた (正規化を候補ごとに 2 回読む)。
-		//   - 一致の枝: trigram 索引で引いた正規化の行 sn と、その利用者 u。stale / matched は以前と同じ式。
-		//   - dirty の枝: 正規化が無い・今の表示名と違う利用者のうち、一致の枝に出ないもの (sn が無いか、sn が一致しない)。
-		//     sn.display_name IS DISTINCT FROM u.display_name なので stale は真、matched は偽 (以前の式でも同じ値)。
 		var rows []struct {
 			SessRegion *string `db:"sess_region"`
 			Found      bool    `db:"found"`
 			User
-			Stale   bool `db:"stale"`
-			Matched bool `db:"matched"`
+			Stale bool `db:"stale"`
 		}
 		if err := selectWithSession(c, h, &rows, func() (int, *string) {
 			if len(rows) == 0 {
 				return 0, nil
 			}
 			return len(rows), rows[0].SessRegion
-		}, `
-  SELECT s.sess_region, r.id IS NOT NULL AS found,
-         `+userColumnsCoalesced("r", "")+`,
-         COALESCE(r.stale, false) AS stale, COALESCE(r.matched, false) AS matched
-  FROM {session}
-  LEFT JOIN LATERAL (
-    WITH cand AS (
-      SELECT u.*, sn.display_name IS DISTINCT FROM u.display_name AS stale,
-        COALESCE(sn.display_name = u.display_name AND (strpos(sn.username_norm, $3) > 0 OR strpos(sn.display_name_norm, $3) > 0), false) AS matched
-      FROM user_search_norms sn JOIN users u ON u.id = sn.user_id
-      WHERE sn.username_norm LIKE $4 OR sn.display_name_norm LIKE $4
-      UNION ALL
-      SELECT u.*, true AS stale, false AS matched
-      FROM user_search_dirty d JOIN users u ON u.id = d.user_id
-      LEFT JOIN user_search_norms sn ON sn.user_id = d.user_id
-      WHERE sn.display_name IS DISTINCT FROM u.display_name
-        AND NOT COALESCE(sn.username_norm LIKE $4 OR sn.display_name_norm LIKE $4, false)
-    )
-    SELECT `+strings.Join(userColumns, ", ")+`, stale, matched FROM (
-      SELECT c.*, count(*) FILTER (WHERE c.matched) OVER (ORDER BY c.username, c.id) AS n
-      FROM cand c
-      WHERE (s.sess_region IS NULL OR s.sess_region = $5)
-        AND c.status = 'active' AND c.id <> s.sess_user_id AND ($1 = '' OR (c.username, c.id) > ($1, $2))
-        AND NOT EXISTS (SELECT 1 FROM block_relations b
-                        WHERE b.blocker_id = s.sess_user_id AND b.blocked_id = c.id
-                        UNION ALL
-                        SELECT 1 FROM block_relations b
-                        WHERE b.blocked_id = s.sess_user_id AND b.blocker_id = c.id)
-    ) x
-    WHERE (matched AND n <= 51) OR (stale AND n < 51)
-    ORDER BY username, id
-  ) r ON true
-  ORDER BY r.username, r.id
- `, searchQueryArgs(query, input.BeforeUsername, input.BeforeID, query, "%"+escapeLike(query)+"%", h.Config.Region)...); err != nil {
+		}, searchUsersQuery, searchQueryArgs(query, input.BeforeUsername, input.BeforeID, "%"+escapeLike(query)+"%", h.Config.Region)...); err != nil {
 			return err
 		}
 		matchedUsers := make([]User, 0, 51)
@@ -199,10 +195,12 @@ func newRelationshipUserResponse(user User) relationshipUserResponse {
 	return relationshipUserResponse{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, ProfileImageURL: newGetMeResponse(user).ProfileImageURL, Bio: user.Bio, AccountType: user.AccountType}
 }
 
+var searchLikeEscaper = strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`)
+
 // escapeLike は LIKE の特殊文字をエスケープする (既定のエスケープ文字は \)。
 // strpos(s, q) > 0 と s LIKE '%' || escapeLike(q) || '%' は同じ結果になる。
 func escapeLike(s string) string {
-	return strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(s)
+	return searchLikeEscaper.Replace(s)
 }
 
 // saveSearchNorms は利用者名と表示名の検索用の正規化を保存する。表示名ごとに保存するので、
