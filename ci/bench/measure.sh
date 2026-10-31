@@ -61,6 +61,12 @@ case $cmd in
       tr -d '\r' <"$ROOT/alp.sh" | timeout 60 ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes "$(host_addr "$h")" 'bash -s 20' \
         >"$dir/alp-$h.txt" 2>>"$dir/stderr.log" || echo "warn: measure: alp failed on $h"
     done
+    # 配った sql/ に定義が無い DB の物 (前の PR のベンチの残骸。initialize では消えない)。読み取りだけ。
+    # asia1 の ~/webapp/sql (この run で配った版) と ~/env.sh を使う。終了コード 1 は「残骸あり」なので失敗扱いにしない。
+    tr -d '\r' <"$ROOT/app/webapp/sql/tests/leftover_objects.sh" |
+      timeout 30 ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes "$(host_addr asia1)" 'cd ~/webapp/sql/tests && bash -s' \
+      >"$dir/leftovers.txt" 2>&1
+    [ $? -le 1 ] || echo "warn: measure: leftover check failed"
 
     {
       echo "app@${APP_SHA:-unknown} / job #$(cat "${STATE_DIR:-.}/job_id" 2>/dev/null || echo '?') / 計測開始 $(cat "$dir/started_at" 2>/dev/null || echo '?')"
@@ -92,6 +98,11 @@ case $cmd in
       echo '```'
       echo "calls | total_ms | mean_ms | rows | query"
       head -n 15 "$dir/pg-top.txt" | cut -c1-200
+      echo '```'
+      echo
+      echo "#### 配った sql/ に定義が無い DB の物（前の PR のベンチの残骸。initialize では消えない）"
+      echo '```'
+      cat "$dir/leftovers.txt" 2>/dev/null || echo "(no data)"
       echo '```'
       for h in $APPS; do
         echo
