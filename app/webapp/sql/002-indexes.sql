@@ -127,3 +127,14 @@ EXCEPTION
   WHEN lock_not_available THEN
     RAISE NOTICE 'dropping users foreign keys skipped: lock not available';
 END $$;
+
+-- 実験の PR #225（close 済み、マージしていない）のベンチの initialize で作られた物を消す。users への書き込みの
+-- たびに文レベルのトリガーが cache_versions の 1 行を更新するので、書き込みがこの行で直列化されていた
+-- （main d0ce88b のベンチで UPDATE cache_versions が 1,690 回・平均 62.7ms・合計 106 秒で DB 時間の 1 位）。
+-- main のコードはどれも使っていない。何度流しても失敗しない。
+DROP TRIGGER IF EXISTS users_changes_insert ON users;
+DROP TRIGGER IF EXISTS users_changes_update ON users;
+DROP TRIGGER IF EXISTS users_changes_delete ON users;
+DROP FUNCTION IF EXISTS isureal_users_changed();
+DROP TABLE IF EXISTS users_changes;
+DROP TABLE IF EXISTS cache_versions;
