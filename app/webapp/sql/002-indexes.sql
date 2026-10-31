@@ -67,18 +67,33 @@ EXCEPTION
   WHEN lock_not_available THEN
     RAISE NOTICE 'gin fastupdate=off skipped: lock not available';
 END $$;
-CREATE TABLE IF NOT EXISTS user_search_dirty (user_id text PRIMARY KEY);
+-- dirty の行は利用者の今の表示名を持つ (トリガーが改名と同じトランザクションで書く)。正規化の保存と dirty の掃除は
+-- この行をロックし、表示名が一致するときだけ dirty から外すので、並行する改名を取りこぼさない (#148)。
+CREATE TABLE IF NOT EXISTS user_search_dirty (user_id text PRIMARY KEY, display_name text);
+-- 表示名の列は後から足した (#148)。足してあれば ALTER TABLE (ACCESS EXCLUSIVE) を取らない。
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'user_search_dirty'::regclass
+                 AND attname = 'display_name' AND NOT attisdropped) THEN
+    ALTER TABLE user_search_dirty ADD COLUMN IF NOT EXISTS display_name text;
+  END IF;
+END $$;
 CREATE OR REPLACE FUNCTION isureal_mark_search_dirty() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  INSERT INTO user_search_dirty (user_id) VALUES (NEW.id) ON CONFLICT DO NOTHING;
+  INSERT INTO user_search_dirty (user_id, display_name) VALUES (NEW.id, NEW.display_name)
+  ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name;
   RETURN NULL;
 END $$;
 CREATE OR REPLACE TRIGGER users_search_dirty_insert AFTER INSERT ON users
   FOR EACH ROW EXECUTE FUNCTION isureal_mark_search_dirty();
 CREATE OR REPLACE TRIGGER users_search_dirty_update AFTER UPDATE OF display_name ON users
   FOR EACH ROW WHEN (OLD.display_name IS DISTINCT FROM NEW.display_name) EXECUTE FUNCTION isureal_mark_search_dirty();
-INSERT INTO user_search_dirty (user_id)
-  SELECT u.id FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
+-- 列を足す前からある行 (表示名が NULL) を埋める。NULL の行だけなので、並行する改名が書いた表示名は上書きしない。
+UPDATE user_search_dirty d SET display_name = u.display_name FROM users u
+  WHERE u.id = d.user_id AND d.display_name IS NULL;
+-- 既にある行はトリガーが今の表示名を書いているので触らない (DO NOTHING)。
+INSERT INTO user_search_dirty (user_id, display_name)
+  SELECT u.id, u.display_name FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
   WHERE s.display_name IS DISTINCT FROM u.display_name
   ON CONFLICT DO NOTHING;
 

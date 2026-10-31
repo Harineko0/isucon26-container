@@ -6,6 +6,13 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 
 ポータルや AWS コンソールなどブラウザ操作が必要なときは、**必ずユーザーの Chrome（Claude in Chrome、`mcp__claude-in-chrome__*`）を使う**。Claude の in-app browser（`mcp__Claude_Browser__*`）は使わない（ポータルや AWS にログインしていないため）。サインイン画面が出たら自分でログインせず、ユーザーに Chrome でのログインを頼む。
 
+## 作業は worktree で
+
+- **ファイルを書き換える作業は、必ず `origin/main` から切った git worktree で行う**。`/Users/hari/proj/isucon26`（main のチェックアウト）は複数のセッションが同時に開いているので、そこで編集・commit・ブランチ切り替えをしない（他のセッションの変更と混ざり、誰の変更か分からない未コミットの差分が main に残る）。
+- 作り方: `git fetch origin && git worktree add -b <ブランチ名> ../isucon26-<短い名前> origin/main`。以後の編集・commit・push・PR はその worktree の中で行う。
+- main のチェックアウトでしてよいのは読み取り（`git log` / `git diff` / ファイルを読む）と、`git pull --ff-only` で最新にすることだけ。
+- PR がマージされたら、その worktree は `git worktree remove ../isucon26-<短い名前>` で片付ける。
+
 ## 競技の基本
 
 - 10:00 開始 / 17:00 リーダーボード凍結 / 18:00 終了。**最終スコア = 最後に回したベンチ**（FAIL なら記録なし）。17:30 以降は安定版のみ回す。
