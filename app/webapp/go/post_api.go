@@ -125,7 +125,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 投稿時刻 (posted_at) は isureal_create_post の中で DB の時計から決まり、o_posted_at で返る
 		// (投稿期間の starts_at / ended_at と同じ時計にそろえる。アプリの時計で先に決めると、
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
-		imageID := newTimeID()
+		imageID := newImageID(h.Config.Region)
 		postID := newTimeID()
 		// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、全部ポインタで受ける
 		// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
@@ -148,12 +148,16 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			AccountType    *string    `db:"o_account_type"`
 			Status         *string    `db:"o_status"`
 		}
+		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		// ディスクへの書き込みは gate の外で済ませ、gate では DB の呼び出しだけを絞る。
+		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
 		if err := gate.acquire(c.Request().Context()); err != nil {
+			discardUploadedImage(imageID, storedRegion)
 			return err
 		}
-		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			imageID, postID, imageData, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality)
+		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			imageID, postID, dbImageData, input.Caption, input.Visibility,
+			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion)
 		gate.release()
 		if err != nil {
 			return err
@@ -164,8 +168,10 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		switch *row.Result {
 		case "ok":
 		case "slot_unavailable":
+			discardUploadedImage(imageID, storedRegion)
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
 		default:
+			discardUploadedImage(imageID, storedRegion)
 			return sql.ErrNoRows
 		}
 		user := User{
@@ -182,6 +188,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		imageDataStore.put(imageID, imageData)
+		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
 }

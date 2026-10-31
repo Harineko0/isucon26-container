@@ -42,17 +42,21 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		cached, hasData := imageDataStore.get(input.ImageID)
+		if !hasData {
+			prefetchStoredImage(input.ImageID, h.Config.Region)
+		}
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
 		var object struct {
 			SecretKeyHash string    `db:"secret_key_hash"`
 			MediaType     string    `db:"media_type"`
 			Data          []byte    `db:"data"`
+			StoredRegion  *string   `db:"stored_region"`
 			Allowed       bool      `db:"allowed"`
 			CreatedAt     time.Time `db:"created_at"`
 		}
 		// 画像の created_at は不変なので、手がかり (imageCreatedAt) があれば created_at の範囲も付けてパーティションを絞る。
 		imageQuery := `
-   SELECT u.secret_key_hash, i.media_type, i.created_at, CASE WHEN $2 THEN NULL ELSE i.data END AS data, COALESCE(
+   SELECT u.secret_key_hash, i.media_type, i.created_at, CASE WHEN $2 THEN NULL ELSE i.data END AS data, i.stored_region, COALESCE(
      u.profile_image_id = i.id
      OR EXISTS (
        SELECT 1 FROM posts p
@@ -109,6 +113,17 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		if hasData {
 			object.Data = cached
+		} else if object.StoredRegion != nil && len(object.Data) == 0 {
+			// 本体は stored_region のサーバーのディスクにある (image_store.go)。
+			data, err := loadStoredImage(input.ImageID, *object.StoredRegion, h.Config.Region)
+			if err != nil {
+				// 先読みが失敗していた (その結果を受け取った) 場合に備えて、1 回だけ取り直す。
+				data, err = loadStoredImage(input.ImageID, *object.StoredRegion, h.Config.Region)
+			}
+			if err != nil {
+				return err
+			}
+			object.Data = data
 		} else {
 			imageDataStore.put(input.ImageID, object.Data)
 			saveInitialImageToDisk(input.ImageID, object.CreatedAt, object.Data)

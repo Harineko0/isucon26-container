@@ -23,7 +23,12 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := cmd.Run(); err != nil {
 			return err
 		}
-		imageDataStore.reset()
+		// ベンチが投稿した画像のファイルを、このサーバーと他のリージョンのサーバーの両方で捨てる
+		// (resetImageStore はメモリの imageDataStore も空にする)。
+		if err := resetImageStore(); err != nil {
+			return err
+		}
+		resetPeerImageStores(h.Config.Region)
 		// login_sessions は作り直されるので、覚えていたセッションも捨てる (他のリージョンの分は DB の確認で外れる)。
 		knownSessions.Clear()
 		// ip_bans は TRUNCATE された。アプリ内の BAN も捨てる (他のリージョンの分は localBanTTL で切れる)。
