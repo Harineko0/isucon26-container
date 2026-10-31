@@ -16,6 +16,13 @@ if [ "${1:-}" = -n ]; then DRY=1; shift; fi
 HOSTS="${*:-$ALL_HOSTS}"
 TS=$(date +%Y%m%d-%H%M%S)
 
+# The versioned binary is self-contained. Only the asia1 service runs it.
+if [ -z "$DRY" ] && [[ " $HOSTS " == *" asia1 "* ]] &&
+    ! $SSH "$(host_addr asia1)" 'test -x /usr/local/lib/isureal/pgbouncer-1.26.1'; then
+  docker buildx build --platform linux/amd64 \
+    --output "type=local,dest=$INFRA_DIR/hosts/asia1/usr/local/lib/isureal" "$INFRA_DIR/pgbouncer"
+fi
+
 # -a は使わない（/ や /etc の所有者・権限が手元のものに置き換わる）。
 # 既存ファイルの所有者と権限はそのまま、新規ファイルは root 所有になる。
 RSYNC_OPTS=(-rlc --no-perms --no-owner --no-group --omit-dir-times
@@ -43,10 +50,11 @@ deploy_host() {
   local cmds=()
   if grep -q '^etc/systemd/' <<<"$changed"; then
     cmds+=("sudo systemctl daemon-reload")
-    grep -q '^etc/systemd/system/isureal-go.service$' <<<"$changed" &&
-      cmds+=("sudo systemctl restart isureal-go")
     grep -q '^etc/systemd/system/postgresql' <<<"$changed" &&
       cmds+=("echo 'NOTE: PostgreSQL の unit を変えた。効かせるには sudo systemctl restart postgresql@16-main'")
+  fi
+  if grep -Eq '^(etc/systemd/system/isureal-go.service$|etc/isureal/pgbouncer.ini$|usr/local/libexec/isureal-with-pool$|usr/local/lib/isureal/pgbouncer-)' <<<"$changed"; then
+    cmds+=("sudo systemctl restart isureal-go && timeout 30 bash -c 'until systemctl is-active --quiet isureal-go && ss -Hltn \"sport = :8080\" | grep -q .; do sleep 1; done' || echo 'ERROR: isureal-go did not start'")
   fi
   grep -q '^etc/nginx/' <<<"$changed" &&
     cmds+=("sudo nginx -t -q && sudo systemctl reload nginx || echo 'ERROR: nginx -t failed; 旧設定のまま動作中。/var/tmp/infra-backup/$TS から戻す'")
