@@ -9,6 +9,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 ## 競技の基本
 
 - 10:00 開始 / 17:00 リーダーボード凍結 / 18:00 終了。**最終スコア = 最後に回したベンチ**（FAIL なら記録なし）。17:30 以降は安定版のみ回す。
+- 16:30 の 4 台再起動リハーサル、17:30 以降の最終ベンチ、終了時チェックは [docs/final-runbook.md](docs/final-runbook.md) の手順で**人が**行う（エージェントは再起動・ベンチ投入をしない）。
 - ベンチはポータル（<https://portal.isucon.net/contestant/benchmark_jobs>）のジョブとして走る。PENDING/RUNNING の間は次を投げられない＝チームで同時に 1 本。1 回あたり約 2 分。初回スコアは #448 の **3465**（10:17、無改修）。
 
 ## ベンチとデプロイは CI だけ（[ci/README.md](ci/README.md)）
@@ -19,6 +20,8 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 - 手元から `deploy.sh` / `infra/deploy.sh` / `smoke.sh` を実行しない、ポータルの Enqueue を押さない、サーバで再起動・設定変更・DB 書き込みをしない。他の人のベンチ中にサーバが変わると、どの変更でスコアが動いたか分からなくなる。スクリプトのガードと Claude Code の hook（`.claude/hooks/guard-bench.py`）が止める。
 - 読み取り（ssh での `journalctl` / `top` / `cat`、DB への `SELECT` / `EXPLAIN`、ルーターへの GET、`infra/deploy.sh -n`）は自由。
 - 17:30 以降は main 以外のベンチを CI が拒否する。
+- PR コメントの「計測」に、その run だけの pg_stat_statements・alp・vmstat・DB wait が載る（統計のリセットは CI がベンチ直前に行う。手元からリセットしない）。
+- 索引を足すときは、initialize の中で作らない。作るのに 1 秒を超える表（notifications・realmojis・posts・comments など）は、人が asia2 で先に `CREATE INDEX CONCURRENTLY` してから 002 に `IF NOT EXISTS` で書く（実測と理由は [ci/README.md](ci/README.md)「索引の追加と initialize の時間」）。
 - スコア = Σ(採点件数 × 配点 × リージョン倍率)。倍率は asia 1 / **europe 1.5 / america 1.5**。配点表は manual.md「スコアの計算」。
 
 ## 環境（CloudFormation スタック `isucon-prod-2`、ap-northeast-1）
