@@ -273,7 +273,7 @@ func getPostHandler(h *HandlerContext) echo.HandlerFunc {
    FROM {session}
    LEFT JOIN LATERAL (
      SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
-     FROM isureal_post_access(s.sess_user_id, $1) a
+     FROM isureal_post_access_read(s.sess_user_id, $1) a
      JOIN posts p ON a.can_view AND p.id = $1 AND p.deleted_at IS NULL
      JOIN posting_windows w ON w.id = p.posting_window_id
      JOIN users u ON u.id = p.author_id AND u.status = 'active'
