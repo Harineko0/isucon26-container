@@ -89,7 +89,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
 		var input createPostRequest
-		if err := c.Bind(&input); err != nil {
+		formImage, err := bindImageForm(c, &input)
+		if err != nil {
 			return err
 		}
 		if input.Image == nil || !validUserText(input.Caption, 0, 1000) {
@@ -107,13 +108,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if !location.valid() {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		imageFile, err := input.Image.Open()
-		if err != nil {
-			return err
-		}
-		defer imageFile.Close()
-		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
-		imageData, err := readUpload(imageFile, input.Image.Size)
+		imageData, err := readFormImage(input.Image, formImage)
 		if err != nil {
 			return err
 		}

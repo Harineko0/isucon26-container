@@ -36,7 +36,8 @@ func newRealMojiResponse(reaction RealMoji, user User) replaceRealMojiResponse {
 func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input replaceRealMojiRequest
-		if err := c.Bind(&input); err != nil {
+		formImage, err := bindImageForm(c, &input)
+		if err != nil {
 			return err
 		}
 		if input.Image == nil {
@@ -47,13 +48,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		default:
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
-		file, err := input.Image.Open()
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
-		data, err := readUpload(file, input.Image.Size)
+		data, err := readFormImage(input.Image, formImage)
 		if err != nil {
 			return err
 		}

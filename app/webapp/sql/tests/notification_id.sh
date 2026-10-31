@@ -48,6 +48,19 @@ SELECT array_agg(id) AS all_users FROM users \gset
 CREATE TEMP TABLE got AS EXECUTE sse('6f1c1a8e-0d6b-4b8a-9a43-2f3b0d6e1f00', :'all_users');
 
 CREATE TEMP TABLE failures (what text);
+-- 旧実装が発行した id は再計算しても同じであること。ミリ秒境界、負の epoch、
+-- タイムゾーン、ASCII 以外の id、NULL を含めて時刻・ハッシュの全桁を比べる。
+INSERT INTO failures
+SELECT 'stored notification id changed'
+FROM (VALUES
+  ('w', 'u', '1970-01-01 00:00:00.000499+00', '00000000-0000-4d29-8683-83dd8a813f26'),
+  ('w', 'u', '1970-01-01 00:00:00.000500+00', '00000000-0001-4d29-8683-83dd8a813f26'),
+  ('w', 'u', '1969-12-31 23:59:59.999500+00', 'ffffffff-ffff-4d29-8683-83dd8a813f26'),
+  ('投稿:期間', '利用者', '2026-10-31 23:59:59.999500+09', '01a19279-8580-46fc-8ace-a815aa178624'),
+  ('', '', '2026-10-31 14:59:59.999500+00', '01a19279-8580-4853-9e90-f0351324bd73'),
+  (NULL, 'u', 'epoch', NULL), ('w', NULL, 'epoch', NULL), ('w', 'u', NULL, NULL)
+) AS fixture(w, u, started, expected)
+WHERE isureal_notification_id(w, u, started::timestamptz) IS DISTINCT FROM expected;
 INSERT INTO failures
 SELECT 'no notifications inserted' WHERE NOT EXISTS (SELECT 1 FROM notifications);
 INSERT INTO failures

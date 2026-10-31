@@ -11,7 +11,9 @@ EnvironmentFile=/home/isucon/env.sh
 # Soft heap cap so the image cache plus GOGC=100 headroom cannot push asia1 into OOM.
 # Above the observed peak (Sys 1.68 GB); see infra/notes/go-memlimit.md
 Environment=GOMEMLIMIT=2GiB
-ExecStart=/home/isucon/webapp/go/isureal
+RuntimeDirectory=isureal-db-pool
+RuntimeDirectoryMode=0700
+ExecStart=/bin/bash /usr/local/libexec/isureal-with-pool
 Restart=on-failure
 RestartSec=5
 
