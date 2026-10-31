@@ -122,7 +122,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if _, _, err := jpegcheck.Validate(bytes.NewReader(imageData)); err != nil {
+		if _, _, err := jpegcheck.ValidateBytes(imageData); err != nil {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
