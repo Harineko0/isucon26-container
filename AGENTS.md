@@ -14,8 +14,8 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 
 ## ベンチとデプロイは CI だけ（[ci/README.md](ci/README.md)）
 
-- **PR は isucon26-container に作る。open すると自動でベンチが 1 回走る**（draft は Ready for review にした時点）。push 後に測り直すときは PR に `/bench [メモ]` とコメントする（`/bench` は GitHub の PR コメントで、コマンドではない）。このリポジトリは monorepo で、app のコード（`app/`）も設定（`infra/`）もこのリポジトリのブランチで直して 1 つの PR にする。CI は PR の head をそのままデプロイする。main の基準値は、`app/`・`infra/`・`deploy.sh` を変える PR を main にマージすると自動で測り直される（手で回すなら `gh workflow run bench.yml -R Harineko0/isucon26-container`）。
-- ベンチ枠は 1 本ずつしかないので、測る価値のある状態になってから PR を open する（作業途中は draft で出す）。
+- **PR は isucon26-container に作る。ベンチは PR に `/bench [メモ]` とコメントしたときだけ走る**（PR の open では走らない。測り直しも同じ）（`/bench` は GitHub の PR コメントで、コマンドではない）。このリポジトリは monorepo で、app のコード（`app/`）も設定（`infra/`）もこのリポジトリのブランチで直して 1 つの PR にする。CI は PR の head をそのままデプロイする。main の基準値は自動では測り直されない。マージ後に測るときは `gh workflow run bench.yml -R Harineko0/isucon26-container`（または Actions の Run workflow ボタン）。
+- ベンチ枠は 1 本ずつしかないので、測る価値のある状態になってから `/bench` する。
 - CI が到着順に 1 本ずつ「デプロイ → initialize 確認 → ベンチ → 改変チェック」を行い、結果を PR コメント、PR の status check `Benchmark`（スコアと、同じ PR の前回との差が出る。初回は main との差）、`bench-results` ブランチの `results.jsonl` に残す。
 - 手元から `deploy.sh` / `infra/deploy.sh` / `smoke.sh` を実行しない、ポータルの Enqueue を押さない、サーバで再起動・設定変更・DB 書き込みをしない。他の人のベンチ中にサーバが変わると、どの変更でスコアが動いたか分からなくなる。スクリプトのガードと Claude Code の hook（`.claude/hooks/guard-bench.py`）が止める。
 - 読み取り（ssh での `journalctl` / `top` / `cat`、DB への `SELECT` / `EXPLAIN`、ルーターへの GET、`infra/deploy.sh -n`）は自由。
