@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -183,6 +184,7 @@ func discardUploadedImage(id string, storedRegion *string) {
 // resetImageStore は initialize で、ベンチが投稿した画像のファイルを捨てる (初期データの imageDiskDir は残す)。
 // ディレクトリごと退避してから作り直すので、すぐに返る。消すのは裏で行う。
 func resetImageStore() error {
+	jpegcheck.ResetValidationCache()
 	imageDataStore.reset()
 	trash := fmt.Sprintf("%s.trash-%d", imageStoreDir, time.Now().UnixNano())
 	if err := os.Rename(imageStoreDir, trash); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -222,10 +224,11 @@ func peerURL(region, path string) (string, bool) {
 }
 
 // resetPeerImageStores は initialize を受けたサーバーから、ほかのリージョンのストアも消させる
-// (initialize はルーター経由で 1 台にしか来ない)。画像の id は使い回されないので、
-// 届かなくても正しさには影響しない (ディスクの掃除だけ)。待ってから返すので、ベンチの新しい画像を消すことはない。
-func resetPeerImageStores(selfRegion string) {
+// (initialize はルーター経由で 1 台にしか来ない)。JPEG 検証キャッシュも各台で消すので、
+// 全台から成功の応答を受け取ってから返す。失敗時は initialize も成功にしない。
+func resetPeerImageStores(selfRegion string) error {
 	var wg sync.WaitGroup
+	errs := make(chan error, len(regionPeerHosts))
 	for region := range regionPeerHosts {
 		if region == selfRegion {
 			continue
@@ -238,22 +241,29 @@ func resetPeerImageStores(selfRegion string) {
 			defer cancel()
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 			if err != nil {
+				errs <- fmt.Errorf("reset %s: %w", region, err)
 				return
 			}
 			req.Header.Set(internalSecretHeader, *internalSecret.Load())
 			resp, err := peerHTTPClient.Do(req)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "imgstore: reset %s failed: %v\n", region, err)
+				errs <- fmt.Errorf("reset %s: %w", region, err)
 				return
 			}
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode != http.StatusNoContent {
-				fmt.Fprintf(os.Stderr, "imgstore: reset %s status %d\n", region, resp.StatusCode)
+				errs <- fmt.Errorf("reset %s: status %d", region, resp.StatusCode)
 			}
 		}(region)
 	}
 	wg.Wait()
+	close(errs)
+	var all []error
+	for err := range errs {
+		all = append(all, err)
+	}
+	return errors.Join(all...)
 }
 
 type imageFetchCall struct {

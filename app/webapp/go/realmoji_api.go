@@ -62,7 +62,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > 512 || cfg.Height > 512 {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
-		if _, _, err := jpegcheck.Validate(bytes.NewReader(data)); err != nil {
+		if _, _, err := jpegcheck.ValidateBytes(data); err != nil {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 

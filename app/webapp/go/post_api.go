@@ -122,7 +122,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if _, _, err := jpegcheck.Validate(bytes.NewReader(imageData)); err != nil {
+		if _, _, err := jpegcheck.ValidateBytes(imageData); err != nil {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
@@ -189,7 +189,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			ID: postID, AuthorID: user.ID, PostingWindowID: *row.WindowID, ImageID: imageID,
 			Caption: input.Caption, Visibility: input.Visibility,
 			PostLocation: PostLocation{Kind: location.Kind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: row.Locality},
-			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
+			PostedAt:     *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		imageDataStore.put(imageID, imageData)
 		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)

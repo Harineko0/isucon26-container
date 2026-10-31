@@ -30,7 +30,9 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := resetImageStore(); err != nil {
 			return err
 		}
-		resetPeerImageStores(h.Config.Region)
+		if err := resetPeerImageStores(h.Config.Region); err != nil {
+			return err
+		}
 		// login_sessions は作り直されるので、覚えていたセッションも捨てる (他のリージョンの分は DB の確認で外れる)。
 		knownSessions.Clear()
 		// ip_bans は TRUNCATE された。アプリ内の BAN も捨てる (他のリージョンの分は localBanTTL で切れる)。
