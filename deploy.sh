@@ -36,6 +36,12 @@ echo "$(hostname) deployed"'
 
 deploy_host() {
   local ip=$1
+  # Remove obsolete Go source from previous PRs before copying this revision.
+  # --delete applies only to *.go: excluded binaries, data and dot-directories
+  # are protected. A leftover .go file can otherwise compile against new types
+  # and make the deployed source set differ from DEPLOYED_SHA (#157).
+  rsync -a --delete -e "ssh -i $KEY" --exclude '.*' --include '*/' --include '*.go' --exclude '*' go/ "isucon@$ip:/home/isucon/webapp/go/" ||
+    { echo "[$ip] FAILED: synchronize Go sources" >&2; return 1; }
   rsync -a -e "ssh -i $KEY" --exclude /isureal --exclude /isureal.new go/ "isucon@$ip:/home/isucon/webapp/go/" ||
     { echo "[$ip] FAILED: rsync go/" >&2; return 1; }
   rsync -a -e "ssh -i $KEY" sql/ "isucon@$ip:/home/isucon/webapp/sql/" ||

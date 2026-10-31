@@ -43,11 +43,17 @@ WHERE u.id = i.id
 -- 上の UPDATE は session_replication_role = replica なので users_search_dirty_update トリガーが発火しない。
 -- ベンチが変えた表示名を初期値に戻した利用者は user_search_norms が古い名前のままになり、initialize 後の
 -- refreshSearchNorms (非同期) が終わるまで、初期の名前で検索しても見つからない。トリガーの代わりにここで dirty に入れる
--- (検索はアプリで照合する)。002-indexes.sql の末尾と同じ文で、5.6k 行の結合なので数 ms。
-INSERT INTO user_search_dirty (user_id)
-SELECT u.id FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
+-- (検索はアプリで照合する)。5.6k 行の結合なので数 ms。
+-- dirty の行は今の表示名を持つ (#148、正規化の保存はこの名前と一致するときだけ dirty から外す) ので、トリガーの
+-- 代わりに表示名も書き直す。ベンチの名前のまま残った dirty の行 (初期値に戻った利用者) も今の名前にそろえる。
+-- 002-indexes.sql の末尾と違い DO UPDATE にする: initialize の間は改名が並行しない。
+INSERT INTO user_search_dirty (user_id, display_name)
+SELECT u.id, u.display_name FROM users u
+LEFT JOIN user_search_norms s ON s.user_id = u.id
+LEFT JOIN user_search_dirty d ON d.user_id = u.id
 WHERE s.display_name IS DISTINCT FROM u.display_name
-ON CONFLICT DO NOTHING;
+   OR (d.user_id IS NOT NULL AND d.display_name IS DISTINCT FROM u.display_name)
+ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name;
 
 INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
 SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM initial_friend_requests;

@@ -87,15 +87,26 @@ func getRelationshipsHandler(h *HandlerContext) echo.HandlerFunc {
   `, input.BeforeUpdatedAt, input.BeforeID); err != nil {
 			return err
 		}
+		hasMore := len(records) > 50
+		if hasMore {
+			records = records[:50]
+		}
+		plan := newSignaturePlan()
+		for i := range records {
+			if records[i].Found {
+				if err := records[i].User.setImageKey(); err != nil {
+					return err
+				}
+				plan.addProfile(records[i].User)
+			}
+		}
+		plan.run()
 		items := make([]relationshipResponse, 0, len(records))
 		for _, record := range records {
 			if !record.Found {
 				continue
 			}
 			user := record.User
-			if err := user.setImageKey(); err != nil {
-				return err
-			}
 			if user.AccountType != "certified_public" && input.Kind != "friends" {
 				user.Bio = ""
 			}
@@ -107,10 +118,6 @@ func getRelationshipsHandler(h *HandlerContext) echo.HandlerFunc {
 				RelationID: record.ID, Status: status, UpdatedAt: record.UpdatedAt,
 				User: newRelationshipUserResponse(user),
 			})
-		}
-		hasMore := len(items) > 50
-		if hasMore {
-			items = items[:50]
 		}
 		return c.JSON(http.StatusOK, getRelationshipsResponse{Items: items, HasMore: hasMore})
 	}

@@ -41,7 +41,8 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
-		cached, hasData := imageDataStore.get(input.ImageID)
+		// 本体の在り処: メモリ (cached)、ディスク (accelURI。本体は Go では読まず nginx に返させる)、どちらでもない。
+		cached, accelURI, hasData := imageDataStore.locate(input.ImageID)
 		if !hasData {
 			prefetchStoredImage(input.ImageID, h.Config.Region)
 		}
@@ -61,16 +62,12 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		// 画像の created_at は不変なので、手がかり (imageCreatedAt / imagePartitions) があればそのパーティションの表を
 		// 直接引く (image_partition.go)。親表を引くと全パーティションの表ロックを取り、asia2 の LockManager が詰まる。
-		rel := imageRelationFor(input.ImageID)
-		hinted := false
-		if rel != "" {
-			err = conn.GetContext(ctx, &object, imageQueryFor(rel), input.ImageID, hasData)
-			hinted = err == nil
-			if errors.Is(err, sql.ErrNoRows) {
-				// 手がかりが外れていた場合に備えて親表で引き直す。
-				err = conn.GetContext(ctx, &object, imageQueryFor("image_objects"), input.ImageID, hasData)
-			}
-		} else {
+		rel, exact := imageRelationFor(input.ImageID, time.Now())
+		err = conn.GetContext(ctx, &object, imageQueryFor(rel), input.ImageID, hasData)
+		hinted := err == nil
+		if errors.Is(err, sql.ErrNoRows) && !exact {
+			// 手がかり (または今のパーティションという推測) が外れていた場合に備えて親表で引き直す。
+			// DB から教わった葉 (exact) に無ければ画像は消えているので、そのまま 403 にする。
 			err = conn.GetContext(ctx, &object, imageQueryFor("image_objects"), input.ImageID, hasData)
 		}
 		conn.Close()
@@ -118,6 +115,14 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
+		if accelURI != "" {
+			// 本体はディスクのファイル。nginx の internal location が sendfile で返す
+			// (infra/app/etc/nginx/sites-available/isureal.conf)。Content-Type と Cache-Control は
+			// nginx が X-Accel-Redirect の応答から引き継ぐので、従来の応答と同じヘッダになる。
+			c.Response().Header().Set(echo.HeaderContentType, object.MediaType)
+			c.Response().Header().Set("X-Accel-Redirect", accelURI)
+			return c.NoContent(http.StatusOK)
 		}
 		return c.Blob(http.StatusOK, object.MediaType, object.Data)
 	}
