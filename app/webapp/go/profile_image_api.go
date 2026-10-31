@@ -30,15 +30,19 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_profile_image")
 		}
 
-		ctx := c.Request().Context()
 		imageID := newImageID(h.Config.Region)
 		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
 		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_put_profile_image($1, $2, $3, $4)`, GetSession(c).UserID, imageID, dbData, storedRegion); err != nil {
+		// セッションの確認と同じ 1 文で呼ぶ (#17)。このルートにはリージョンの確認が無い。
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSessionAnyRegion(c, h, &row, `(SELECT isureal_put_profile_image({user}, $1, $2, $3) AS result)`, imageID, dbData, storedRegion); err != nil {
+			discardUploadedImage(imageID, storedRegion)
 			return err
 		}
-		if result != "ok" {
+		if row.Result == nil || *row.Result != "ok" {
 			discardUploadedImage(imageID, storedRegion)
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
@@ -50,11 +54,14 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 func deleteProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		var result string
-		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_profile_image($1)`, GetSession(c).UserID); err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSessionAnyRegion(c, h, &row, `(SELECT isureal_delete_profile_image({user}) AS result)`); err != nil {
 			return err
 		}
-		if result != "ok" {
+		if row.Result == nil || *row.Result != "ok" {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		return c.NoContent(http.StatusNoContent)
