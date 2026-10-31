@@ -25,13 +25,21 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 - チーム ID: 120107。ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）の 4 台と上表の IP が一致していることを確認済み（2026-10-31 時点で全台 RUNNING）。
 - 表示確認用 URL（ルーター経由）: <http://35.73.68.236:8080>
 - BenchmarkHost: `app.team120107-aws.127.0.0.1.nip.io`
-- SSH は `ssh isucon@<Public IP>`（GitHub 登録鍵）。ポータルのサーバリストにある 4 台以外へは SSH しない。
+- SSH は `~/.ssh/config` のエイリアスを使う: asia1 → `ssh isucon26-asia`、europe1 → `ssh isucon26-europe`、america1 → `ssh isucon26-america`。asia2 はエイリアスが無いので `ssh isucon@3.115.193.33`。ポータルのサーバリストにある 4 台以外へは SSH しない。
 - ルーターは `X-Country-Code`（JP/KR/CN/AU→asia1、GB/DE/FR→europe1、US/CA/MX→america1、省略時 JP）で振り分ける。クライアント IP は `X-Client-IP` を使う。
 - europe1/america1 → asia2 はリージョン間通信で遅延と帯域制限がある。asia1 と asia2 は同一リージョン扱い。
 
 ## アプリ（`app/` サブモジュール = サーバの `/home/isucon`）
 
-- `app/` は別リポジトリ <https://github.com/Harineko0/isucon26> のサブモジュール。コードの変更とコミットはその中で行う。
+- サーバごとの `/home/isucon` を別々のサブモジュールにしている。コードの変更とコミットは各サブモジュールの中で行う。
+
+  | ディレクトリ | サーバ | リポジトリ | `env.sh` の違い |
+  |---|---|---|---|
+  | `app/` | asia1 | <https://github.com/Harineko0/isucon26> | `ISUREAL_REGION=asia` |
+  | `app-europe/` | europe1 | <https://github.com/Harineko0/isucon26-europe> | `ISUREAL_REGION=europe`、`ISUREAL_LOG_LEVEL=info` |
+  | `app-america/` | america1 | <https://github.com/Harineko0/isucon26-america> | `ISUREAL_REGION=america` |
+
+  `app-europe/` と `app-america/` は各サーバの初期状態（`init` コミット）のまま。改善中のコードは `app/` にあり、ルートの `deploy.sh` は `app/webapp` の Go と SQL を 3 台すべてに配る。
 - 稼働中は Go 実装（`isureal-go.service`、`:8080`、前段に nginx）。`webapp/{go,rust,nodejs,perl,php,python,ruby}` は同一 API の参照実装で、Rust 版は `xxx.go` ⇔ `src/xxx.rs` でファイル名・SQL・ロック順が揃っている。
 - 設定は `/home/isucon/env.sh`（`ISUREAL_REGION` / `ISUREAL_DB_*`、`ISUREAL_LOG_LEVEL`）。region 値はサーバごとに異なる。
 - ビルド: `cd app/webapp/go && make`（`go build -o isureal cmd/isureal/main.go`）。Rust は `cd app/webapp/rust && make` / `make lint`。Go にも Rust にもテストは同梱されていない。
