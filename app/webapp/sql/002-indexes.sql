@@ -10,6 +10,11 @@ CREATE INDEX IF NOT EXISTS block_relations_blocked_id ON block_relations(blocked
 CREATE INDEX IF NOT EXISTS friend_requests_recipient_status ON friend_requests(recipient_id, status);
 CREATE INDEX IF NOT EXISTS friend_requests_requester_status ON friend_requests(requester_id, status);
 CREATE INDEX IF NOT EXISTS posts_image_id ON posts(image_id);
+-- 著者の投稿は投稿期間ごとに 1 件なので、(著者, 投稿期間) で引けば Memories や当日投稿済みの判定が
+-- 著者の全投稿 (最大 365 件、それぞれ別ページ) を読まずに済む。author_id 単独の索引はこれで代わる。
+-- 検証: sql/tests/posts_author_window.sh
+CREATE INDEX IF NOT EXISTS posts_author_window ON posts(author_id, posting_window_id);
+DROP INDEX IF EXISTS posts_author_id;
 CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis(image_id);
 DROP INDEX IF EXISTS notifications_user_created;
 CREATE INDEX IF NOT EXISTS posting_windows_region_active ON posting_windows(region) WHERE ended_at IS NULL;

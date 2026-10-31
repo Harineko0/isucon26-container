@@ -70,12 +70,19 @@ func getMemoriesByDateHandler(h *HandlerContext) echo.HandlerFunc {
 	}
 }
 
+// memoriesFrom は期間内の投稿期間ごとに、著者の投稿を posts(author_id, posting_window_id) で 1 件ずつ引く。
+// 普通の JOIN だと、プランナは著者の全投稿 (最大 365 件、それぞれ別ページ) を読んでから期間で絞る
+// (random_page_cost=1.1 ではヒープ読みを安く見積もるため)。OFFSET 0 で副問い合わせの平坦化を止め、
+// 投稿期間ごとの索引引きに固定する。結果は通常の JOIN と同じ。検証: sql/tests/posts_author_window.sh
+const memoriesFrom = `posting_windows w
+  CROSS JOIN LATERAL (SELECT * FROM posts p WHERE p.author_id = $1 AND p.posting_window_id = w.id OFFSET 0) p`
+
 func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, start, end time.Time, beforeAt *time.Time, beforeID string) (getMemoriesResponse, error) {
 	var response getMemoriesResponse
 	if (beforeAt == nil) != (beforeID == "") {
 		return response, NewAPIError(http.StatusBadRequest, "invalid_pagination")
 	}
-	posts, err := selectPostsWithAuthor(ctx, db, `
+	posts, err := selectPostsWithAuthorFrom(ctx, db, memoriesFrom, `
   AND p.author_id = $1 AND w.local_date >= $2 AND w.local_date < $3
   AND ($4::timestamptz IS NULL OR (p.posted_at, p.id) < ($4, $5))
   ORDER BY p.posted_at DESC, p.id DESC LIMIT 51
