@@ -169,12 +169,13 @@ func (d *decoder) processSOS(n int) error {
 						}
 					}
 
-					// Load the previous partially decoded coefficients, if applicable.
-					if d.progressive {
-						b = d.progCoeffs[compIndex][by*mxx*hi+bx]
-					} else {
-						b = block{}
+					if !d.progressive {
+						if err := d.validateSequentialBlock(&d.huff[dcTable][scan[i].td], &d.huff[acTable][scan[i].ta]); err != nil {
+							return err
+						}
+						continue
 					}
+					b = d.progCoeffs[compIndex][by*mxx*hi+bx]
 
 					if ah != 0 {
 						if err := d.refine(&b, &d.huff[acTable][scan[i].ta], zigStart, zigEnd, 1<<al); err != nil {
@@ -241,20 +242,7 @@ func (d *decoder) processSOS(n int) error {
 						}
 					}
 
-					if d.progressive {
-						// Save the coefficients.
-						d.progCoeffs[compIndex][by*mxx*hi+bx] = b
-						// At this point, we could call reconstructBlock to dequantize and perform the
-						// inverse DCT, to save early stages of a progressive image to the *image.YCbCr
-						// buffers (the whole point of progressive encoding), but in Go, the jpeg.Decode
-						// function does not return until the entire image is decoded, so we "continue"
-						// here to avoid wasted computation. Instead, reconstructBlock is called on each
-						// accumulated block by the reconstructProgressiveImage method after all of the
-						// SOS markers are processed.
-						continue
-					}
-					// image/jpeg calls reconstructBlock here; it cannot fail
-					// (compIndex < nComp <= 4), so validation skips it.
+					d.progCoeffs[compIndex][by*mxx*hi+bx] = b
 				} // for j
 			} // for i
 			mcu++
