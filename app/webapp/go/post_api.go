@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"image/jpeg"
@@ -45,7 +46,39 @@ type createPostResponse struct {
 	LateSeconds     int64              `json:"lateSeconds"`
 }
 
+// createPostGate は isureal_create_post (image_objects への画像 INSERT を含む) のサーバごとの同時実行数を
+// 絞る。image_objects の TOAST の拡張ロック (Lock:extend) は、同時に走る backend が 12 本以下なら
+// 待ちがほぼ 0 で、asia のプール 80 本では最大 50 本ほどがロック待ちのままプールの接続を占めていた
+// (DB の wait の 28%、INSERT の平均 390 ms)。待ちは DB のロックではなく、接続を取り出す前の goroutine で
+// させる。RealMoji・プロフィール画像の INSERT (68 ms) は対象にしない。
+type createPostGate chan struct{}
+
+// createPostGateSize はサーバ (リージョン) ごとの同時実行数。asia は EU/US の約 5 倍の投稿を受ける。
+// 3 台合計で 8 + 4 + 4 = 16 本 (待ちが 0 だった 12 本に近い値。asia に寄せる)。
+var createPostGateSize = map[string]int{"asia": 8, "europe": 4, "america": 4}
+
+func newCreatePostGate(region string) createPostGate {
+	n, ok := createPostGateSize[region]
+	if !ok {
+		n = 6
+	}
+	return make(createPostGate, n)
+}
+
+// acquire は枠が空くか ctx が取り消されるまで待つ。取り消された要求は DB に行かない。
+func (g createPostGate) acquire(ctx context.Context) error {
+	select {
+	case g <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g createPostGate) release() { <-g }
+
 func createPostHandler(h *HandlerContext) echo.HandlerFunc {
+	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
 		var input createPostRequest
 		if err := c.Bind(&input); err != nil {
@@ -109,9 +142,14 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			AccountType    *string    `db:"o_account_type"`
 			Status         *string    `db:"o_status"`
 		}
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		if err := gate.acquire(c.Request().Context()); err != nil {
+			return err
+		}
+		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			imageID, postID, imageData, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality); err != nil {
+			location.Kind, location.Latitude, location.Longitude, location.Locality)
+		gate.release()
+		if err != nil {
 			return err
 		}
 		switch row.Result {
