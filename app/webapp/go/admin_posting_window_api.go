@@ -101,9 +101,17 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		// 通知の id は SSE (notification_api.go) が投稿期間と利用者から同じ関数で組み立てる。
 		// 期間はもうコミットされているので、失敗しても期間は開いたまま (再送された開始要求は 409)。
 		// 同じ (期間, 利用者) の行が残っていても ON CONFLICT DO NOTHING で再実行できる。
-		if err := insertPostingWindowNotifications(ctx, h.DB, region, windowID, opened.StartsAt); err != nil {
-			return err
-		}
+		//
+		// 応答は通知の INSERT を待たない。notifications 表は実行中に誰も読まない (SSE は期間と利用者から
+		// 組み立てる #27) ので、応答を待たせても得るものが無い。一方ベンチは開始の応答を待ってから
+		// そのリージョンの 1 日を進めるので、待たせた分だけ 1 日の開始が遅れる。ベンチ中の通知 INSERT は
+		// 平均 760ms・最大 7.5 秒で、アジア最終日の開始が 8.4 秒遅れ、グランプリ (20 点) の達成が
+		// 420 人中 12 人に留まっていた (#97)。
+		go func() {
+			if err := insertPostingWindowNotifications(ctx, h.DB, region, windowID, opened.StartsAt); err != nil {
+				log.Printf("failed to insert notifications for window %s: %v", windowID, err)
+			}
+		}()
 		return c.JSON(http.StatusCreated, openPostingWindowResponse{
 			ID: windowID, Region: region, LocalDate: localDate.Format(time.DateOnly),
 			StartsAt: opened.StartsAt, OnTimeDeadline: opened.OnTimeDeadline,
