@@ -1,20 +1,58 @@
 package isureal
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
+	"io"
 	"net/http"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
+// A missing SOI marker proves that a JPEG is invalid. For large bodies,
+// drain the request before reporting the usual invalid_image, without keeping
+// those bytes in memory. A short read or transport error is still an I/O error.
+func readProfileUpload(body io.Reader, size int64) ([]byte, error) {
+	if size <= 2<<20 || size > maxUploadBytes {
+		return readUpload(body, size)
+	}
+	r := bufio.NewReader(body)
+	marker, err := r.Peek(2)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	// A streaming client can stop after the marker. Grow with received data
+	// instead of reserving its entire Content-Length on arrival.
+	var image bytes.Buffer
+	var dst io.Writer = io.Discard
+	if marker[0] == 0xff && marker[1] == 0xd8 {
+		dst = &image
+	}
+	n, err := io.Copy(dst, io.LimitReader(r, maxUploadBytes+1))
+	switch {
+	case err != nil:
+		return nil, err
+	case n < size:
+		return nil, io.ErrUnexpectedEOF
+	case n > maxUploadBytes:
+		return nil, errUploadTooLarge
+	}
+	// Cache accounting uses len(data); release any spare buffer capacity.
+	// A discarded body returns nil and takes the usual invalid_image path.
+	return bytes.Clone(image.Bytes()), nil
+}
+
 func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		if c.Request().Header.Get("Content-Type") != "image/jpeg" {
 			return NewAPIError(http.StatusUnsupportedMediaType, "unsupported_media_type")
 		}
-		// nginx は本文をバッファして Content-Length 付きで渡す (上限 32m) ので、
-		// その長さを 1 回だけ確保して読む (#93)。
-		data, err := readUpload(c.Request().Body, c.Request().ContentLength)
+		data, err := readProfileUpload(c.Request().Body, c.Request().ContentLength)
 		if err != nil {
 			return err
 		}

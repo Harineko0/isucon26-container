@@ -86,6 +86,31 @@ func TestReadUpload_TooLarge(t *testing.T) {
 	}
 }
 
+func TestLargeProfileUpload(t *testing.T) {
+	const size = 3 << 20
+	payload := bytes.Repeat([]byte{0x01}, size)
+	body := bytes.NewReader(payload)
+	got, err := readProfileUpload(body, size)
+	if err != nil || len(got) != 0 || body.Len() != 0 {
+		t.Fatalf("invalid JPEG: kept %d bytes, unread %d, error %v", len(got), body.Len(), err)
+	}
+	// A possible JPEG must reach the full validator, including all trailing bytes.
+	payload[0], payload[1] = 0xff, 0xd8
+	got, err = readProfileUpload(&chunkReader{r: bytes.NewReader(payload), chunk: 1}, size)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("JPEG input changed: got %d bytes, error %v", len(got), err)
+	}
+	for _, n := range []int64{0, 1, size - 1, maxUploadBytes + 1} {
+		wantErr := io.ErrUnexpectedEOF
+		if n > maxUploadBytes {
+			wantErr = errUploadTooLarge
+		}
+		if _, err := readProfileUpload(io.LimitReader(zeroReader{}, n), size); !errors.Is(err, wantErr) {
+			t.Errorf("body length %d: error %v, want %v", n, err, wantErr)
+		}
+	}
+}
+
 type zeroReader struct{}
 
 func (zeroReader) Read(p []byte) (int, error) { return len(p), nil }
