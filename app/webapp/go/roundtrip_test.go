@@ -285,7 +285,7 @@ func TestGetPostUsesOneStatementOnOneConnection(t *testing.T) {
 				t.Fatalf("connections: max in use %d, opened %d, want 1 and 1", conn.maxInUse, conn.opened)
 			}
 			q := queries[0].query
-			if !strings.Contains(q, "login_sessions") || !strings.Contains(q, "isureal_post_access(s.sess_user_id, $1)") {
+			if !strings.Contains(q, "login_sessions") || !strings.Contains(q, "isureal_post_access_read(s.sess_user_id, $1)") {
 				t.Fatalf("query = %s", q)
 			}
 			if strings.Contains(q, "friendships") {
