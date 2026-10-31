@@ -194,3 +194,67 @@ func TestRoundTripHandlersOnPostgresWindowNotifications(t *testing.T) {
 	readNotification(resp, "recovered")
 	waitForListen()
 }
+
+func TestRoundTripHandlersOnPostgresWindowAudience(t *testing.T) {
+	dsn := os.Getenv("ISUREAL_TEST_DSN")
+	if dsn == "" {
+		t.Skip("ISUREAL_TEST_DSN is not set")
+	}
+	db, err := sqlx.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Beginx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	tx.MustExec(`
+		CREATE TEMP TABLE users (id text PRIMARY KEY, status text NOT NULL, region text NOT NULL);
+		CREATE TEMP TABLE posting_windows (id text PRIMARY KEY, region text, starts_at timestamptz, ended_at timestamptz);
+		INSERT INTO posting_windows VALUES ('期間', 'europe', now(), NULL);
+		INSERT INTO users SELECT 'u:' || i, 'active', 'europe' FROM generate_series(1,32) AS i;
+		INSERT INTO users VALUES ('退会', 'deleted', 'europe'), ('moved', 'active', 'asia');
+	`)
+	var active []string
+	if err := tx.Select(&active, `SELECT id FROM users WHERE status = 'active' AND region = 'europe' ORDER BY id`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, stamp := range []string{"1969-12-31T23:59:59.999500Z", "2026-10-31T08:00:00.999499Z", "2026-10-31T08:00:00.999500Z", "12000-10-31T00:00:00Z"} {
+		tx.MustExec(`UPDATE posting_windows SET starts_at=$1`, stamp)
+		var want []string
+		if err := tx.Select(&want, `SELECT isureal_notification_id(w.id, u.id, w.starts_at)
+			FROM posting_windows w, users u WHERE u.id = ANY($1::text[]) ORDER BY u.id`, active); err != nil {
+			t.Fatal(err)
+		}
+		for _, ids := range [][]string{active, append(append([]string(nil), active...), "退会", "moved", "missing")} {
+			got, err := (windowDB{tx}).notifications(context.Background(), "europe", "期間", ids)
+			n := len(ids)
+			if n > len(active) {
+				n-- // missing users are skipped, moved/deleted users get a kick
+			}
+			if err != nil || len(got) != n {
+				t.Fatalf("%s: got %d rows, want %d: %v", stamp, len(got), n, err)
+			}
+			for i, r := range got {
+				if r.UserID != ids[i] || r.kick != (i >= len(active)) || (!r.kick && r.ID != want[i]) {
+					t.Fatalf("%s: unexpected row for %s: %+v", stamp, ids[i], r)
+				}
+			}
+		}
+	}
+
+	// A signal for a window with no matching user must not advance last.
+	w := newPostingWindowWatcherWith("europe", nil)
+	w.subscribe("missing")
+	if err := w.checkWindow(context.Background(), windowDB{tx}, "期間"); err != nil || w.last != "" {
+		t.Fatalf("missing subscriber: last=%q, err=%v", w.last, err)
+	}
+	tx.MustExec(`UPDATE posting_windows SET ended_at=starts_at`)
+	w.subscribe(active[0])
+	if err := w.checkWindow(context.Background(), windowDB{tx}, "期間"); err != nil || w.last != "" {
+		t.Fatalf("stale hint: last=%q, err=%v", w.last, err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -106,4 +107,54 @@ func TestSearchUsersOnPostgres(t *testing.T) {
 	if len(ids) != 10 || more || ids[0] != "p-51" || ids[9] != "p-60" {
 		t.Fatalf("page 2: %d items hasMore=%v %v", len(ids), more, ids)
 	}
+
+	t.Run("merge dirty names across the page boundary", func(t *testing.T) {
+		for _, q := range []string{
+			// More than 51 dirty nonmatches sort before every valid result.
+			`INSERT INTO users(id, username, secret_key_hash, display_name, region)
+			 SELECT 'a-'||i,'aaa'||i,repeat('ab',32),'other','asia' FROM generate_series(1,60) i`,
+			`UPDATE users SET display_name='renamed away' WHERE id='p-10'`,
+			`UPDATE users SET display_name='still PAGER' WHERE id='p-15'`,
+			`INSERT INTO users(id, username, secret_key_hash, display_name, region) VALUES
+			   ('middle','page20z',repeat('ab',32),'pager','asia'),
+			   ('last','zzz_last',repeat('ab',32),'pager','asia')`,
+			// Dirty rows from before the display_name column was populated still
+			// need the current user's name. A current normalization can also
+			// coexist with a dirty marker until the cleaner runs.
+			`UPDATE user_search_dirty SET display_name=NULL WHERE user_id='middle'`,
+			`INSERT INTO user_search_dirty(user_id,display_name) VALUES ('p-30','Pager')`,
+			`INSERT INTO block_relations(id,blocker_id,blocked_id) VALUES ('reverse','p-02','viewer')`,
+			`UPDATE users SET status='deleted' WHERE id='p-03'`,
+		} {
+			if _, err := db.Exec(q); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}
+		var want []string
+		for i := 1; i <= 60; i++ {
+			switch i {
+			case 2, 3, 10:
+				continue
+			}
+			want = append(want, fmt.Sprintf("p-%02d", i))
+			if i == 20 {
+				want = append(want, "middle")
+			}
+		}
+		want = append(want, "last")
+		ids, more := search(url.Values{"q": {"pager"}})
+		if !more || !slices.Equal(ids, want[:50]) {
+			t.Fatalf("first page: %v more=%v, want %v", ids, more, want[:50])
+		}
+		// Same username as the cursor, on either side of its id.
+		for _, tc := range []struct {
+			beforeID string
+			index    int
+		}{{"p-51", 49}, {"p-52", 50}} {
+			ids, more := search(url.Values{"q": {"pager"}, "beforeUsername": {"page52"}, "beforeId": {tc.beforeID}})
+			if more || !slices.Equal(ids, want[tc.index:]) {
+				t.Fatalf("cursor %q: %v more=%v, want %v", tc.beforeID, ids, more, want[tc.index:])
+			}
+		}
+	})
 }

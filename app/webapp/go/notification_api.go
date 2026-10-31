@@ -48,11 +48,10 @@ const (
 )
 
 type windowNotification struct {
-	UserID     string    `db:"user_id"`
-	ID         string    `db:"id"`
-	CreatedAt  time.Time `db:"created_at"`
-	UserActive bool      `db:"user_active"`
-	UserRegion string    `db:"user_region"`
+	UserID    string
+	ID        string
+	CreatedAt time.Time
+	kick      bool
 }
 
 // notificationEvent は購読者に配るもの。kick なら接続を閉じる。
@@ -174,11 +173,17 @@ func (w *postingWindowWatcher) snapshot() ([]string, map[string][]*notificationS
 	defer w.mu.Unlock()
 	userIDs := make([]string, 0, len(w.subs))
 	targets := make(map[string][]*notificationSubscriber, len(w.subs))
+	// Share a backing array across users in this snapshot. Most users have
+	// one connection, and both the periodic check and window delivery take it.
+	subscribers := make([]*notificationSubscriber, 0, len(w.subs))
 	for userID, set := range w.subs {
 		userIDs = append(userIDs, userID)
+		start := len(subscribers)
 		for s := range set {
-			targets[userID] = append(targets[userID], s)
+			subscribers = append(subscribers, s)
 		}
+		end := len(subscribers)
+		targets[userID] = subscribers[start:end:end]
 	}
 	return userIDs, targets
 }
@@ -219,7 +224,7 @@ func (w *postingWindowWatcher) checkWindow(ctx context.Context, db windowReader,
 			ev := notificationEvent{notification: getNotificationsResponse{
 				ID: row.ID, PostingWindowID: id, Region: w.region, CreatedAt: row.CreatedAt,
 			}}
-			if !row.UserActive || row.UserRegion != w.region {
+			if row.kick {
 				ev = notificationEvent{kick: true}
 			}
 			for _, s := range targets[row.UserID] {

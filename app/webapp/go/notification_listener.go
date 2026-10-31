@@ -2,8 +2,11 @@ package isureal
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log"
 	"time"
@@ -32,14 +35,59 @@ func (db windowDB) activeWindow(ctx context.Context, region string) (string, err
 }
 
 func (db windowDB) notifications(ctx context.Context, region, windowID string, userIDs []string) ([]windowNotification, error) {
-	var rows []windowNotification
-	err := sqlx.SelectContext(ctx, db, &rows, `
-    SELECT u.id AS user_id, isureal_notification_id(w.id, u.id, w.starts_at) AS id, w.starts_at AS created_at,
-           u.status = 'active' AS user_active, u.region AS user_region
-    FROM posting_windows w JOIN users u ON u.id = ANY($2::text[])
+	// A single snapshot decides both whether the window is still open and
+	// which subscribers can receive it. Normally every subscriber qualifies,
+	// in which case the result is just the common timestamp and ID prefix.
+	var startsAt time.Time
+	var prefix string
+	var exceptions []byte
+	err := db.QueryRowxContext(ctx, `
+    SELECT w.starts_at, left(isureal_notification_id(w.id, '', w.starts_at), 13),
+           (SELECT json_object_agg(ids.id, u.id IS NOT NULL)
+            FROM unnest($2::text[]) ids(id)
+            LEFT JOIN users u ON u.id = ids.id
+            WHERE u.id IS NULL OR u.status <> 'active' OR u.region <> w.region)
+    FROM posting_windows w
     WHERE w.id = $1 AND w.region = $3 AND w.ended_at IS NULL
-   `, windowID, userIDs, region)
-	return rows, err
+   `, windowID, userIDs, region).Scan(&startsAt, &prefix, &exceptions)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// An existing but inactive/moved user is disconnected. A missing user
+	// produced no row in the original join and is handled by checkUsers.
+	var excluded map[string]bool
+	if len(exceptions) != 0 {
+		if err := json.Unmarshal(exceptions, &excluded); err != nil {
+			return nil, err
+		}
+	}
+	rows := make([]windowNotification, 0, len(userIDs))
+	for _, id := range userIDs {
+		if exists, skip := excluded[id]; skip {
+			if exists {
+				rows = append(rows, windowNotification{UserID: id, kick: true})
+			}
+			continue
+		}
+		rows = append(rows, windowNotification{
+			UserID: id, ID: windowNotificationID(prefix, windowID, id), CreatedAt: startsAt,
+		})
+	}
+	return rows, nil
+}
+
+// Match the suffix of isureal_notification_id, including its variant derived
+// from the low two bits of digest byte 2. PostgreSQL supplies the formatted
+// timestamp prefix, so its rounding and lpad behavior are preserved.
+func windowNotificationID(prefix, windowID, userID string) string {
+	digest := md5.Sum([]byte(windowID + ":" + userID))
+	var h [md5.Size * 2]byte
+	hex.Encode(h[:], digest[:])
+	variant := "89ab"[digest[2]&3]
+	return prefix + "-4" + string(h[:3]) + "-" + string(variant) + string(h[4:7]) + "-" + string(h[7:19])
 }
 
 func (w *postingWindowWatcher) runWindowLoop(ctx context.Context, db *sqlx.DB) {
