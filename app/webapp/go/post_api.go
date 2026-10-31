@@ -123,9 +123,11 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
 		imageID := newTimeID()
 		postID := newTimeID()
+		// deferred 経路でセッションのリージョンが違うと関数は呼ばれず o_* が NULL になるので、全部ポインタで受ける
+		// (string のままだと走査に失敗して callWithSession の 403 に届かず 500 になる、#53)。
 		var row struct {
 			SessRegion     *string    `db:"sess_region"`
-			Result         string     `db:"o_result"`
+			Result         *string    `db:"o_result"`
 			WindowID       *string    `db:"o_window_id"`
 			OnTimeDeadline *time.Time `db:"o_on_time_deadline"`
 			PostedAt       *time.Time `db:"o_posted_at"`
@@ -152,7 +154,10 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		switch row.Result {
+		if row.Result == nil {
+			return sql.ErrNoRows
+		}
+		switch *row.Result {
 		case "ok":
 		case "slot_unavailable":
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
