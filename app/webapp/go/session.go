@@ -93,8 +93,10 @@ func (w *bufferedResponseWriter) Write(b []byte) (int, error) {
 }
 
 // deferredSessionRoutes の GET はハンドラの 1 文でセッションを確認するので、投機的には処理しない。
-func speculativeSessionAllowed(c *echo.Context) bool {
-	return c.Request().Method == http.MethodGet && !deferredSessionRoutes[c.Request().Method+" "+c.RouteInfo().Path]
+// asia は DB との往復が 1ms なので、並行にしても 1ms しか縮まないのに GET 1 回で接続を 2 本使い、
+// プール待ちの最大要因になっていた (#68)。往復 100ms の EU/US だけで使う。
+func speculativeSessionAllowed(c *echo.Context, region string) bool {
+	return region != "asia" && c.Request().Method == http.MethodGet && !deferredSessionRoutes[c.Request().Method+" "+c.RouteInfo().Path]
 }
 
 func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.MiddlewareFunc {
@@ -105,7 +107,7 @@ func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.M
 				return err
 			}
 			ctx := c.Request().Context()
-			if ok && speculativeSessionAllowed(c) {
+			if ok && speculativeSessionAllowed(c, handlerContext.Config.Region) {
 				if cached, found := knownSessions.Load(tokenHash); found {
 					known := cached.(Session)
 					type result struct {
@@ -154,7 +156,17 @@ func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.M
 					known := cached.(Session)
 					c.Set("session", &known)
 					c.Set("deferred_session", tokenHash)
-					return next(c)
+					err := next(c)
+					if err == nil || c.Get(deferredSessionCheckedKey) != nil {
+						return err
+					}
+					if response, _ := echo.UnwrapResponse(c.Response()); response != nil && response.Committed {
+						return err
+					}
+					// ハンドラがセッションを確認する SQL に達する前に失敗した (入力検証の 400 など)。
+					// 参照実装は SessionMiddleware → RegionMiddleware → ハンドラの順なので、401 → 403 を
+					// ハンドラのエラーより優先する。成功経路では通らないので往復は増えない。
+					return verifyDeferredSession(c, handlerContext, tokenHash, err)
 				}
 			}
 			var session *Session
@@ -265,9 +277,34 @@ func init() {
 	deferredSessionRoutes["GET /api/posting-window/current"] = true
 }
 
+// deferredSessionCheckedKey は、deferred 経路でハンドラがセッションを確認する SQL を実行したことを示す。
+// これが無いままハンドラがエラーを返したら、SessionMiddleware がセッションを確認してから返す。
+const deferredSessionCheckedKey = "deferred_session_checked"
+
+// lookupSessionFunc はテストで差し替えるためのもの。
+var lookupSessionFunc = lookupSession
+
+// verifyDeferredSession は、deferred 経路のハンドラがセッションを確認する前に handlerErr を返したときに
+// 呼ぶ。セッションが無効なら 401、リージョン違いなら 403、問題なければ handlerErr をそのまま返す。
+func verifyDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string, handlerErr error) error {
+	session, err := lookupSessionFunc(c.Request().Context(), h.DB, tokenHash)
+	if err != nil {
+		return err
+	}
+	region := ""
+	if session != nil {
+		region = session.Region
+	}
+	if err := rejectDeferredSession(c, h, tokenHash, session != nil, region); err != nil {
+		return err
+	}
+	return handlerErr
+}
+
 // rejectDeferredSession は、ハンドラの SQL でセッションを確認した結果が 401/403 のときの応答を返す。
 // found が false ならセッションが無効 (401)、region がこのサーバのリージョンと違えば 403。問題なければ nil。
 func rejectDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string, found bool, region string) error {
+	c.Set(deferredSessionCheckedKey, true)
 	if !found {
 		knownSessions.Delete(tokenHash)
 		c.Set("session", nil)
@@ -307,6 +344,7 @@ func callWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion fu
 		n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
 	err := h.DB.GetContext(ctx, dest, query, args...)
 	if errors.Is(err, sql.ErrNoRows) {
+		c.Set(deferredSessionCheckedKey, true)
 		knownSessions.Delete(tokenHash)
 		c.Set("session", nil)
 		return NewAPIError(http.StatusUnauthorized, "invalid_session")
@@ -314,6 +352,7 @@ func callWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion fu
 	if err != nil {
 		return err
 	}
+	c.Set(deferredSessionCheckedKey, true)
 	if region := sessRegion(); region == nil || *region != h.Config.Region {
 		knownSessions.Delete(tokenHash)
 		return NewAPIError(http.StatusForbidden, "region_mismatch")

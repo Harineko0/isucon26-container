@@ -45,9 +45,15 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		// 閲覧可否・フィードの種類・おすすめ度・ページングをすべて DB 側で計算し、51 件だけを受け取る。
+		// フィードごとに別の SQL にして、不要な CTE（mutual など）の計画・実行を省く。
 		var posts []feedRow
-		if err := sqlx.SelectContext(ctx, h.DB, &posts, feedQuery,
-			GetSession(c).UserID, input.Feed, input.BeforePostedAt, input.BeforeID, input.BeforeScore); err != nil {
+		var args []any
+		if ranked {
+			args = []any{GetSession(c).UserID, input.BeforePostedAt, input.BeforeID, input.BeforeScore}
+		} else {
+			args = []any{GetSession(c).UserID, input.BeforePostedAt, input.BeforeID}
+		}
+		if err := sqlx.SelectContext(ctx, h.DB, &posts, feedQueries[input.Feed], args...); err != nil {
 			return err
 		}
 		plan := newSignaturePlan()
@@ -81,10 +87,23 @@ type feedRow struct {
 	Score int64 `db:"score"`
 }
 
-// feedQuery は viewerContext.canView・matchesFeed・recommendationScores と同じ判定を SQL で行う。
-// $1 閲覧者, $2 フィード, $3 beforePostedAt, $4 beforeId, $5 beforeScore (friends-of-friends のみ)
-var feedQuery = `
-  WITH viewer AS (
+// feedQueries は viewerContext.canView・matchesFeed・recommendationScores と同じ判定を SQL で行う。
+// 以前は 4 種類を 1 本の SQL（CASE $2）で分岐していたが、汎用プランのコスト見積もりが大きく毎回カスタムプランで
+// 再計画され（計画だけで 1.3〜5ms）、friends-of-friends では mutual から posts_author_id を引く遅い計画（1 秒超）も出た。
+// 判定式は変えずにフィードごとに展開し、開いている期間の投稿を先に取り出す形に固定した。
+//
+// 非ランキング（public / following / friends）: $1 閲覧者, $2 beforePostedAt, $3 beforeId
+// friends-of-friends: $1 閲覧者, $2 beforePostedAt, $3 beforeId, $4 beforeScore
+var feedQueries = map[string]string{
+	"public":             feedPublicQuery,
+	"following":          feedFollowingQuery,
+	"friends":            feedFriendsQuery,
+	"friends-of-friends": feedFriendsOfFriendsQuery,
+}
+
+// feedViewerCTE は閲覧者が有効で、今日の期間に投稿済みかを返す。
+const feedViewerCTE = `
+  viewer AS (
     SELECT EXISTS(
       SELECT 1 FROM posts p
       JOIN posting_windows posted ON posted.id = p.posting_window_id
@@ -93,42 +112,99 @@ var feedQuery = `
       WHERE p.author_id = u.id AND p.deleted_at IS NULL
     ) AS has_posted_today
     FROM users u WHERE u.id = $1 AND u.status = 'active'
-  ),
+  )`
+
+const feedFriendsCTE = `
   friends AS (
     SELECT CASE WHEN user_low_id = $1 THEN user_high_id ELSE user_low_id END AS id
     FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
-  ),
+  )`
+
+const feedBlockedCTE = `
   blocked AS (
     SELECT CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END AS id
     FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
-  ),
+  )`
+
+// feedOpenPostsCTE はどのフィードにも共通する条件（期間中・未削除・本人以外・閲覧者が投稿済み）の投稿。
+// 開いている期間の投稿は数百件程度なので MATERIALIZED で先に取り出し、プランナが mutual などから
+// posts_author_id を引く遅い計画（実測 1 秒超）を選ばないようにする。
+// ここに著者の条件（友達・フォロー先）を入れると、著者から posts_author_id を引く計画になり遅くなる（実測 230ms）ので入れない。
+var feedOpenPostsCTE = `
+  open_posts AS MATERIALIZED (
+    SELECT ` + postColumns + `
+    FROM posts p
+    JOIN posting_windows w ON w.id = p.posting_window_id AND w.ended_at IS NULL
+    WHERE p.deleted_at IS NULL AND p.author_id <> $1
+      AND COALESCE((SELECT has_posted_today FROM viewer), false)
+  )`
+
+// feedCandidateBase は open_posts に有効な著者を付け、ブロック関係（双方向）を除く。続けてフィードごとの条件を AND でつなぐ。
+// 著者は 1 件ずつ主キーで引く（OFFSET 0 で平坦化を防ぎ、users の Seq Scan + Hash Join にさせない）。
+// フィードごとの「著者 IN (...)」は `(...) IS TRUE` で包み、準結合への引き上げを防いで hashed SubPlan にする
+// （引き上げられると汎用プランで open_posts × 友達の Nested Loop になり、実測 3.5ms かかった）。
+// 著者 ID も一覧の ID も NULL にならないので、IS TRUE を付けても結果は変わらない。
+var feedCandidateBase = `
+    SELECT p.*, u.* FROM open_posts p
+    CROSS JOIN LATERAL (
+      SELECT ` + userColumnsAs("u", "author") + ` FROM users u
+      WHERE u.id = p.author_id AND u.status = 'active' OFFSET 0
+    ) u
+    WHERE p.author_id NOT IN (SELECT id FROM blocked)`
+
+// 非ランキングのフィードは score が常に 0 なので posted_at, id の降順だけで並ぶ。
+const feedUnrankedTail = `
+  SELECT c.*, 0::bigint AS score FROM candidates c
+  WHERE $2::timestamptz IS NULL OR (c.posted_at, c.id) < ($2, $3)
+  ORDER BY c.posted_at DESC, c.id DESC
+  LIMIT 51
+`
+
+// public: 公開投稿は誰でも見られるので、閲覧可否は visibility = 'public' だけで決まる。
+var feedPublicQuery = `
+  WITH` + feedViewerCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
+  candidates AS (` + feedCandidateBase + `
+      AND p.visibility = 'public'
+  )` + feedUnrankedTail
+
+// friends: 著者が友達なら public / friends / friends_of_friends のどれも閲覧できる。
+var feedFriendsQuery = `
+  WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
+  candidates AS (` + feedCandidateBase + `
+      AND (p.author_id IN (SELECT id FROM friends)) IS TRUE
+      AND p.visibility IN ('public', 'friends', 'friends_of_friends')
+  )` + feedUnrankedTail
+
+// following: 著者がフォロー先で、閲覧可否は canView と同じ。
+// 「著者が友達の友達（mutual）」は、著者と閲覧者の友達の間に友達関係があること（著者 <> 閲覧者は上で保証）。
+var feedFollowingQuery = `
+  WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
+  candidates AS (` + feedCandidateBase + `
+      AND (p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)) IS TRUE
+      AND (p.visibility = 'public'
+           OR (p.visibility = 'friends' AND p.author_id IN (SELECT id FROM friends))
+           OR (p.visibility = 'friends_of_friends' AND (
+                p.author_id IN (SELECT id FROM friends)
+                OR EXISTS(SELECT 1 FROM friendships fs JOIN friends f ON f.id = fs.user_high_id WHERE fs.user_low_id = p.author_id)
+                OR EXISTS(SELECT 1 FROM friendships fs JOIN friends f ON f.id = fs.user_low_id WHERE fs.user_high_id = p.author_id))))
+  )` + feedUnrankedTail
+
+// friends-of-friends: 著者は友達ではなく mutual に含まれる。この場合 friends 公開の投稿は見られない。
+var feedFriendsOfFriendsQuery = `
+  WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
   mutual AS (
     SELECT id, count(*) AS n FROM (
       SELECT fs.user_high_id AS id FROM friendships fs JOIN friends f ON fs.user_low_id = f.id
       UNION ALL
       SELECT fs.user_low_id AS id FROM friendships fs JOIN friends f ON fs.user_high_id = f.id
     ) x WHERE id <> $1 GROUP BY id
-  ),
-  candidates AS (
-    SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
-    FROM posts p
-    JOIN posting_windows w ON w.id = p.posting_window_id AND w.ended_at IS NULL
-    JOIN users u ON u.id = p.author_id AND u.status = 'active'
-    WHERE p.deleted_at IS NULL AND p.author_id <> $1
-      AND COALESCE((SELECT has_posted_today FROM viewer), false)
-      AND p.author_id NOT IN (SELECT id FROM blocked)
-      AND (p.visibility = 'public'
-           OR (p.visibility = 'friends' AND p.author_id IN (SELECT id FROM friends))
-           OR (p.visibility = 'friends_of_friends' AND (p.author_id IN (SELECT id FROM friends) OR p.author_id IN (SELECT id FROM mutual))))
-      AND CASE $2
-        WHEN 'public' THEN p.visibility = 'public'
-        WHEN 'following' THEN p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)
-        WHEN 'friends' THEN p.author_id IN (SELECT id FROM friends)
-        WHEN 'friends-of-friends' THEN p.author_id NOT IN (SELECT id FROM friends) AND p.author_id IN (SELECT id FROM mutual)
-        ELSE false END
+  ),` + feedOpenPostsCTE + `,
+  candidates AS (` + feedCandidateBase + `
+      AND p.author_id NOT IN (SELECT id FROM friends) AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
+      AND p.visibility IN ('public', 'friends_of_friends')
   ),
   scored AS (
-    SELECT c.*, CASE WHEN $2 = 'friends-of-friends' THEN
+    SELECT c.*, (
       10 * (SELECT count(*) FROM (
               SELECT r.reactor_id AS user_id FROM realmojis r JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
               WHERE r.post_id = c.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
@@ -140,13 +216,11 @@ var feedQuery = `
       + LEAST(COALESCE((SELECT sum(m.n) FROM friendships fs
                         JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = c.author_id THEN fs.user_high_id ELSE fs.user_low_id END
                         WHERE fs.user_low_id = c.author_id OR fs.user_high_id = c.author_id), 0), 30)
-      ELSE 0 END::bigint AS score
+      )::bigint AS score
     FROM candidates c
   )
   SELECT * FROM scored
-  WHERE CASE WHEN $2 = 'friends-of-friends'
-    THEN $5::bigint IS NULL OR (score, posted_at, id) < ($5, $3::timestamptz, $4)
-    ELSE $3::timestamptz IS NULL OR (posted_at, id) < ($3, $4) END
+  WHERE $4::bigint IS NULL OR (score, posted_at, id) < ($4, $2::timestamptz, $3)
   ORDER BY score DESC, posted_at DESC, id DESC
   LIMIT 51
 `

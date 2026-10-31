@@ -128,7 +128,33 @@ BEGIN
   FROM users u WHERE u.id = p_user_id;
 END $$;
 
--- 友達申請・フォロー・ブロック。2 人の利用者を id 順にロックしてから処理する(アプリと同じ)。
+-- 2 人の関係(友達申請・友達・フォロー・ブロック)の変更は、2 人組(順不同)の advisory lock で直列化する。
+-- 以前は 2 人の users 行を FOR NO KEY UPDATE でロックしていたが、その行ロックは投稿・コメント・RealMoji・
+-- ログイン・プロフィール画像などもとるので、無関係な操作(投稿期間の切り替わりを待っている投稿など)の後ろで待っていた。
+-- 関係の変更が users 行から読むのは status(active か)と account_type だけで、status を変えるのは退会だけなので、
+-- 利用者ごとの advisory lock を共有モードでとり、退会(isureal_delete_account)は同じ鍵を排他モードでとる。
+-- 関係の表(friend_requests / friendships / follows / block_relations)を書くのは、2 人組のロックを持つ
+-- isureal_relationship と isureal_transition_friend_request だけ。
+-- ロックの順序: 利用者ごと(id 順) → 2 人組 → 行。コメント・RealMoji は行 → 2 人組だが、利用者ごとのロックはとらない。
+CREATE OR REPLACE FUNCTION isureal_user_lock_key(p_user text) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:user:' || p_user, 0) $$;
+
+CREATE OR REPLACE FUNCTION isureal_pair_lock_key(p_a text, p_b text) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:pair:' || least(p_a, p_b) || ':' || greatest(p_a, p_b), 0) $$;
+
+-- 2 人をロックし、2 人とも active なら true を返す。
+CREATE OR REPLACE FUNCTION isureal_lock_pair(p_a text, p_b text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(least(p_a, p_b)));
+  PERFORM pg_advisory_xact_lock_shared(isureal_user_lock_key(greatest(p_a, p_b)));
+  PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_a, p_b));
+  -- ロックをとった後の文なので、待っている間にコミットされた退会や関係の変更も見える
+  -- (READ COMMITTED では VOLATILE な関数の文ごとに新しいスナップショットをとる)。
+  RETURN (SELECT count(*) FROM users WHERE id IN (p_a, p_b) AND status = 'active') = 2;
+END $$;
+
+-- 友達申請・フォロー・ブロック。2 人組をロックしてから処理する。
 -- o_result: ok / not_found(404) / conflict(409) / forbidden(403)
 CREATE OR REPLACE FUNCTION isureal_relationship(
   p_action text, p_actor text, p_target text, p_new_id text
@@ -141,10 +167,7 @@ DECLARE
   v_req friend_requests%ROWTYPE;
   v_count int;
 BEGIN
-  PERFORM 1 FROM users WHERE id = v_low AND status = 'active' FOR NO KEY UPDATE;
-  IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
-  PERFORM 1 FROM users WHERE id = v_high AND status = 'active' FOR NO KEY UPDATE;
-  IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
+  IF NOT isureal_lock_pair(p_actor, p_target) THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
 
   IF p_action = 'friend_request' THEN
     IF EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
@@ -209,10 +232,7 @@ DECLARE
   v_req friend_requests%ROWTYPE;
 BEGIN
   IF p_requester = p_recipient OR p_recipient = '' THEN o_result := 'bad'; RETURN NEXT; RETURN; END IF;
-  PERFORM 1 FROM users WHERE id = least(p_requester, p_recipient) AND status = 'active' FOR NO KEY UPDATE;
-  IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
-  PERFORM 1 FROM users WHERE id = greatest(p_requester, p_recipient) AND status = 'active' FOR NO KEY UPDATE;
-  IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
+  IF NOT isureal_lock_pair(p_requester, p_recipient) THEN o_result := 'not_found'; RETURN NEXT; RETURN; END IF;
   SELECT * INTO v_req FROM friend_requests WHERE id = p_request_id;
   IF v_req.status <> 'pending' THEN o_result := 'forbidden'; RETURN NEXT; RETURN; END IF;
   IF p_status = 'accepted' THEN
@@ -301,6 +321,8 @@ BEGIN
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
     PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
+    -- 2 人の関係の変更(ブロック・友達の解除など)と直列化する(isureal_lock_pair)。
+    PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_author));
     IF NOT (SELECT can_view FROM isureal_post_access(p_actor, p_post)) THEN
       v_fail := 'forbidden'; RAISE SQLSTATE 'IR001';
     END IF;
@@ -340,6 +362,8 @@ BEGIN
   IF p_actor <> p_author THEN
     PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) FOR NO KEY UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'user not found'; END IF;
+    -- 2 人の関係の変更(ブロック・友達の解除など)と直列化する(isureal_lock_pair)。
+    PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_author));
   END IF;
   IF NOT (SELECT can_comment FROM isureal_post_access(p_actor, p_post)) THEN
     o_result := 'forbidden'; RETURN NEXT; RETURN;
@@ -369,8 +393,10 @@ BEGIN
       RETURN 'not_found';
   END;
   UPDATE users SET profile_image_id = p_image_id, updated_at = clock_timestamp() WHERE id = p_user;
+  -- 初期データの画像(境界以前)は消さない。initialize で users.profile_image_id が初期値に戻るので、
+  -- 行が残っていないと初期データと一致しなくなる。外れた画像は image_api の profile_image_id 判定で 403 になる。
   IF v_old IS NOT NULL THEN
-    DELETE FROM image_objects WHERE id = v_old;
+    DELETE FROM image_objects WHERE id = v_old AND created_at > (SELECT created_at FROM initial_data_boundary);
   END IF;
   RETURN 'ok';
 END $$;
@@ -383,13 +409,16 @@ BEGIN
   SELECT profile_image_id INTO v_old FROM users WHERE id = p_user FOR NO KEY UPDATE;
   IF NOT FOUND OR v_old IS NULL THEN RETURN 'not_found'; END IF;
   UPDATE users SET profile_image_id = NULL, updated_at = clock_timestamp() WHERE id = p_user;
-  DELETE FROM image_objects WHERE id = v_old;
+  -- 初期データの画像は消さない(isureal_put_profile_image と同じ理由)。
+  DELETE FROM image_objects WHERE id = v_old AND created_at > (SELECT created_at FROM initial_data_boundary);
   RETURN 'ok';
 END $$;
 
 CREATE OR REPLACE FUNCTION isureal_delete_account(p_user text)
 RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
+  -- 関係の変更(isureal_lock_pair)が共有モードでとる利用者ごとのロックを排他モードでとり、進行中の変更を待つ。
+  PERFORM pg_advisory_xact_lock(isureal_user_lock_key(p_user));
   PERFORM 1 FROM users WHERE id = p_user AND status = 'active' FOR NO KEY UPDATE;
   IF NOT FOUND THEN RETURN 'not_found'; END IF;
   UPDATE users SET status = 'deleted', deleted_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = p_user;
@@ -441,3 +470,15 @@ BEGIN
   END IF;
   RETURN 'ok';
 END $$;
+
+-- 通知の id は (投稿期間, 利用者) から決まる値にする。SSE は notifications 表を読まずに、
+-- 投稿期間と利用者からこの関数で id を組み立てる (#27)。形式は以前の
+-- 「開始時刻 (ミリ秒) の 16 進 12 桁 + gen_random_uuid() の後半」と同じで、後半を
+-- md5(期間 id || ':' || 利用者 id) から UUID version 4 / variant 8〜b の形で作る (全体で 36 文字)。
+CREATE OR REPLACE FUNCTION isureal_notification_id(p_window_id text, p_user_id text, p_starts_at timestamptz)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
+         || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12)
+  FROM (SELECT lpad(to_hex((extract(epoch FROM p_starts_at) * 1000)::bigint), 12, '0') AS ts,
+               md5(p_window_id || ':' || p_user_id) AS h) x
+$$;
