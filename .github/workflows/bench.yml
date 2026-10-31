@@ -107,6 +107,9 @@ jobs:
           chmod +x "$RUNNER_TEMP/freeze.sh"
           echo "FREEZE_CHECK=$RUNNER_TEMP/freeze.sh" >>"$GITHUB_ENV"
           "$RUNNER_TEMP/freeze.sh"
+          git show "$GITHUB_SHA:ci/bench/gate.sh" >"$RUNNER_TEMP/gate.sh"
+          chmod +x "$RUNNER_TEMP/gate.sh"
+          echo "BENCH_GATE=$RUNNER_TEMP/gate.sh" >>"$GITHUB_ENV"
 
       - name: Wait for my turn
         env:
@@ -114,7 +117,9 @@ jobs:
           ON_WAIT: ci/bench/stage.sh queued
         run: |
           ci/bench/stage.sh queued
-          ci/bench/queue.sh
+          "$BENCH_GATE"
+          if [ ! -f "$STATE_DIR/exclusive" ]; then ci/bench/queue.sh; fi
+          "$BENCH_GATE"
           "$FREEZE_CHECK" # 待ちの間に凍結時刻を過ぎていたら、ここで止める（#245）
           git fetch -q origin bench-results && git show FETCH_HEAD:results.jsonl >"$HISTORY" || : >"$HISTORY"
 
@@ -134,7 +139,10 @@ jobs:
         env:
           PORTAL_COOKIE: ${{ secrets.PORTAL_COOKIE }}
           PORTAL_TARGET_ID: ${{ vars.PORTAL_TARGET_ID || '1707' }}
-        run: ci/bench/run.sh
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "$BENCH_GATE"
+          ci/bench/run.sh
 
       - name: Record and report
         if: always()
