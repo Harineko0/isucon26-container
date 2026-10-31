@@ -8,13 +8,18 @@ import (
 
 func deleteAccountHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		var result string
-		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_account($1)`, GetSession(c).UserID); err != nil {
+		// セッションとリージョンの確認と同じ 1 文で呼ぶ (#17)。
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_account({user}) AS result)`); err != nil {
 			return err
 		}
-		if result != "ok" {
+		if row.Result == nil || *row.Result != "ok" {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
+		knownSessions.Delete(GetSession(c).TokenHash)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
