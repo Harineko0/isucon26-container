@@ -158,3 +158,56 @@ func TestWriteExportZipMatchesLegacyResponse(t *testing.T) {
 		})
 	}
 }
+
+// DB に本体がある画像と stored_region にある画像が交互に並んでも、map への書き込みが競合せず (-race で確認)、
+// 全部の画像が入ることを確かめる (#167)。
+func TestCollectExportImagesMixed(t *testing.T) {
+	oldStore := imageDataStore
+	imageDataStore = newImageDataCache()
+	t.Cleanup(func() { imageDataStore = oldStore })
+
+	region := "europe"
+	rows := make([]exportImageRow, 0, 200)
+	want := make(map[string][]byte, 200)
+	for i := range 200 {
+		id := fmt.Sprintf("img-%03d", i)
+		data := []byte(id)
+		want[id] = data
+		if i%2 == 0 {
+			rows = append(rows, exportImageRow{ID: id, Data: data})
+		} else {
+			rows = append(rows, exportImageRow{ID: id, StoredRegion: &region})
+		}
+	}
+	images := make(map[string][]byte)
+	err := collectExportImages(rows, images, func(id, gotRegion string) ([]byte, error) {
+		if gotRegion != region {
+			t.Errorf("region: got %q, want %q", gotRegion, region)
+		}
+		time.Sleep(time.Millisecond)
+		return []byte(id), nil
+	})
+	if err != nil {
+		t.Fatalf("collectExportImages: %v", err)
+	}
+	if len(images) != len(want) {
+		t.Fatalf("images: got %d, want %d", len(images), len(want))
+	}
+	for id, data := range want {
+		if !bytes.Equal(images[id], data) {
+			t.Errorf("images[%s]: got %q, want %q", id, images[id], data)
+		}
+	}
+}
+
+func TestCollectExportImagesLoadError(t *testing.T) {
+	region := "america"
+	rows := []exportImageRow{{ID: "a", StoredRegion: &region}}
+	wantErr := fmt.Errorf("load failed")
+	err := collectExportImages(rows, map[string][]byte{}, func(string, string) ([]byte, error) {
+		return nil, wantErr
+	})
+	if err != wantErr {
+		t.Fatalf("err: got %v, want %v", err, wantErr)
+	}
+}
