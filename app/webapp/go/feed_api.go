@@ -190,32 +190,6 @@ const feedBlockedCTE = `
     SELECT blocker_id AS id FROM block_relations WHERE blocked_id = $1
   )`
 
-// feedOpenPostsCTE は友達の友達フィードで、期間中・未削除・本人以外・閲覧者が投稿済みの投稿を取り出す。
-// 開いている期間の投稿は数百件程度なので MATERIALIZED で先に取り出し、プランナが mutual などから
-// posts_author_id を引く遅い計画（実測 1 秒超）を選ばないようにする。
-// ここに著者の条件（友達・フォロー先）を入れると、著者から posts_author_id を引く計画になり遅くなる（実測 230ms）ので入れない。
-var feedOpenPostsCTE = `
-  open_posts AS MATERIALIZED (
-    SELECT ` + postColumns + `
-    FROM posts p
-    JOIN posting_windows w ON w.id = p.posting_window_id AND w.ended_at IS NULL
-    WHERE p.deleted_at IS NULL AND p.author_id <> $1
-      AND COALESCE((SELECT has_posted_today FROM viewer), false)
-  )`
-
-// feedCandidateBase は open_posts に有効な著者を付け、ブロック関係（双方向）を除く。続けてフィードごとの条件を AND でつなぐ。
-// 著者は 1 件ずつ主キーで引く（OFFSET 0 で平坦化を防ぎ、users の Seq Scan + Hash Join にさせない）。
-// フィードごとの「著者 IN (...)」は `(...) IS TRUE` で包み、準結合への引き上げを防いで hashed SubPlan にする
-// （引き上げられると汎用プランで open_posts × 友達の Nested Loop になり、実測 3.5ms かかった）。
-// 著者 ID も一覧の ID も NULL にならないので、IS TRUE を付けても結果は変わらない。
-var feedCandidateBase = `
-    SELECT p.*, u.* FROM open_posts p
-    CROSS JOIN LATERAL (
-      SELECT ` + userColumnsAs("u", "author") + ` FROM users u
-      WHERE u.id = p.author_id AND u.status = 'active' OFFSET 0
-    ) u
-    WHERE p.author_id NOT IN (SELECT id FROM blocked)`
-
 // 非ランキングのフィードは score が常に 0 なので posted_at, id の降順だけで並ぶ。
 // viewer から LEFT JOIN LATERAL して、一覧が 0 件でも有効なセッションなら番兵の 1 行を返す。
 var feedUnrankedTail = `
@@ -326,38 +300,48 @@ func buildFeedFollowingQuery(regionParam, tokenParam int) string {
   )` + feedUnrankedTail
 }
 
-// friends-of-friends: 著者は友達ではなく mutual に含まれる。この場合 friends 公開の投稿は見られない。
-// おすすめ度の「著者の mutual 数」と「著者の友達の mutual 数の和」は、以前は候補ごとの相関副問い合わせで
-// mutual（CTE、友達の多い閲覧者では千数百行）を毎回全件なめていた（候補 36 件で約 13ms）。
-// mutual は id で一意なので LEFT JOIN、著者の友達の和は候補の著者ごとに 1 回だけ集計して LEFT JOIN する（値は同じ）。
+// ランキングは投稿 ID・著者 ID・投稿時刻だけで進める。スコアは著者の有効性とは独立なので、
+// 順位順に有効な著者を 51 件まで取り、そのページの投稿本文と期間だけを主キーで引く。
 //
-// author_fof は「著者 → 和」を 1 つの jsonb にまとめ、候補ごとに ->> で引く（jsonb のキー検索は二分探索）。
-// 以前の LEFT JOIN author_fof は、candidates の見積もりが数行（実際は友達の多い閲覧者で数百行）のため
-// Nested Loop + Materialize になり、候補数 × 著者数の比較をしていた（候補 396 件で 7.8 万回）。
-// 著者が author_fof に無い（著者の友達が mutual にいない）ときは ->> が NULL になり、以前の LEFT JOIN の NULL と同じく 0 になる。
-// 反応・コメントの数は、友達かどうか（friends のハッシュ）を先に見て、友達だった利用者だけ active かを主キーで確かめる
-// （以前は反応・コメントした全員の users を主キーで引いてから友達で絞っていた）。active は利用者ごとの性質なので、
-// 「active な反応者・コメント者の集合 ∩ 友達」と「反応者・コメント者の集合 ∩ 友達 ∩ active」は同じ集合で、件数も同じ。
+// author_fof は著者ごとの 3 ホップの経路数を jsonb にまとめ、順位とカーソルが同じ集計を使えるよう実体化する。
+// 友達関係の両方向はそれぞれ複合索引で引く。以前の OR 結合は自己辺を 1 行として数えるので、
+// author_fof の 2 本目の枝だけで自己辺を除く。反応とコメントは有効な友達によるものだけを数える。
 func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
+  active_friends AS MATERIALIZED (
+    SELECT f.id FROM friends f JOIN users u ON u.id = f.id WHERE u.status = 'active'
+  ),
   mutual AS (
     SELECT id, count(*) AS n FROM (
       SELECT fs.user_high_id AS id FROM friendships fs JOIN friends f ON fs.user_low_id = f.id
       UNION ALL
       SELECT fs.user_low_id AS id FROM friendships fs JOIN friends f ON fs.user_high_id = f.id
     ) x WHERE id <> $1 GROUP BY id
-  ),` + feedOpenPostsCTE + `,
-  candidates AS (` + feedCandidateBase + `
-      AND p.author_id NOT IN (SELECT id FROM friends) AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
-      AND p.visibility IN ('public', 'friends_of_friends')
   ),
-  author_fof AS (
+  open_posts AS MATERIALIZED (
+    SELECT p.id, p.author_id, p.posted_at
+    FROM posting_windows w JOIN posts p ON p.posting_window_id = w.id
+    WHERE w.ended_at IS NULL AND p.deleted_at IS NULL AND p.author_id <> $1
+      AND p.visibility IN ('public', 'friends_of_friends')
+      AND (SELECT has_posted_today FROM viewer)
+  ),
+  candidates AS (
+    SELECT p.* FROM open_posts p
+    WHERE p.author_id NOT IN (SELECT id FROM blocked)
+      AND p.author_id NOT IN (SELECT id FROM friends)
+      AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
+  ),
+  author_fof AS MATERIALIZED (
     SELECT jsonb_object_agg(t.author_id, t.s) AS by_author FROM (
       SELECT a.author_id, sum(m.n) AS s
       FROM (SELECT DISTINCT author_id FROM candidates) a
-      JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
-      JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
+      CROSS JOIN LATERAL (
+        SELECT fs.user_high_id AS id FROM friendships fs WHERE fs.user_low_id = a.author_id
+        UNION ALL
+        SELECT fs.user_low_id FROM friendships fs WHERE fs.user_high_id = a.author_id AND fs.user_low_id <> a.author_id
+      ) f
+      JOIN mutual m ON m.id = f.id
       GROUP BY a.author_id
     ) t
   ),
@@ -369,23 +353,36 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
               UNION
               SELECT cm.author_id FROM comments cm
               WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
-            ) e WHERE e.user_id IN (SELECT id FROM friends)
-                AND EXISTS(SELECT 1 FROM users eu WHERE eu.id = e.user_id AND eu.status = 'active'))
+            ) e WHERE (e.user_id IN (SELECT id FROM active_friends)) IS TRUE)
       + 3 * COALESCE(mm.n, 0)
       + LEAST(COALESCE(((SELECT by_author FROM author_fof) ->> c.author_id)::numeric, 0), 30)
       )::bigint AS score
     FROM candidates c
     LEFT JOIN mutual mm ON mm.id = c.author_id
+  ),
+  page AS (
+    SELECT ranked.id AS page_id, ranked.score, u.*
+    FROM (
+      SELECT id, author_id, posted_at, score FROM scored
+      WHERE $4::bigint IS NULL OR (score, posted_at, id) < ($4, $2::timestamptz, $3)
+      ORDER BY score DESC, posted_at DESC, id DESC
+      OFFSET 0
+    ) ranked
+    CROSS JOIN LATERAL (
+      SELECT ` + userColumnsAs("u", "author") + ` FROM users u
+      WHERE u.id = ranked.author_id AND u.status = 'active' OFFSET 0
+    ) u
+    ORDER BY ranked.score DESC, ranked.posted_at DESC, ranked.id DESC
+    LIMIT 51
   )
   SELECT v.sess_region, r.id IS NOT NULL AS found,
     ` + postWithAuthorColumnsCoalesced("r") + `,
     COALESCE(r.score, 0)::bigint AS score
   FROM viewer v
-  LEFT JOIN LATERAL (
-    SELECT * FROM scored
-    WHERE $4::bigint IS NULL OR (score, posted_at, id) < ($4, $2::timestamptz, $3)
-    ORDER BY score DESC, posted_at DESC, id DESC
-    LIMIT 51
+  LEFT JOIN (
+    SELECT ` + postColumns + `, k.*
+    FROM page k JOIN posts p ON p.id = k.page_id
+    JOIN posting_windows w ON w.id = p.posting_window_id
   ) r ON true
   ORDER BY r.score DESC, r.posted_at DESC, r.id DESC
 `
