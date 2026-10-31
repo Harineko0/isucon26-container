@@ -16,8 +16,16 @@ CREATE INDEX IF NOT EXISTS posts_image_id ON posts(image_id);
 CREATE INDEX IF NOT EXISTS posts_author_window ON posts(author_id, posting_window_id);
 DROP INDEX IF EXISTS posts_author_id;
 CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis(image_id);
+-- reset.sql (initialize) の DELETE ... WHERE created_at > (初期データの境界) が毎回表を全件走査していた (#75)。
+-- どの表も heap の並びが created_at 順 (pg_stats.correlation >= 0.9999) なので、BRIN なら末尾の範囲だけ読む。
+-- 索引は数十 KB で INSERT 時の維持費はほぼ無い。初回は asia2 で CONCURRENTLY で作ってから入れる (ci/README.md #40)。
+CREATE INDEX IF NOT EXISTS realmojis_created_brin ON realmojis USING brin (created_at);
+CREATE INDEX IF NOT EXISTS posts_created_brin ON posts USING brin (created_at);
+CREATE INDEX IF NOT EXISTS comments_created_brin ON comments USING brin (created_at);
 DROP INDEX IF EXISTS notifications_user_created;
-CREATE INDEX IF NOT EXISTS posting_windows_region_active ON posting_windows(region) WHERE ended_at IS NULL;
+-- 001-schema.sql の posting_windows_one_active_region (UNIQUE (region) WHERE ended_at IS NULL) と同じ定義の
+-- 索引を重ねて持っていたので消す (#78)。計画は UNIQUE 側で同じになる。
+DROP INDEX IF EXISTS posting_windows_region_active;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_posting_window_id_fkey;
 -- 通知は投稿期間ごとにまとめて作るので、(投稿期間, 利用者) の順の一意索引にして挿入先のページを局所化する。
