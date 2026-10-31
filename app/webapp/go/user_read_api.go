@@ -8,7 +8,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 	"golang.org/x/text/cases"
@@ -99,7 +101,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
     ORDER BY username, id
   ) r ON true
   ORDER BY r.username, r.id
- `, input.BeforeUsername, input.BeforeID, query, "%"+escapeLike(query)+"%", h.Config.Region); err != nil {
+ `, searchQueryArgs(query, input.BeforeUsername, input.BeforeID, query, "%"+escapeLike(query)+"%", h.Config.Region)...); err != nil {
 			return err
 		}
 		matchedUsers := make([]User, 0, 51)
@@ -273,6 +275,23 @@ func cleanSearchDirtyLoop(db *sqlx.DB) {
 // 保存までの間はトリガーが入れた dirty の行があるので、検索はアプリで照合する。
 func saveSearchNormsAsync(db *sqlx.DB, user User) {
 	saveSearchNormsOnce(db, []User{user})
+}
+
+// searchCustomPlanMaxRunes 未満の短い検索語は、毎回その値で計画させる (custom plan)。
+// アプリの接続は plan_cache_mode = force_generic_plan (#153) なので、検索もキャッシュした generic plan で走る。
+// generic plan は trigram 索引で引いた正規化の行ごとに users を主キーで引くので、絞れる検索語 (3 文字以上) では
+// 速い (asia2 の実データで 3 文字: generic 0.79ms、custom 1.35ms)。trigram は 3 文字未満では絞れず、
+// '%a%' のような語は数千行に一致する。そこでは custom plan の users の seq scan + hash join の方が速い
+// (1 文字: generic 31ms、custom 15ms)。検索は DB 時間の 1 位の文 (#97)。
+// 単純プロトコルは prepare しないので値を見て計画し、往復も増えない (値は pgx がエスケープして埋める)。
+var searchCustomPlanMaxRunes = 3
+
+// searchQueryArgs は検索の文の引数。短い検索語なら先頭に単純プロトコルの指定を付ける (selectWithSession が外す)。
+func searchQueryArgs(query string, args ...any) []any {
+	if utf8.RuneCountInString(query) < searchCustomPlanMaxRunes {
+		return append([]any{pgx.QueryExecModeSimpleProtocol}, args...)
+	}
+	return args
 }
 
 // searchNormsSaver は検索用の正規化の保存を 1 本の goroutine にまとめる。
