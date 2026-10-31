@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
@@ -48,6 +49,8 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		// 正規化が古い・未作成の利用者 (stale) はアプリで照合する。
 		// 候補は trigram 索引で引いた一致と、名前が変わって正規化が追いついていない利用者
 		// (user_search_dirty、users のトリガーで記録) に限り、全 active 利用者は並べ替えない (#26)。
+		// dirty のうち正規化が今の名前に追いついている (または消えた) 利用者は候補にしない。
+		// 混ぜると候補が数百件になり、users と正規化の表を全件読むプランになる (#97)。
 		var rows []struct {
 			User
 			Stale   bool `db:"stale"`
@@ -57,7 +60,10 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
   WITH cand AS (
     SELECT user_id FROM user_search_norms WHERE username_norm LIKE $5 OR display_name_norm LIKE $5
     UNION
-    SELECT user_id FROM user_search_dirty
+    SELECT d.user_id FROM user_search_dirty d
+    JOIN users u ON u.id = d.user_id
+    LEFT JOIN user_search_norms s ON s.user_id = d.user_id
+    WHERE s.display_name IS DISTINCT FROM u.display_name
   )
   SELECT `+strings.Join(userColumns, ", ")+`, stale, matched FROM (
     SELECT u.*, m.stale, m.matched, count(*) FILTER (WHERE m.matched) OVER (ORDER BY u.username, u.id) AS n
@@ -191,6 +197,42 @@ func saveSearchNorms(ctx context.Context, db *sqlx.DB, users []User) error {
 	return err
 }
 
+// cleanSearchDirty は、正規化が今の表示名に追いついた利用者と、消えた利用者を dirty から外す。
+// 名前が変わった直後 (正規化が古い) の利用者は残すので、検索の正しさは変わらない。
+func cleanSearchDirty(ctx context.Context, db *sqlx.DB) error {
+	_, err := db.ExecContext(ctx, `
+  DELETE FROM user_search_dirty d
+  WHERE NOT EXISTS (
+    SELECT 1 FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
+    WHERE u.id = d.user_id AND s.display_name IS DISTINCT FROM u.display_name)
+ `)
+	return err
+}
+
+// cleanSearchDirtyLoop は dirty を小さく保つ。登録や名前の変更のあと、正規化は非同期に保存されるので、
+// 保存が済んだ利用者をここで外す。
+func cleanSearchDirtyLoop(db *sqlx.DB) {
+	for range time.Tick(2 * time.Second) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := cleanSearchDirty(ctx, db); err != nil {
+			log.Printf("failed to clean user_search_dirty: %v", err)
+		}
+		cancel()
+	}
+}
+
+// saveSearchNormsAsync は登録・表示名の変更のあとに正規化を保存する。応答は待たせない。
+// 保存までの間はトリガーが入れた dirty の行があるので、検索はアプリで照合する。
+func saveSearchNormsAsync(db *sqlx.DB, user User) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := saveSearchNorms(ctx, db, []User{user}); err != nil {
+			log.Printf("failed to save search norms: %v", err)
+		}
+	}()
+}
+
 // refreshSearchNorms は正規化が無い・古い利用者をまとめて保存し直す (起動時と初期化後)。
 func refreshSearchNorms(db *sqlx.DB) {
 	ctx := context.Background()
@@ -201,7 +243,7 @@ func refreshSearchNorms(db *sqlx.DB) {
 			log.Printf("search norms schema: %v", err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, `DELETE FROM user_search_dirty d WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = d.user_id)`); err != nil {
+	if err := cleanSearchDirty(ctx, db); err != nil {
 		log.Printf("failed to clean user_search_dirty: %v", err)
 	}
 	var users []User
