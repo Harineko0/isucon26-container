@@ -48,27 +48,57 @@ type signatureCacheKey struct {
 	exp     int64
 }
 
+type signatureFlight struct {
+	done  chan struct{}
+	value []byte
+}
+
 // 署名の結果は鍵・画像・exp だけで決まるので、古い世代を捨てるだけで正しさは保たれる。
 type signatureCache struct {
 	mu       sync.RWMutex
 	current  map[signatureCacheKey][]byte
 	previous map[signatureCacheKey][]byte
+	inFlight map[signatureCacheKey]*signatureFlight
 	rotateAt time.Time
 }
 
-var imageSignatures = &signatureCache{current: map[signatureCacheKey][]byte{}, previous: map[signatureCacheKey][]byte{}}
+var imageSignatures = &signatureCache{inFlight: make(map[signatureCacheKey]*signatureFlight)}
 
-func (s *signatureCache) get(k signatureCacheKey) ([]byte, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if v, ok := s.current[k]; ok {
-		return v, true
+func (s *signatureCache) cachedLocked(k signatureCacheKey) []byte {
+	if v := s.current[k]; v != nil {
+		return v
 	}
-	v, ok := s.previous[k]
-	return v, ok
+	return s.previous[k]
 }
 
-func (s *signatureCache) put(k signatureCacheKey, v []byte) {
+// claim leaves cached results on the read-lock path. A cold key has exactly
+// one owner across individual signatures and SIMD batches.
+func (s *signatureCache) claim(r signatureRequest) (value []byte, flight *signatureFlight, owner bool) {
+	s.mu.RLock()
+	value = s.cachedLocked(r.cacheKey())
+	s.mu.RUnlock()
+	if value != nil {
+		return value, nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := r.cacheKey()
+	if value = s.cachedLocked(k); value != nil {
+		return value, nil, false
+	}
+	if flight, exists := s.inFlight[k]; exists {
+		if flight == nil {
+			flight = &signatureFlight{done: make(chan struct{})}
+			s.inFlight[k] = flight
+		}
+		return nil, flight, false
+	}
+	// Allocate the notification only if another caller actually needs to wait.
+	s.inFlight[k] = nil
+	return nil, nil, true
+}
+
+func (s *signatureCache) finish(k signatureCacheKey, v []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -78,15 +108,26 @@ func (s *signatureCache) put(k signatureCacheKey, v []byte) {
 		s.rotateAt = now.Add(10 * time.Minute)
 	}
 	s.current[k] = v
+	flight := s.inFlight[k]
+	delete(s.inFlight, k)
+	if flight != nil {
+		flight.value = v
+		close(flight.done)
+	}
 }
 
 func imageSignature(key []byte, imageID string, exp int64) []byte {
-	k := signatureCacheKey{key: string(key), imageID: imageID, exp: exp}
-	if v, ok := imageSignatures.get(k); ok {
+	r := signatureRequest{key: key, imageID: imageID, exp: exp}
+	v, flight, owner := imageSignatures.claim(r)
+	if v != nil {
 		return v
 	}
-	v := computeImageSignature(key, imageID, exp)
-	imageSignatures.put(k, v)
+	if !owner {
+		<-flight.done
+		return flight.value
+	}
+	v = computeImageSignature(key, imageID, exp)
+	imageSignatures.finish(r.cacheKey(), v)
 	return v
 }
 

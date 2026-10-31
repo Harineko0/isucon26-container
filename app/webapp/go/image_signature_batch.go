@@ -17,6 +17,10 @@ type signatureRequest struct {
 	exp     int64
 }
 
+func (r signatureRequest) cacheKey() signatureCacheKey {
+	return signatureCacheKey{key: string(r.key), imageID: r.imageID, exp: r.exp}
+}
+
 var sha256K = [64]uint32{
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
 	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -101,34 +105,34 @@ func (lane *hmacLane) bytes() []byte {
 
 // computeImageSignatures は複数の署名をまとめて計算する。結果はキャッシュにも入る。
 func computeImageSignatures(requests []signatureRequest) {
-	pending := make([]signatureRequest, 0, len(requests))
-	seen := make(map[signatureCacheKey]bool, len(requests))
+	var pending []signatureRequest
+	var waiting []<-chan struct{}
 	for _, r := range requests {
-		k := signatureCacheKey{key: string(r.key), imageID: r.imageID, exp: r.exp}
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		if _, ok := imageSignatures.get(k); !ok {
+		v, flight, owner := imageSignatures.claim(r)
+		if owner {
 			pending = append(pending, r)
+		} else if v == nil {
+			waiting = append(waiting, flight.done)
 		}
 	}
-	if len(pending) == 0 {
-		return
-	}
-	if !useSIMDSignatures {
-		// SHA 命令を使える場合は 1 本ずつ固定長の反復を処理する。
+
+	// Publish everything this batch owns before waiting. Two plans can claim
+	// overlapping sets in different orders.
+	if useSIMDSignatures && len(pending) != 0 {
+		lanes := make([]hmacLane, len(pending))
+		for i, r := range pending {
+			lanes[i] = newHMACLane(r.key, r.imageID, r.exp)
+		}
+		iterateLanes(lanes, imageSignatureIterations-1)
+		for i, r := range pending {
+			imageSignatures.finish(r.cacheKey(), lanes[i].bytes())
+		}
+	} else {
 		for _, r := range pending {
-			imageSignatures.put(signatureCacheKey{key: string(r.key), imageID: r.imageID, exp: r.exp}, computeImageSignature(r.key, r.imageID, r.exp))
+			imageSignatures.finish(r.cacheKey(), computeImageSignature(r.key, r.imageID, r.exp))
 		}
-		return
 	}
-	lanes := make([]hmacLane, len(pending))
-	for i, r := range pending {
-		lanes[i] = newHMACLane(r.key, r.imageID, r.exp)
-	}
-	iterateLanes(lanes, imageSignatureIterations-1)
-	for i, r := range pending {
-		imageSignatures.put(signatureCacheKey{key: string(r.key), imageID: r.imageID, exp: r.exp}, lanes[i].bytes())
+	for _, done := range waiting {
+		<-done
 	}
 }
