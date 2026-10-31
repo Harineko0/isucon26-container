@@ -60,12 +60,13 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 			// 投稿画像の created_at は投稿時刻と同じなので、(id, created_at) で引いてパーティションを絞る。
 			// 一致しないものがあれば id だけで引き直す。
 			var rows []struct {
-				ID           string  `db:"id"`
-				Data         []byte  `db:"data"`
-				StoredRegion *string `db:"stored_region"`
+				ID           string    `db:"id"`
+				Data         []byte    `db:"data"`
+				StoredRegion *string   `db:"stored_region"`
+				CreatedAt    time.Time `db:"created_at"`
 			}
 			if err := h.DB.SelectContext(ctx, &rows, `
-    SELECT i.id, i.data, i.stored_region FROM unnest($1::text[], $2::timestamptz[]) AS k(id, created_at)
+    SELECT i.id, i.data, i.stored_region, i.created_at FROM unnest($1::text[], $2::timestamptz[]) AS k(id, created_at)
     JOIN image_objects i ON i.id = k.id AND i.created_at = k.created_at
    `, missingIDs, missingAt); err != nil {
 				return err
@@ -82,7 +83,8 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			if len(rest) > 0 {
 				// 固定の SQL にして、件数ごとに文が変わって Prepare の往復が増えるのを避ける。
-				if err := h.DB.SelectContext(ctx, &rows, `SELECT id, data, stored_region FROM image_objects WHERE id = ANY($1)`, rest); err != nil {
+				// rows に追記される (sqlx の Select はスライスに append する) ので、下のループで両方をまとめて扱う。
+				if err := h.DB.SelectContext(ctx, &rows, `SELECT id, data, stored_region, created_at FROM image_objects WHERE id = ANY($1)`, rest); err != nil {
 					return err
 				}
 			}
@@ -94,6 +96,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 				if row.StoredRegion == nil || len(row.Data) > 0 {
 					images[row.ID] = row.Data
 					imageDataStore.put(row.ID, row.Data)
+					saveInitialImageToDisk(row.ID, row.CreatedAt, row.Data)
 					continue
 				}
 				wg.Add(1)

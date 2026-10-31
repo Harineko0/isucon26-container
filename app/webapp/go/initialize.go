@@ -23,11 +23,13 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := cmd.Run(); err != nil {
 			return err
 		}
-		// ベンチが投稿した画像のファイルを、このサーバーと他のリージョンのサーバーの両方で捨てる。
+		// ベンチが投稿した画像のファイルを、このサーバーと他のリージョンのサーバーの両方で捨てる
+		// (resetImageStore はメモリの imageDataStore も空にする)。
 		if err := resetImageStore(); err != nil {
 			return err
 		}
 		resetPeerImageStores(h.Config.Region)
+		go loadInitialDataBoundary(h.DB)
 		go refreshSearchNorms(h.DB)
 
 		// Set language to the implementation language.

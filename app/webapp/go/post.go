@@ -63,12 +63,18 @@ type PostWithAuthor struct {
 	Author User `db:"author"`
 }
 
+const postsWithWindowFrom = `posts p JOIN posting_windows w ON w.id = p.posting_window_id`
+
 func selectPostsWithAuthor(ctx context.Context, db sqlx.QueryerContext, conditions string, args ...any) ([]PostWithAuthor, error) {
+	return selectPostsWithAuthorFrom(ctx, db, postsWithWindowFrom, conditions, args...)
+}
+
+// selectPostsWithAuthorFrom は FROM 句 (別名 p と w を定義すること) を差し替えられる版。
+func selectPostsWithAuthorFrom(ctx context.Context, db sqlx.QueryerContext, from, conditions string, args ...any) ([]PostWithAuthor, error) {
 	var posts []PostWithAuthor
 	if err := sqlx.SelectContext(ctx, db, &posts, `
   SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
-  FROM posts p
-  JOIN posting_windows w ON w.id = p.posting_window_id
+  FROM `+from+`
   JOIN users u ON u.id = p.author_id AND u.status = 'active'
   WHERE p.deleted_at IS NULL `+conditions, args...); err != nil {
 		return nil, err
