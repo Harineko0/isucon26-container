@@ -138,6 +138,9 @@ func saveInitialImageToDisk(id string, createdAt time.Time, data []byte) {
 }
 
 // imageCreatedAt は画像 id → created_at (不変)。パーティションを絞るために使う。
+// 値は created_at の上限 (手がかり) で、画像の created_at は [値 - 1 時間, 値] に入る
+// (投稿画像と画像取得で得た値は created_at そのもの、RealMoji は realmojis.created_at:
+// 画像は同じトランザクションでそれより先に INSERT される)。外れていても id だけで引き直すので結果は変わらない。
 var imageCreatedAt sync.Map
 
 // 画像の本体は id ごとに不変なので、リージョンごとにメモリへ置いて DB からの転送を省く。
