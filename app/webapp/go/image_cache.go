@@ -55,8 +55,8 @@ func (c *imageDataCache) locate(id string) (data []byte, accelURI string, ok boo
 	if path, ok := imageDiskPath(id); ok && imageFileExists(path) {
 		return nil, imageDiskAccelPrefix + id[:2] + "/" + id, true
 	}
-	if path, ok := imageStorePath(id); ok && imageFileExists(path) {
-		return nil, imageStoreAccelPrefix + id[:2] + "/" + id, true
+	if path, ok := storedImagePath(id); ok {
+		return nil, imageStoreAccelPrefix + filepath.Base(filepath.Dir(path)) + "/" + id, true
 	}
 	return nil, "", false
 }
