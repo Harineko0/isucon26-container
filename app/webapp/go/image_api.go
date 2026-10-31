@@ -44,6 +44,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		cached, hasData := imageDataStore.get(input.ImageID)
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
 		var object struct {
+			OwnerUserID   string    `db:"owner_user_id"`
 			SecretKeyHash string    `db:"secret_key_hash"`
 			MediaType     string    `db:"media_type"`
 			Data          []byte    `db:"data"`
@@ -64,12 +65,36 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
        JOIN users author ON author.id = p.author_id AND author.status = 'active'
        WHERE r.image_id = i.id AND r.reactor_id = u.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
      )
-   , false) AS allowed
+   , false) AS allowed, i.owner_user_id
    FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
    WHERE i.id = $1`
 		conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, c.RealIP())
 		if err != nil {
 			return err
+		}
+		// 本体と所有者が手元にあれば、image_objects を読まずに所有者の行だけで可否と署名を確かめる (image_meta.go)。
+		if meta, ok := loadImageMeta(input.ImageID); ok && hasData {
+			verdict, err := lookupImageByOwner(ctx, conn, input.ImageID, meta.ownerID, sig, exp)
+			if err != nil {
+				conn.Close()
+				return err
+			}
+			switch verdict {
+			case imageServe:
+				conn.Close()
+				if exp <= time.Now().Unix() {
+					return NewAPIError(http.StatusForbidden, "image_forbidden")
+				}
+				return c.Blob(http.StatusOK, meta.mediaType, cached)
+			case imageForbidden:
+				conn.Close()
+				return NewAPIError(http.StatusForbidden, "image_forbidden")
+			case imageInvalidSignature:
+				conn.Close()
+				c.Set("abuse", "invalid_signature")
+				return NewAPIError(http.StatusForbidden, "image_forbidden")
+			}
+			// imageFullLookup: 下の従来の検索で決める。
 		}
 		hinted := false
 		if createdAt, ok := imageCreatedAt.Load(input.ImageID); ok {
@@ -96,6 +121,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		imageMetas.Store(input.ImageID, imageMeta{ownerID: object.OwnerUserID, mediaType: object.MediaType})
 		key, err := imageSigningKey(object.SecretKeyHash)
 		if err != nil {
 			return err

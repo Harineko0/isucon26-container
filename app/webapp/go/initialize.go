@@ -28,6 +28,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		knownSessions.Clear()
 		// ip_bans は TRUNCATE された。アプリ内の BAN も捨てる (他のリージョンの分は localBanTTL で切れる)。
 		h.IPBans.abuse.reset()
+		// 画像の所有者の手がかり。id は再利用されないので他のリージョンに残っても誤らない (image_meta.go)。
+		imageMetas.Clear()
 		go loadInitialDataBoundary(h.DB)
 		go refreshSearchNorms(h.DB)
 
