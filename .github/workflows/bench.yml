@@ -97,8 +97,16 @@ jobs:
           ref: ${{ env.CONTAINER_SHA }}
           fetch-depth: 0 # bench-results を fetch するため
 
+      # 作業ツリーは PR の head なので、判定スクリプトはこのワークフローと同じ commit（GITHUB_SHA）から取る
+      # （freeze.sh を持たない古い PR でも同じ判定になる）
       - name: Freeze check
-        run: ci/bench/freeze.sh
+        run: |
+          set -eu
+          git cat-file -e "$GITHUB_SHA" 2>/dev/null || git fetch -q origin "$GITHUB_SHA"
+          git show "$GITHUB_SHA:ci/bench/freeze.sh" >"$RUNNER_TEMP/freeze.sh"
+          chmod +x "$RUNNER_TEMP/freeze.sh"
+          echo "FREEZE_CHECK=$RUNNER_TEMP/freeze.sh" >>"$GITHUB_ENV"
+          "$RUNNER_TEMP/freeze.sh"
 
       - name: Wait for my turn
         env:
@@ -107,6 +115,7 @@ jobs:
         run: |
           ci/bench/stage.sh queued
           ci/bench/queue.sh
+          "$FREEZE_CHECK" # 待ちの間に凍結時刻を過ぎていたら、ここで止める（#245）
           git fetch -q origin bench-results && git show FETCH_HEAD:results.jsonl >"$HISTORY" || : >"$HISTORY"
 
       - name: Set up SSH
