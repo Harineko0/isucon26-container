@@ -345,9 +345,10 @@ BEGIN
   BEGIN
     -- リアクションした人が存在しなければ外部キー違反(23503) → 'not_found'(従来と同じ結果)。
     INSERT INTO image_objects (id, owner_user_id, data, media_type, stored_region) VALUES (p_image_id, p_actor, p_data, 'image/jpeg', p_stored_region);
-    PERFORM 1 FROM users WHERE id = least(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
+    -- 2 人の users 行は共有ロック (FOR SHARE) にする (理由は isureal_create_comment の上)。
+    PERFORM 1 FROM users WHERE id = least(p_actor, p_author) AND status = 'active' FOR SHARE;
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
-    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
+    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) AND status = 'active' FOR SHARE;
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
     -- 2 人の関係の変更(ブロック・友達の解除など)と直列化する(isureal_lock_pair)。
     PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_author));
@@ -370,6 +371,19 @@ BEGIN
     u.profile_image_id::text, u.region, u.account_type, u.status;
 END $$;
 
+-- コメント・RealMoji (isureal_replace_realmoji) は、リアクションする人と投稿者の users 行を共有ロック (FOR SHARE) でとる。
+-- 以前は FOR NO KEY UPDATE (排他) で、同じ投稿者の投稿へのコメント・RealMoji どうしが投稿者の行で 1 件ずつ
+-- 直列に待っていた (1 ベンチで 2 つの行ロックだけで平均 40〜46ms ずつ)。共有ロックどうしは待たない。
+-- 共有ロックでも直列化が保たれる相手 (FOR SHARE は UPDATE・FOR NO KEY UPDATE・FOR UPDATE と衝突する):
+--   退会 (isureal_delete_account: FOR NO KEY UPDATE → UPDATE users SET status)、PATCH /api/me の region 変更
+--   (isureal_update_me: UPDATE users)、投稿の作成・公開範囲の変更・削除 (isureal_create_post / isureal_update_post /
+--   isureal_delete_post: 投稿者の行を FOR NO KEY UPDATE)、ログイン・ログアウト・プロフィール画像 (FOR NO KEY UPDATE)。
+--   待っている間に退会がコミットされれば、WHERE status = 'active' を新しい版で見直して見つからない (従来と同じ)。
+-- 2 人の関係の変更 (ブロック・友達の解除・友達申請の承認) は users 行をロックせず、2 人組の advisory lock で
+-- 直列化しているので、下の pg_advisory_xact_lock(isureal_pair_lock_key(...)) がそのまま効く。
+-- 共有ロックどうしで衝突しなくなるのはコメント・RealMoji どうしだけで、同じ 2 人組の RealMoji の置き換えは
+-- 2 人組の advisory lock で今までどおり直列になる。ロックの順序 (least → greatest → 2 人組) は変えない。
+-- 同じトランザクションの中で同じ行をより強いモードでロックし直すことはない (昇格によるデッドロックは起きない)。
 -- o_result: ok / forbidden(403 interaction_forbidden)
 CREATE OR REPLACE FUNCTION isureal_create_comment(
   p_actor text, p_post text, p_id text, p_body text
@@ -384,10 +398,10 @@ DECLARE
 BEGIN
   SELECT author_id INTO p_author FROM posts WHERE id = p_post AND deleted_at IS NULL;
   IF NOT FOUND THEN o_result := 'forbidden'; RETURN NEXT; RETURN; END IF;
-  PERFORM 1 FROM users WHERE id = least(p_actor, p_author) FOR NO KEY UPDATE;
+  PERFORM 1 FROM users WHERE id = least(p_actor, p_author) FOR SHARE;
   IF NOT FOUND THEN RAISE EXCEPTION 'user not found'; END IF;
   IF p_actor <> p_author THEN
-    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) FOR NO KEY UPDATE;
+    PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) FOR SHARE;
     IF NOT FOUND THEN RAISE EXCEPTION 'user not found'; END IF;
     -- 2 人の関係の変更(ブロック・友達の解除など)と直列化する(isureal_lock_pair)。
     PERFORM pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_author));
