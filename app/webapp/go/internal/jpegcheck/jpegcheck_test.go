@@ -177,3 +177,17 @@ func BenchmarkValidate(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkValidateBytes exercises the entry point used by the upload handlers.
+func BenchmarkValidateBytes(b *testing.B) {
+	imgs := benchCorpus(b)
+	if len(imgs) == 0 {
+		b.Fatal("no JPEGs in JPEGCHECK_CORPUS")
+	}
+	b.ReportAllocs()
+	for i := 0; b.Loop(); i++ {
+		if _, _, err := ValidateBytes(imgs[i%len(imgs)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

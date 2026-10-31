@@ -36,7 +36,8 @@ func newRealMojiResponse(reaction RealMoji, user User) replaceRealMojiResponse {
 func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input replaceRealMojiRequest
-		if err := c.Bind(&input); err != nil {
+		formImage, err := bindImageForm(c, &input)
+		if err != nil {
 			return err
 		}
 		if input.Image == nil {
@@ -47,13 +48,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		default:
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
-		file, err := input.Image.Open()
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
-		data, err := readUpload(file, input.Image.Size)
+		data, err := readFormImage(input.Image, formImage)
 		if err != nil {
 			return err
 		}
@@ -134,7 +129,7 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
      SELECT m.id, m.post_id, m.reactor_id, m.image_id, m.reaction_type, m.created_at, m.replaced_at, m.deleted_at,
             `+userColumnsAs("u", "reactor")+`
      FROM realmojis m JOIN users u ON u.id = m.reactor_id AND u.status = 'active'
-     WHERE a.can_view AND m.replaced_at IS NULL AND m.deleted_at IS NULL AND m.post_id=$1 AND ($2::timestamptz IS NULL OR (m.created_at,m.id)<($2,$3))
+     WHERE a.can_view AND COALESCE(m.replaced_at, m.deleted_at) IS NULL AND m.post_id=$1 AND ($2::timestamptz IS NULL OR (m.created_at,m.id)<($2,$3))
      ORDER BY m.created_at DESC,m.id DESC LIMIT 51
    ) r ON true
    ORDER BY r.created_at DESC, r.id DESC

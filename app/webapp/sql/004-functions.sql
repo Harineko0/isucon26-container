@@ -186,7 +186,9 @@ BEGIN
             pg_advisory_xact_lock(isureal_pair_lock_key(p_actor, p_target));
     SELECT x.active, x.conflict, fr.id, fr.requester_id INTO v_active, v_conflict, v_pending_id, v_pending_requester
     FROM (SELECT (SELECT count(*) FROM users WHERE id IN (p_actor, p_target) AND status = 'active') = 2 AS active,
-                 EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
+                 EXISTS(SELECT 1 FROM block_relations WHERE blocker_id = p_actor AND blocked_id = p_target
+                        UNION ALL
+                        SELECT 1 FROM block_relations WHERE blocker_id = p_target AND blocked_id = p_actor)
                  OR EXISTS(SELECT 1 FROM friendships WHERE user_low_id = v_low AND user_high_id = v_high) AS conflict) x
     LEFT JOIN LATERAL (
       SELECT id, requester_id FROM friend_requests WHERE status = 'pending' AND
@@ -214,7 +216,9 @@ BEGIN
   IF p_action = 'follow' THEN
     SELECT account_type INTO v_type FROM users WHERE id = p_target AND status = 'active';
     IF v_type IS DISTINCT FROM 'certified_public'
-       OR EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = p_actor AND blocked_id = p_target) OR (blocker_id = p_target AND blocked_id = p_actor))
+       OR EXISTS(SELECT 1 FROM block_relations WHERE blocker_id = p_actor AND blocked_id = p_target
+                 UNION ALL
+                 SELECT 1 FROM block_relations WHERE blocker_id = p_target AND blocked_id = p_actor)
        OR EXISTS(SELECT 1 FROM follows WHERE follower_id = p_actor AND followee_id = p_target) THEN
       o_result := 'conflict'; RETURN NEXT; RETURN;
     END IF;
@@ -258,7 +262,9 @@ BEGIN
   SELECT * INTO v_req FROM friend_requests WHERE id = p_request_id;
   IF v_req.status <> 'pending' THEN o_result := 'forbidden'; RETURN NEXT; RETURN; END IF;
   IF p_status = 'accepted' THEN
-    IF EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = v_req.requester_id AND blocked_id = v_req.recipient_id) OR (blocker_id = v_req.recipient_id AND blocked_id = v_req.requester_id)) THEN
+    IF EXISTS(SELECT 1 FROM block_relations WHERE blocker_id = v_req.requester_id AND blocked_id = v_req.recipient_id
+              UNION ALL
+              SELECT 1 FROM block_relations WHERE blocker_id = v_req.recipient_id AND blocked_id = v_req.requester_id) THEN
       o_result := 'conflict'; RETURN NEXT; RETURN;
     END IF;
     INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
@@ -272,52 +278,60 @@ END $$;
 CREATE OR REPLACE FUNCTION isureal_post_access(p_viewer text, p_post text, OUT can_view boolean, OUT can_comment boolean)
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
-  v users%ROWTYPE;
-  p posts%ROWTYPE;
+  v_region text;
+  p_author_id text;
+  p_visibility text;
   w_ended timestamptz;
   posted boolean;
   is_friend boolean;
 BEGIN
   can_view := false;
   can_comment := false;
-  SELECT pp.* INTO p FROM posts pp JOIN users a ON a.id = pp.author_id AND a.status = 'active'
+  SELECT pp.author_id, pp.visibility, pw.ended_at
+    INTO p_author_id, p_visibility, w_ended
+  FROM posts pp
+  JOIN users a ON a.id = pp.author_id AND a.status = 'active'
+  JOIN posting_windows pw ON pw.id = pp.posting_window_id
   WHERE pp.id = p_post AND pp.deleted_at IS NULL;
   IF NOT FOUND THEN RETURN; END IF;
-  SELECT ended_at INTO w_ended FROM posting_windows WHERE id = p.posting_window_id;
-  SELECT * INTO v FROM users WHERE id = p_viewer AND status = 'active';
+  SELECT region INTO v_region FROM users WHERE id = p_viewer AND status = 'active';
   IF NOT FOUND THEN RETURN; END IF;
   IF w_ended IS NOT NULL THEN
-    can_view := p.author_id = v.id;
+    can_view := p_author_id = p_viewer;
     RETURN;
   END IF;
   posted := EXISTS(
     SELECT 1 FROM posts pp
     JOIN posting_windows pw ON pw.id = pp.posting_window_id
-    JOIN posting_windows cur ON cur.region = v.region AND cur.ended_at IS NULL AND cur.local_date = pw.local_date
-    WHERE pp.author_id = v.id AND pp.deleted_at IS NULL);
-  IF p.author_id = v.id THEN
+    JOIN posting_windows cur ON cur.region = v_region AND cur.ended_at IS NULL AND cur.local_date = pw.local_date
+    WHERE pp.author_id = p_viewer AND pp.deleted_at IS NULL);
+  IF p_author_id = p_viewer THEN
     can_view := true;
-  ELSIF w_ended IS NOT NULL OR NOT posted
-     OR EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id = v.id AND blocked_id = p.author_id) OR (blocker_id = p.author_id AND blocked_id = v.id)) THEN
+  ELSIF NOT posted
+     OR EXISTS(
+       SELECT 1 FROM block_relations WHERE blocker_id = p_viewer AND blocked_id = p_author_id
+       UNION ALL
+       SELECT 1 FROM block_relations WHERE blocker_id = p_author_id AND blocked_id = p_viewer
+     ) THEN
     can_view := false;
-  ELSIF p.visibility = 'public' THEN
+  ELSIF p_visibility = 'public' THEN
     can_view := true;
   ELSE
-    is_friend := EXISTS(SELECT 1 FROM friendships WHERE user_low_id = least(v.id, p.author_id) AND user_high_id = greatest(v.id, p.author_id));
-    IF p.visibility = 'friends' THEN
+    is_friend := EXISTS(SELECT 1 FROM friendships WHERE user_low_id = least(p_viewer, p_author_id) AND user_high_id = greatest(p_viewer, p_author_id));
+    IF p_visibility = 'friends' THEN
       can_view := is_friend;
-    ELSIF p.visibility = 'friends_of_friends' THEN
+    ELSIF p_visibility = 'friends_of_friends' THEN
       can_view := is_friend OR EXISTS(
       SELECT 1 FROM friendships f1
-      CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = v.id THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
-      JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p.author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p.author_id)
-      WHERE f1.user_low_id = v.id OR f1.user_high_id = v.id);
+      CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = p_viewer THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
+      JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = p_author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = p_author_id)
+      WHERE f1.user_low_id = p_viewer OR f1.user_high_id = p_viewer);
     END IF;
   END IF;
-  IF can_view AND w_ended IS NULL THEN
-    IF v.id = p.author_id THEN
+  IF can_view THEN
+    IF p_viewer = p_author_id THEN
       can_comment := posted;
-    ELSIF p.visibility = 'public' THEN
+    ELSIF p_visibility = 'public' THEN
       can_comment := true;
     ELSE
       can_comment := is_friend;
@@ -513,9 +527,11 @@ END $$;
 -- 「開始時刻 (ミリ秒) の 16 進 12 桁 + gen_random_uuid() の後半」と同じで、後半を
 -- md5(期間 id || ':' || 利用者 id) から UUID version 4 / variant 8〜b の形で作る (全体で 36 文字)。
 CREATE OR REPLACE FUNCTION isureal_notification_id(p_window_id text, p_user_id text, p_starts_at timestamptz)
-RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
-  SELECT substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
-         || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12)
-  FROM (SELECT lpad(to_hex((extract(epoch FROM p_starts_at) * 1000)::bigint), 12, '0') AS ts,
-               md5(p_window_id || ':' || p_user_id) AS h) x
-$$;
+RETURNS text LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE
+  ts CONSTANT text := lpad(to_hex((extract(epoch FROM p_starts_at) * 1000)::bigint), 12, '0');
+  h CONSTANT text := md5(p_window_id || ':' || p_user_id);
+BEGIN
+  RETURN substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
+         || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12);
+END $$;

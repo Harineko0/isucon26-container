@@ -38,15 +38,19 @@ func NewServer(config *Config) *echo.Echo {
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
-	db, err := openDB(config)
+	primary, err := openDB(config)
 	if err != nil {
 		panic("failed to open database: " + err.Error())
+	}
+	db, err := openRequestDB(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"))
+	if err != nil {
+		panic("failed to open application DB pool: " + err.Error())
 	}
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
 	}
-	go warmUpDBPool(db, dbMaxConns(config.Region))
+	go warmUpDBPool(db, db.Stats().MaxOpenConnections)
 
 	go func() {
 		// 接続プールの待ちを観測する (stderr → journal。guard は JSON の行しか読まない)。
@@ -62,7 +66,7 @@ func NewServer(config *Config) *echo.Echo {
 		DB:      db,
 		Config:  config,
 		IPBans:  ipBans,
-		Windows: newPostingWindowWatcher(db, config.Region),
+		Windows: newPostingWindowWatcher(primary, config.Region),
 	}
 	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, requests []imageReadRequest) []imageReadResult {
 		return loadImageReadBatch(ctx, handlerContext, rel, requests)

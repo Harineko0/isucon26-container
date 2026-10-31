@@ -3,6 +3,7 @@ package isureal
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -65,6 +66,33 @@ func openDB(config *Config) (*sqlx.DB, error) {
 	sqlDB.SetConnMaxLifetime(dbConnMaxLifetime)
 	sqlDB.SetConnMaxIdleTime(0)
 	return sqlx.NewDb(sqlDB, "pgx"), nil
+}
+
+// SQL transactions can share backends near the primary. A LISTEN connection
+// needs its own session, so the posting-window watcher keeps using primary.
+func openRequestDB(config *Config, primary *sqlx.DB, address string) (*sqlx.DB, error) {
+	if address == "" {
+		return primary, nil
+	}
+	pooled := *config
+	var err error
+	pooled.DBHost, pooled.DBPort, err = net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid application DB pool address: %w", err)
+	}
+	db, err := openDB(&pooled)
+	if err != nil {
+		return nil, err
+	}
+	if config.Region != "asia" {
+		// These are client sockets to PgBouncer. Most of their time is
+		// spent in flight across the WAN, outside a database transaction.
+		db.SetMaxOpenConns(128)
+		db.SetMaxIdleConns(128)
+	}
+	primary.SetMaxOpenConns(4)
+	primary.SetMaxIdleConns(4)
+	return db, nil
 }
 
 // warmUpDBPool はプールの全接続を起動時に張っておき、ベンチ開始直後のリクエストが
