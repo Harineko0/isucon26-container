@@ -94,8 +94,12 @@ CREATE OR REPLACE FUNCTION isureal_login(
 DECLARE
   u users%ROWTYPE;
 BEGIN
-  SELECT * INTO u FROM users WHERE username = p_username FOR NO KEY UPDATE;
-  IF NOT FOUND OR u.status <> 'active' OR u.secret_key_hash <> p_secret_key_hash THEN
+  -- Reject invalid credentials before acquiring a user row lock. The WHERE
+  -- predicate is rechecked after a concurrent update while waiting for the lock.
+  SELECT * INTO u FROM users
+  WHERE username = p_username AND status = 'active' AND secret_key_hash = p_secret_key_hash
+  FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
     o_result := 'invalid'; RETURN NEXT; RETURN;
   END IF;
   UPDATE login_sessions
