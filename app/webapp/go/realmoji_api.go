@@ -83,7 +83,6 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		imageDataStore.put(imageID, data)
-		enqueueImagePush(imageID, data, storedRegion, h.Config.Region)
 		reaction := RealMoji{ID: id, PostID: input.PostID, ReactorID: user.ID, ImageID: imageID, ReactionType: input.ReactionType, CreatedAt: *row.CreatedAt}
 		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))
 	}

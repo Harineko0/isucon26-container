@@ -1,7 +1,6 @@
 package isureal
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -24,7 +23,7 @@ import (
 // 新しく投稿された画像 (投稿・RealMoji・プロフィール画像) の本体は、受け付けたリージョンのサーバーの
 // ディスク (imageStoreDir) に fsync してから DB にメタデータだけを入れる (image_objects.data は空、
 // stored_region に置き場のリージョン)。閲覧可否は従来どおり毎回 DB で判定する。
-// 手元に無い画像は置き場のリージョンのサーバーから private IP (ルーター経由) で取り、ここに複製する。
+// 他リージョンには初回の画像取得・エクスポートで原本を取り寄せて複製する (private IP、ルーター経由)。
 // 初期データの画像 (stored_region IS NULL) は従来どおり DB と imageDiskDir にある。
 var imageStoreDir = envOrDefault("ISUREAL_IMAGE_STORE_DIR", "/home/isucon/imgstore")
 
@@ -270,8 +269,6 @@ var (
 	imagePullFail  atomic.Int64
 	imagePullNanos atomic.Int64
 	imagePullBytes atomic.Int64
-	imagePushCount atomic.Int64
-	imagePushFail  atomic.Int64
 )
 
 func init() {
@@ -282,9 +279,6 @@ func init() {
 			ns, b := imagePullNanos.Swap(0), imagePullBytes.Swap(0)
 			if n > 0 || f > 0 {
 				fmt.Fprintf(os.Stderr, "imgpull n=%d fail=%d avg=%s bytes=%d\n", n, f, time.Duration(ns/max(n, 1)), b)
-			}
-			if pn, pf := imagePushCount.Swap(0), imagePushFail.Swap(0); pn > 0 || pf > 0 {
-				fmt.Fprintf(os.Stderr, "imgpush n=%d fail=%d queued=%d\n", pn, pf, len(imagePushQueue))
 			}
 		}
 	}()
@@ -404,7 +398,7 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 				}
 				return c.NoContent(http.StatusNoContent)
 			case r.Method == http.MethodPut && strings.HasPrefix(path, "images/"):
-				// 他リージョンで受け付けた画像の複製を受け取る (pushStoredImage)。
+				// 順次デプロイ中に旧版の peer が送った画像も受け取れるようにする。
 				id := strings.TrimPrefix(path, "images/")
 				dst, ok := imageStorePath(id)
 				if !ok {
@@ -464,67 +458,5 @@ func imageRegionHint(id string) (string, bool) {
 func prefetchStoredImage(id, selfRegion string) {
 	if region, ok := imageRegionHint(id); ok && region != selfRegion {
 		go loadStoredImage(id, region, selfRegion)
-	}
-}
-
-// 閲覧の大半はアジアなので、ヨーロッパ・アメリカで受け付けた画像はアジアのサーバーへ裏で複製しておく
-// (今まで DB (asia2) へ同期で送っていたのと同じ量を、応答の後に送る)。複製が間に合わなければ、
-// アジアは従来どおり置き場から取りに行く。キューがあふれたら捨てる。
-const imageReplicaRegion = "asia"
-
-type imagePush struct {
-	id   string
-	data []byte
-}
-
-var imagePushQueue = make(chan imagePush, 1024)
-
-func startImagePushers(selfRegion string) {
-	if selfRegion == imageReplicaRegion {
-		return
-	}
-	for range 4 {
-		go func() {
-			for p := range imagePushQueue {
-				pushStoredImage(p)
-			}
-		}()
-	}
-}
-
-func enqueueImagePush(id string, data []byte, storedRegion *string, selfRegion string) {
-	if storedRegion == nil || selfRegion == imageReplicaRegion {
-		return
-	}
-	select {
-	case imagePushQueue <- imagePush{id: id, data: data}:
-	default:
-	}
-}
-
-func pushStoredImage(p imagePush) {
-	url, ok := peerURL(imageReplicaRegion, "/api/internal/images/"+p.id)
-	if !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(p.data))
-	if err != nil {
-		return
-	}
-	req.Header.Set(internalSecretHeader, *internalSecret.Load())
-	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := peerHTTPClient.Do(req)
-	if err != nil {
-		imagePushFail.Add(1)
-		return
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode == http.StatusNoContent {
-		imagePushCount.Add(1)
-	} else {
-		imagePushFail.Add(1)
 	}
 }

@@ -192,7 +192,6 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			PostedAt: *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		imageDataStore.put(imageID, imageData)
-		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
 }
