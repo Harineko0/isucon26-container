@@ -31,7 +31,12 @@ func NewServer(config *Config) *echo.Echo {
 	go removeImageStoreTrash()
 	startImagePushers(config.Region)
 
-	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout))
+	ipBans := newIPBanList()
+	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, func(action string, status int, ip, abuse string) {
+		if kind := abuseKind(action, status, abuse); kind != "" {
+			ipBans.abuse.observe(kind, ip, time.Now())
+		}
+	}))
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
@@ -58,10 +63,11 @@ func NewServer(config *Config) *echo.Echo {
 	handlerContext := &HandlerContext{
 		DB:      db,
 		Config:  config,
-		IPBans:  &IPBanList{},
+		IPBans:  ipBans,
 		Windows: newPostingWindowWatcher(db, config.Region),
 	}
 	e.Pre(InternalMiddleware(handlerContext))
+	go ipBans.abuse.writeLoop(db)
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)
 	go loadInitialDataBoundary(db)

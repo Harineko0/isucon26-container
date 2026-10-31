@@ -55,7 +55,8 @@ var actionNames = map[string]string{
 
 var logLevelRanks = map[string]int{"debug": 0, "info": 1, "error": 2}
 
-func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc {
+// onLogged は書いた action log の 1 行ごとに呼ぶ (isureal-guard が読むのと同じ行。nil なら呼ばない)。
+func ActionLogMiddleware(minLevel string, output io.Writer, onLogged func(action string, status int, ip, abuse string)) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
 			err := next(c)
@@ -105,6 +106,9 @@ func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc 
 				return marshalErr
 			}
 			_, writeErr := output.Write(append(line, '\n'))
+			if onLogged != nil {
+				onLogged(action, status, c.RealIP(), abuse)
+			}
 			return writeErr
 		}
 	}
