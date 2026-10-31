@@ -7,7 +7,7 @@ package jpegcheck
 import "encoding/binary"
 
 // Sequential (non-progressive) scans are validated by a dedicated bit reader
-// over the whole in-memory input: a 64-bit accumulator refilled eight bytes at
+// over the whole in-memory input: a 64-bit accumulator refilled four bytes at
 // a time, and a seqLutBits-bit look-up table that resolves a Huffman code and
 // the length of its amplitude in one step. Coefficient values are never
 // materialised; only the positions (zig) and the number of bits consumed
@@ -27,26 +27,25 @@ const seqLutBits = 10
 // seqMinBits is the number of unread bits that must be present in the
 // accumulator at the start of each symbol for the fast path to proceed without
 // any further availability checks: a Huffman code (<= 16 bits) plus an
-// amplitude (<= 16 bits). A refill normally leaves 56..63 bits.
+// amplitude (<= 16 bits). A four-byte refill leaves 32..63 bits.
 const seqMinBits = 32
 
 // seq table entry layout (uint16):
 //
-//	bits 0..4   bits consumed by the code and its amplitude: code length +
-//	            amplitude size for an AC symbol with a non-zero size, or for
-//	            a DC symbol <= 16; the code length alone otherwise
-//	bits 5..12  the decoded symbol
+//	bits 0..4   bits consumed (code and amplitude for each ordinary
+//	            coefficient, code alone for EOB/ZRL or an invalid DC size)
+//	bits 5..12  the decoded symbol, or the zig-zag advance for a short AC code or pair
+//	bit 15      entry encodes a zig-zag advance
 //	0           the code is longer than seqLutBits bits (use the slow path)
 const (
 	seqEntryBitsMask = 0x1f
 	seqEntrySymShift = 5
+	seqAdvanceFlag   = 1 << 15
 )
 
 // seqReader is the fast bit reader. The top nb bits of acc are unread (MSB
-// first); bits below them are either zero or a correct copy of the following
-// input bytes, never counted. pos is the index of the next raw byte of data;
-// base is the first byte of the current entropy-coded segment (scan start or
-// after a RST marker).
+// first) and the bits below them are zero. pos is the next raw input byte.
+// base is the first byte after the scan start or restart marker.
 type seqReader struct {
 	data []byte
 	pos  int
@@ -60,7 +59,7 @@ type seqReader struct {
 // decodeHuffman does with at least 8 bits available: the 8-bit lut if it hits,
 // the bit-by-bit canonical search otherwise. Malformed (over-subscribed) tables
 // therefore resolve to the same symbols as in image/jpeg.
-func (h *huffman) buildSeqLut(isAC bool) {
+func (h *huffman) buildSeqLut(isAC, prefixFree bool) {
 	for idx := range h.seq {
 		var sym uint8
 		var length int
@@ -90,7 +89,24 @@ func (h *huffman) buildSeqLut(isAC bool) {
 		} else if sym <= 16 {
 			total += int(sym)
 		}
-		h.seq[idx] = uint16(total) | uint16(sym)<<seqEntrySymShift
+		entry := uint16(total) | uint16(sym)<<seqEntrySymShift
+		if isAC && prefixFree && sym&15 != 0 && length <= lutSize {
+			advance := 1 + int(sym>>4)
+			if total < seqLutBits {
+				// Skip the first amplitude and align the remaining prefix
+				// for the 8-bit LUT. Use only a fully determined second code.
+				suffix := (idx << total) & (len(h.seq) - 1)
+				next := h.lut[suffix>>(seqLutBits-lutSize)]
+				length2 := int(next&0xff) - 1
+				size2 := int(next>>8) & 15
+				if size2 != 0 && total+length2 <= seqLutBits {
+					advance += 1 + int(next>>12)
+					total += length2 + size2
+				}
+			}
+			entry = seqAdvanceFlag | uint16(advance)<<seqEntrySymShift | uint16(total)
+		}
+		h.seq[idx] = entry
 	}
 }
 
@@ -130,11 +146,19 @@ func (d *decoder) seqSync() {
 	d.bits.m = (uint32(1) << uint(rem)) >> 1
 }
 
-// hasFF reports whether any byte of w is 0xff (a byte is 0xff exactly when
-// its complement is zero; the classic has-zero-byte test is exact).
-func hasFF(w uint64) bool {
-	x := ^w
-	return (x-0x0101010101010101)&^x&0x8080808080808080 != 0
+// seqAppendWord appends four bytes when they are available without byte
+// stuffing. The caller has fewer than 32 unread bits, so the word always fits.
+func seqAppendWord(data []byte, acc uint64, nb int) (uint64, bool) {
+	if len(data) < 4 {
+		return acc, false
+	}
+	word := binary.BigEndian.Uint32(data)
+	// A zero byte in the complement is a 0xff in the input.
+	x := ^word
+	if (x-0x01010101)&^x&0x80808080 != 0 {
+		return acc, false
+	}
+	return acc | uint64(word)<<(uint(32-nb)&63), true
 }
 
 // seqRefillSlow tops the accumulator up byte by byte, undoing 0xff 0x00 byte
@@ -205,15 +229,12 @@ func (d *decoder) validateSequentialScan(scan *[maxComponents]scanComponent, nCo
 						}
 					}
 
-					// Refill to 56..63 bits. The common case (the next eight bytes hold
-					// no 0xff) is branch-free; otherwise seqRefillSlow handles byte
-					// stuffing and stops at a marker or EOF.
-					if pos+8 <= len(data) && !hasFF(binary.BigEndian.Uint64(data[pos:])) {
-						acc |= binary.BigEndian.Uint64(data[pos:]) >> uint(nb)
-						pos += (63 - nb) >> 3
-						nb |= 56
-					} else {
-						pos, acc, nb = seqRefillSlow(data, pos, acc, nb)
+					if nb < seqMinBits {
+						if next, ok := seqAppendWord(data[pos:], acc, nb); ok {
+							pos, acc, nb = pos+4, next, nb+32
+						} else {
+							pos, acc, nb = seqRefillSlow(data, pos, acc, nb)
+						}
 					}
 					if nb < seqMinBits {
 						// Near a marker or EOF: the reference reader takes this block.
@@ -261,15 +282,12 @@ func (d *decoder) validateSequentialScan(scan *[maxComponents]scanComponent, nCo
 						return FormatError("uninitialized Huffman table")
 					}
 					for zig := 1; zig <= blockSize-1; {
-						// Refill to 56..63 bits. The common case (the next eight bytes hold
-						// no 0xff) is branch-free; otherwise seqRefillSlow handles byte
-						// stuffing and stops at a marker or EOF.
-						if pos+8 <= len(data) && !hasFF(binary.BigEndian.Uint64(data[pos:])) {
-							acc |= binary.BigEndian.Uint64(data[pos:]) >> uint(nb)
-							pos += (63 - nb) >> 3
-							nb |= 56
-						} else {
-							pos, acc, nb = seqRefillSlow(data, pos, acc, nb)
+						if nb < seqMinBits {
+							if next, ok := seqAppendWord(data[pos:], acc, nb); ok {
+								pos, acc, nb = pos+4, next, nb+32
+							} else {
+								pos, acc, nb = seqRefillSlow(data, pos, acc, nb)
+							}
 						}
 						if nb < seqMinBits {
 							r.pos, r.acc, r.nb = pos, acc, nb
@@ -283,7 +301,22 @@ func (d *decoder) validateSequentialScan(scan *[maxComponents]scanComponent, nCo
 						}
 
 						var sym, k int
-						if e := ac.seq[acc>>(64-seqLutBits)]; e != 0 {
+						e := ac.seq[acc>>(64-seqLutBits)]
+						if e&seqAdvanceFlag != 0 {
+							advance := int((e &^ seqAdvanceFlag) >> seqEntrySymShift)
+							if zig+advance <= blockSize {
+								bits := uint(e & seqEntryBitsMask)
+								acc <<= bits
+								nb -= int(bits)
+								zig += advance
+								continue
+							}
+							// The run may overshoot, or the first coefficient may
+							// end the block. Decode the original short code alone.
+							first := ac.lut[acc>>(64-lutSize)]
+							sym = int(first >> 8)
+							k = int(first&0xff) - 1 + (sym & 15)
+						} else if e != 0 {
 							sym = int(e>>seqEntrySymShift) & 0xff
 							k = int(e & seqEntryBitsMask)
 						} else {
