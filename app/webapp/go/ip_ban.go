@@ -16,6 +16,11 @@ const ipBanReloadInterval = 200 * time.Millisecond
 type IPBanList struct {
 	reloading sync.Mutex
 	snapshot  atomic.Pointer[ipBanSnapshot]
+	abuse     *abuseDetector
+}
+
+func newIPBanList() *IPBanList {
+	return &IPBanList{abuse: newAbuseDetector()}
 }
 
 type ipBanSnapshot struct {
@@ -29,6 +34,9 @@ type ipBan struct {
 }
 
 func (l *IPBanList) Banned(ctx context.Context, db *sqlx.DB, ip string) (bool, error) {
+	if l.abuse != nil && l.abuse.bannedAt(ip, time.Now()) {
+		return true, nil
+	}
 	snapshot := l.snapshot.Load()
 	if snapshot == nil && l.reloading.TryLock() {
 		// 初回だけ同期で読み、以降は裏で 200ms ごとに読み直す(リクエストに DB 往復を乗せない)。

@@ -26,6 +26,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		imageDataStore.reset()
 		// login_sessions は作り直されるので、覚えていたセッションも捨てる (他のリージョンの分は DB の確認で外れる)。
 		knownSessions.Clear()
+		// ip_bans は TRUNCATE された。アプリ内の BAN も捨てる (他のリージョンの分は localBanTTL で切れる)。
+		h.IPBans.abuse.reset()
 		go loadInitialDataBoundary(h.DB)
 		go refreshSearchNorms(h.DB)
 
