@@ -56,13 +56,12 @@ var prewarmCandidates = []string{
 	"user_search_dirty", "user_search_dirty_pkey",
 	// 投稿 (フィード・Memories・閲覧可否・当日投稿済み判定)
 	"posts_pkey", "posts_author_window", "posts_image_id", "posts_posting_window_id", "posts",
-	// Memories のコメント一覧・RealMoji 一覧 (ここまでで約 580MB = shared_buffers 768MB の 75%)
-	"comments_post_id", "realmojis_one_active",
-	// ここから先は 'read' になる見込み (shared_buffers 768MB では入らない)。
-	// 画像の閲覧可否確認 (realmojis.image_id と月パーティションの主キーで 1 行引く)、heap
-	"realmojis_image_id", "image_objects_*_pkey",
+	// Memories は投稿 ID から両方の一覧を引く。コメントと RealMoji の主キーは
+	// 使われたページだけ通常の読み取りで載せ、全ページの先読みは省く。
+	"comments_post_id", "realmojis_post_id",
+	// 画像の可否確認とリアクションの照会。大きい索引・heap は予算を超えれば 'read' で読む。
+	"realmojis_image_id", "realmojis_one_active", "image_objects_*_pkey",
 	"comments", "realmojis", "image_objects_*",
-	"comments_pkey", "realmojis_pkey", "realmojis_post_id",
 }
 
 var imageMonthlyPartition = regexp.MustCompile(`^image_objects_[0-9]{6}(_pkey)?$`)
