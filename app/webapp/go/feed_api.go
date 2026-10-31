@@ -190,7 +190,7 @@ const feedBlockedCTE = `
     SELECT blocker_id AS id FROM block_relations WHERE blocked_id = $1
   )`
 
-// feedOpenPostsCTE はどのフィードにも共通する条件（期間中・未削除・本人以外・閲覧者が投稿済み）の投稿。
+// feedOpenPostsCTE は友達の友達フィードで、期間中・未削除・本人以外・閲覧者が投稿済みの投稿を取り出す。
 // 開いている期間の投稿は数百件程度なので MATERIALIZED で先に取り出し、プランナが mutual などから
 // posts_author_id を引く遅い計画（実測 1 秒超）を選ばないようにする。
 // ここに著者の条件（友達・フォロー先）を入れると、著者から posts_author_id を引く計画になり遅くなる（実測 230ms）ので入れない。
@@ -216,14 +216,6 @@ var feedCandidateBase = `
     ) u
     WHERE p.author_id NOT IN (SELECT id FROM blocked)`
 
-// feedUnrankedCandidateBase は非ランキングフィード（public / friends / following）用の候補抽出。
-// ここでは users をまだ引かず、feedUnrankedTail で posted_at, id 降順に並べてから先頭 51 件分の有効な著者だけを主キーで引く
-// （open_posts 全件に対して先に users_pkey を引くと、51 件より後ろの候補まで毎回 users を引いていた）。
-var feedUnrankedCandidateBase = `
-    SELECT p.* FROM open_posts p
-    WHERE p.author_id NOT IN (SELECT id FROM blocked)
-      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))`
-
 // 非ランキングのフィードは score が常に 0 なので posted_at, id の降順だけで並ぶ。
 // viewer から LEFT JOIN LATERAL して、一覧が 0 件でも有効なセッションなら番兵の 1 行を返す。
 var feedUnrankedTail = `
@@ -247,12 +239,18 @@ var feedUnrankedTail = `
   ORDER BY r.posted_at DESC, r.id DESC
 `
 
-// public: 公開投稿は誰でも見られるので、閲覧可否は visibility = 'public' だけで決まる。
+// 公開範囲とカーソルの条件を期間索引で投稿を読む段階で適用する。
+// 非公開の投稿や前のページの本文を中間表に書き出す必要はない。
 func buildFeedPublicQuery(regionParam, tokenParam int) string {
 	return `
-  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
-  candidates AS (` + feedUnrankedCandidateBase + `
-      AND p.visibility = 'public'
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedBlockedCTE + `,
+  candidates AS (
+    SELECT ` + postColumns + `
+    FROM posting_windows w JOIN posts p ON p.posting_window_id = w.id
+    WHERE w.ended_at IS NULL AND p.deleted_at IS NULL AND p.visibility = 'public'
+      AND (SELECT has_posted_today FROM viewer) AND p.author_id <> $1
+      AND p.author_id NOT IN (SELECT id FROM blocked)
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
   )` + feedUnrankedTail
 }
 

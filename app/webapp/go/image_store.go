@@ -130,33 +130,55 @@ func ensureImageStoreDirs() error {
 // writeImageFileDurable は一時ファイルに書いて fsync → rename → ディレクトリを fsync する
 // (応答・DB のコミットより前に呼べば、再起動しても消えない。途中で止まっても壊れたファイルを残さない)。
 func writeImageFileDurable(path string, data []byte) error {
+	return writeImageFileDurableFrom(path, bytes.NewReader(data))
+}
+
+const maxPeerImageBytes = 64 << 20
+
+var errInvalidImageBody = errors.New("invalid image body")
+
+// A read failure on the peer connection is a bad upload. An error writing the
+// local file is a server failure. Keep that distinction through io.Copy.
+type peerImageBody struct{ io.Reader }
+
+func (body peerImageBody) Read(p []byte) (int, error) {
+	n, err := body.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		return n, fmt.Errorf("%w: %w", errInvalidImageBody, err)
+	}
+	return n, err
+}
+
+func writeImageFileDurableFrom(path string, src io.Reader) error {
 	dir := filepath.Dir(path)
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if errors.Is(err, os.ErrNotExist) {
 		if err := ensureImageStoreDirs(); err != nil {
 			return err
 		}
+		tmp, err = os.CreateTemp(dir, ".tmp-*")
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	tmp.Chmod(0o644)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
+	if err = tmp.Chmod(0o644); err == nil {
+		var n int64
+		n, err = io.Copy(tmp, src)
+		if err == nil && n == 0 {
+			err = errInvalidImageBody
+		}
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
+	if err == nil {
+		err = tmp.Sync()
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err == nil {
+		err = os.Rename(tmpName, path)
+	}
+	if err != nil {
 		os.Remove(tmpName)
 		return err
 	}
@@ -404,11 +426,14 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 				if _, err := os.Stat(dst); err == nil {
 					return c.NoContent(http.StatusNoContent)
 				}
-				data, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
-				if err != nil || len(data) == 0 {
+				if r.ContentLength > maxPeerImageBytes {
 					return c.NoContent(http.StatusBadRequest)
 				}
-				if err := writeImageFileDurable(dst, data); err != nil {
+				body := http.MaxBytesReader(nil, r.Body, maxPeerImageBytes)
+				if err := writeImageFileDurableFrom(dst, peerImageBody{body}); err != nil {
+					if errors.Is(err, errInvalidImageBody) {
+						return c.NoContent(http.StatusBadRequest)
+					}
 					return c.NoContent(http.StatusInternalServerError)
 				}
 				return c.NoContent(http.StatusNoContent)

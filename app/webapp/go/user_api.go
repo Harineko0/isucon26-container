@@ -103,7 +103,14 @@ func newGetMeResponse(user User) getMeResponse {
 	return response
 }
 
+const registerSQL = `SELECT * FROM isureal_register($1, $2, $3, $4, $5)`
+
 func registerHandler(h *HandlerContext) echo.HandlerFunc {
+	writes := &writeQueue[sessionUserRow]{db: h.DB, sql: registerSQL}
+	return registerHandlerWithQueue(writes, func(user User) { saveSearchNormsAsync(h.DB, user) })
+}
+
+func registerHandlerWithQueue(writes *writeQueue[sessionUserRow], indexUser func(User)) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input registerRequest
 		if err := c.Bind(&input); err != nil {
@@ -115,17 +122,16 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		secretKey := uuid.NewString()
 		hash := sha256.Sum256([]byte(secretKey))
-		ctx := c.Request().Context()
-		var row sessionUserRow
-		if err := h.DB.GetContext(ctx, &row, `SELECT * FROM isureal_register($1, $2, $3, $4, $5)`,
-			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region); err != nil {
+		row, err := writes.execute(c.Request().Context(), "", uuid.NewString(), input.Username,
+			hex.EncodeToString(hash[:]), input.DisplayName, input.Region)
+		if err != nil {
 			return err
 		}
 		if row.Result != "ok" {
 			return NewAPIError(http.StatusConflict, "username_taken")
 		}
 		user := row.user()
-		saveSearchNormsAsync(h.DB, user)
+		indexUser(user)
 		return c.JSON(http.StatusCreated, registerResponse{SecretKey: secretKey, User: newSessionUserResponse(user)})
 	}
 }
