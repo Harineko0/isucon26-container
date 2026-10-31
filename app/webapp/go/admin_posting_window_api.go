@@ -58,13 +58,28 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		//      投稿を受け付け、watcher (notification_api.go) が SSE を配り始める。
 		//   2. notifications 表への INSERT (リージョンの active な利用者 1 人 1 行、数千行・数百 ms)。
 		// SSE は notifications 表を読まず、期間と利用者から同じ id を組み立てる (#27) ので、
-		// 2 を待たせる必要がない。1 のトランザクションが短くなる分、リージョンの排他ロック
-		// (create_post の共有 advisory lock と競合する) を持つ時間も短くなる。
+		// 2 を待たせる必要がない。1 のトランザクションが短くなる分、直前の期間の行ロック
+		// (create_post の FOR SHARE と競合する) を持つ時間も短くなる。
 		tx, err := h.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
+		// 直前の期間の行ロック (FOR UPDATE) を、投稿に追い越させないため、
+		// 先に posting_windows の表ロックを EXCLUSIVE で取る (#97)。投稿が posting_windows の行ロックを
+		// 取らなくなった (#79、下の advisory lock) 後も、posting_windows への他の書き込みとの直列化として残す。
+		// 行の共有ロック (FOR SHARE) は、行が共有ロックだけで持たれていれば、待っている FOR UPDATE が
+		// あっても待たずに取れる。投稿が途切れずに続くと FOR UPDATE は投稿が 0 件になる瞬間まで待ち続け、
+		// 人数の多い asia の切り替えで 1 秒ほどかかっていた (pg_stat_statements の最大 1,019ms)。
+		// 表ロックは待ち行列が公平なので、この要求より後に来た FOR SHARE (表には ROW SHARE を取る) は
+		// この後ろに並ぶ。待つのは要求の時点で FOR SHARE を持っている投稿 (画像の INSERT を済ませた後の
+		// 残りの数文) だけになる。
+		// EXCLUSIVE は ACCESS SHARE (ふつうの SELECT: フィード、現在の期間、SSE の watcher) とは
+		// 競合しないので、読み取りは止めない。止まるのは全リージョンの create_post の FOR SHARE と
+		// posting_windows への書き込みだけで、その時間はこのトランザクションの長さ (数十 ms) になる。
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE posting_windows IN EXCLUSIVE MODE`); err != nil {
+			return err
+		}
 		var conflict bool
 		if err := tx.GetContext(ctx, &conflict, `SELECT EXISTS(SELECT 1 FROM posting_windows WHERE region = $1 AND local_date >= $2)`, region, localDate); err != nil {
 			return err
@@ -74,11 +89,11 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		// 直前の投稿期間の終了時刻は、進行中の投稿 (create_post) が終わるのを待ってから決める。
 		// 待つ前の時刻で閉じると、待っている間に旧期間へ入った投稿の posted_at が ended_at より後になる。
-		// 投稿は isureal_create_post の中でリージョンごとの advisory lock を共有モードでとるので、
+		// 投稿は isureal_create_post の中でリージョンごとの advisory lock を共有モードでとる (#79。以前の
+		// posting_windows 行の FOR SHARE は、同じ 1 行への共有ロックの重なりが MultiXact を作って投稿側が遅かった)。
 		// ここで同じ鍵を排他モードでとれば、進行中の投稿が全部コミットするまで待ち、以後の投稿はこの
-		// トランザクションのコミットまで待つ (#79。以前は posting_windows の行の FOR SHARE / FOR UPDATE で
-		// 同じことをしていたが、同じ 1 行への共有ロックの重なりが MultiXact を作って投稿側が遅かった)。
-		// 排他ロックは別の文でとる (CTE に入れると評価順が保証されない)。asia1 → asia2 は同一リージョンなので往復 1 回分は小さい。
+		// トランザクションのコミットまで待つ。advisory lock の待ち行列も公平なので、上の表ロックと同じく追い越されない。
+		// 別の文でとる (CTE に入れると評価順が保証されない)。asia1 → asia2 は同一リージョンなので往復 1 回分は小さい。
 		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(isureal_region_lock_key($1))`, region); err != nil {
 			return err
 		}
@@ -109,9 +124,17 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		// 通知の id は SSE (notification_api.go) が投稿期間と利用者から同じ関数で組み立てる。
 		// 期間はもうコミットされているので、失敗しても期間は開いたまま (再送された開始要求は 409)。
 		// 同じ (期間, 利用者) の行が残っていても ON CONFLICT DO NOTHING で再実行できる。
-		if err := insertPostingWindowNotifications(ctx, h.DB, region, windowID, opened.StartsAt); err != nil {
-			return err
-		}
+		//
+		// 応答は通知の INSERT を待たない。notifications 表は実行中に誰も読まない (SSE は期間と利用者から
+		// 組み立てる #27) ので、応答を待たせても得るものが無い。一方ベンチは開始の応答を待ってから
+		// そのリージョンの 1 日を進めるので、待たせた分だけ 1 日の開始が遅れる。ベンチ中の通知 INSERT は
+		// 平均 760ms・最大 7.5 秒で、アジア最終日の開始が 8.4 秒遅れ、グランプリ (20 点) の達成が
+		// 420 人中 12 人に留まっていた (#97)。
+		go func() {
+			if err := insertPostingWindowNotifications(ctx, h.DB, region, windowID, opened.StartsAt); err != nil {
+				log.Printf("failed to insert notifications for window %s: %v", windowID, err)
+			}
+		}()
 		return c.JSON(http.StatusCreated, openPostingWindowResponse{
 			ID: windowID, Region: region, LocalDate: localDate.Format(time.DateOnly),
 			StartsAt: opened.StartsAt, OnTimeDeadline: opened.OnTimeDeadline,

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
@@ -187,15 +188,26 @@ func logoutHandler(h *HandlerContext) echo.HandlerFunc {
 
 func getMeHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		session := GetSession(c)
-		if session == nil {
+		if GetSession(c) == nil {
 			return NewAPIError(http.StatusUnauthorized, "invalid_session")
 		}
-		user, err := getUser(c.Request().Context(), h.DB, session.UserID)
+		// セッションの確認と利用者の取得を 1 文で行う (#82)。
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			User
+		}
+		err := getWithSession(c, h, &row, func() *string { return row.SessRegion }, `
+   SELECT s.sess_region, u.`+strings.Join(userColumns, ", u.")+`
+   FROM {session} JOIN users u ON u.id = s.sess_user_id AND u.status = 'active'
+  `)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		if err != nil {
+			return err
+		}
+		user := row.User
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		return c.JSON(http.StatusOK, newGetMeResponse(user))

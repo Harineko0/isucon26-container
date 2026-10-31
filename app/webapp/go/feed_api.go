@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -44,17 +45,46 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		// 閲覧可否・フィードの種類・おすすめ度・ページングをすべて DB 側で計算し、51 件だけを受け取る。
-		// フィードごとに別の SQL にして、不要な CTE（mutual など）の計画・実行を省く。
-		var posts []feedRow
+		// 閲覧可否・フィードの種類・おすすめ度・ページング・セッション確認をすべて DB 側で 1 文・接続 1 本で計算し、
+		// 51 件だけを受け取る。フィードごとに別の SQL にして、不要な CTE（mutual など）の計画・実行を省く。
+		tokenHash, deferred := deferredSession(c)
+		userID := GetSession(c).UserID
+		var rows []feedRow
+		var query string
 		var args []any
 		if ranked {
-			args = []any{GetSession(c).UserID, input.BeforePostedAt, input.BeforeID, input.BeforeScore}
+			if deferred {
+				query = feedDeferredQueries[input.Feed]
+				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore, h.Config.Region, tokenHash}
+			} else {
+				query = feedQueries[input.Feed]
+				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore}
+			}
 		} else {
-			args = []any{GetSession(c).UserID, input.BeforePostedAt, input.BeforeID}
+			if deferred {
+				query = feedDeferredQueries[input.Feed]
+				args = []any{userID, input.BeforePostedAt, input.BeforeID, h.Config.Region, tokenHash}
+			} else {
+				query = feedQueries[input.Feed]
+				args = []any{userID, input.BeforePostedAt, input.BeforeID}
+			}
 		}
-		if err := sqlx.SelectContext(ctx, h.DB, &posts, feedQueries[input.Feed], args...); err != nil {
+		if err := sqlx.SelectContext(ctx, h.DB, &rows, query, args...); err != nil {
 			return err
+		}
+		var sessRegion *string
+		if len(rows) > 0 {
+			sessRegion = rows[0].SessRegion
+		}
+		if err := finishWithSession(c, h, tokenHash, deferred, len(rows) > 0, sessRegion); err != nil {
+			return err
+		}
+		posts := make([]feedRow, 0, len(rows))
+		for _, row := range rows {
+			if !row.Found {
+				continue
+			}
+			posts = append(posts, row)
 		}
 		plan := newSignaturePlan()
 		for i := range posts {
@@ -83,6 +113,8 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 }
 
 type feedRow struct {
+	SessRegion *string `db:"sess_region"`
+	Found      bool    `db:"found"`
 	PostWithAuthor
 	Score int64 `db:"score"`
 }
@@ -92,27 +124,56 @@ type feedRow struct {
 // 再計画され（計画だけで 1.3〜5ms）、friends-of-friends では mutual から posts_author_id を引く遅い計画（1 秒超）も出た。
 // 判定式は変えずにフィードごとに展開し、開いている期間の投稿を先に取り出す形に固定した。
 //
-// 非ランキング（public / following / friends）: $1 閲覧者, $2 beforePostedAt, $3 beforeId
-// friends-of-friends: $1 閲覧者, $2 beforePostedAt, $3 beforeId, $4 beforeScore
+// 非ランキング（public / following / friends）: $1 閲覧者, $2 beforePostedAt, $3 beforeId (deferred 時は $4 region, $5 tokenHash)
+// friends-of-friends: $1 閲覧者, $2 beforePostedAt, $3 beforeId, $4 beforeScore (deferred 時は $5 region, $6 tokenHash)
 var feedQueries = map[string]string{
-	"public":             feedPublicQuery,
-	"following":          feedFollowingQuery,
-	"friends":            feedFriendsQuery,
-	"friends-of-friends": feedFriendsOfFriendsQuery,
+	"public":             buildFeedPublicQuery(0, 0),
+	"following":          buildFeedFollowingQuery(0, 0),
+	"friends":            buildFeedFriendsQuery(0, 0),
+	"friends-of-friends": buildFeedFriendsOfFriendsQuery(0, 0),
 }
 
-// feedViewerCTE は閲覧者が有効で、今日の期間に投稿済みかを返す。
-const feedViewerCTE = `
-  viewer AS (
-    SELECT EXISTS(
-      SELECT 1 FROM posts p
-      JOIN posting_windows posted ON posted.id = p.posting_window_id
-      JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
-                                  AND current.local_date = posted.local_date
-      WHERE p.author_id = u.id AND p.deleted_at IS NULL
-    ) AS has_posted_today
+var feedDeferredQueries = map[string]string{
+	"public":             buildFeedPublicQuery(4, 5),
+	"following":          buildFeedFollowingQuery(4, 5),
+	"friends":            buildFeedFriendsQuery(4, 5),
+	"friends-of-friends": buildFeedFriendsOfFriendsQuery(5, 6),
+}
+
+// feedViewerSessionCTE は閲覧者が有効で、今日の期間に投稿済みかを返す。
+// deferred 時は同じ 1 行の取得で login_sessions も確認し、リージョン違いなら has_posted_today を false にして
+// open_posts の走査を省きつつ sess_region を返して 403 にする。
+func feedViewerSessionCTE(regionParam, tokenParam int) string {
+	if tokenParam == 0 {
+		return `
+  viewer AS MATERIALIZED (
+    SELECT u.region AS sess_region,
+      EXISTS(
+        SELECT 1 FROM posts p
+        JOIN posting_windows posted ON posted.id = p.posting_window_id
+        JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                                    AND current.local_date = posted.local_date
+        WHERE p.author_id = u.id AND p.deleted_at IS NULL
+      ) AS has_posted_today
     FROM users u WHERE u.id = $1 AND u.status = 'active'
   )`
+	}
+	return fmt.Sprintf(`
+  viewer AS MATERIALIZED (
+    SELECT u.region AS sess_region,
+      (u.region = $%[1]d AND EXISTS(
+        SELECT 1 FROM posts p
+        JOIN posting_windows posted ON posted.id = p.posting_window_id
+        JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                                    AND current.local_date = posted.local_date
+        WHERE p.author_id = u.id AND p.deleted_at IS NULL
+      )) AS has_posted_today
+    FROM users u
+    JOIN login_sessions s ON s.user_id = u.id
+    WHERE u.id = $1 AND u.status = 'active'
+      AND s.token_hash = $%[2]d AND s.active = true
+  )`, regionParam, tokenParam)
+}
 
 const feedFriendsCTE = `
   friends AS (
@@ -153,32 +214,45 @@ var feedCandidateBase = `
     WHERE p.author_id NOT IN (SELECT id FROM blocked)`
 
 // 非ランキングのフィードは score が常に 0 なので posted_at, id の降順だけで並ぶ。
-const feedUnrankedTail = `
-  SELECT c.*, 0::bigint AS score FROM candidates c
-  WHERE $2::timestamptz IS NULL OR (c.posted_at, c.id) < ($2, $3)
-  ORDER BY c.posted_at DESC, c.id DESC
-  LIMIT 51
+// viewer から LEFT JOIN LATERAL して、一覧が 0 件でも有効なセッションなら番兵の 1 行を返す。
+var feedUnrankedTail = `
+  SELECT v.sess_region, r.id IS NOT NULL AS found,
+    ` + postWithAuthorColumnsCoalesced("r") + `,
+    0::bigint AS score
+  FROM viewer v
+  LEFT JOIN LATERAL (
+    SELECT c.* FROM candidates c
+    WHERE $2::timestamptz IS NULL OR (c.posted_at, c.id) < ($2, $3)
+    ORDER BY c.posted_at DESC, c.id DESC
+    LIMIT 51
+  ) r ON true
+  ORDER BY r.posted_at DESC, r.id DESC
 `
 
 // public: 公開投稿は誰でも見られるので、閲覧可否は visibility = 'public' だけで決まる。
-var feedPublicQuery = `
-  WITH` + feedViewerCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
+func buildFeedPublicQuery(regionParam, tokenParam int) string {
+	return `
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
   candidates AS (` + feedCandidateBase + `
       AND p.visibility = 'public'
   )` + feedUnrankedTail
+}
 
 // friends: 著者が友達なら public / friends / friends_of_friends のどれも閲覧できる。
-var feedFriendsQuery = `
-  WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
+func buildFeedFriendsQuery(regionParam, tokenParam int) string {
+	return `
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
   candidates AS (` + feedCandidateBase + `
       AND (p.author_id IN (SELECT id FROM friends)) IS TRUE
       AND p.visibility IN ('public', 'friends', 'friends_of_friends')
   )` + feedUnrankedTail
+}
 
 // following: 著者がフォロー先で、閲覧可否は canView と同じ。
 // 「著者が友達の友達（mutual）」は、著者と閲覧者の友達の間に友達関係があること（著者 <> 閲覧者は上で保証）。
-var feedFollowingQuery = `
-  WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
+func buildFeedFollowingQuery(regionParam, tokenParam int) string {
+	return `
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,` + feedOpenPostsCTE + `,
   candidates AS (` + feedCandidateBase + `
       AND (p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)) IS TRUE
       AND (p.visibility = 'public'
@@ -188,10 +262,15 @@ var feedFollowingQuery = `
                 OR EXISTS(SELECT 1 FROM friendships fs JOIN friends f ON f.id = fs.user_high_id WHERE fs.user_low_id = p.author_id)
                 OR EXISTS(SELECT 1 FROM friendships fs JOIN friends f ON f.id = fs.user_low_id WHERE fs.user_high_id = p.author_id))))
   )` + feedUnrankedTail
+}
 
 // friends-of-friends: 著者は友達ではなく mutual に含まれる。この場合 friends 公開の投稿は見られない。
-var feedFriendsOfFriendsQuery = `
-  WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
+// おすすめ度の「著者の mutual 数」と「著者の友達の mutual 数の和」は、以前は候補ごとの相関副問い合わせで
+// mutual（CTE、友達の多い閲覧者では千数百行）を毎回全件なめていた（候補 36 件で約 13ms）。
+// mutual は id で一意なので LEFT JOIN、著者の友達の和は候補の著者ごとに 1 回だけ集計して LEFT JOIN する（値は同じ）。
+func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
+	return `
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
   mutual AS (
     SELECT id, count(*) AS n FROM (
       SELECT fs.user_high_id AS id FROM friendships fs JOIN friends f ON fs.user_low_id = f.id
@@ -203,6 +282,13 @@ var feedFriendsOfFriendsQuery = `
       AND p.author_id NOT IN (SELECT id FROM friends) AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
       AND p.visibility IN ('public', 'friends_of_friends')
   ),
+  author_fof AS (
+    SELECT a.author_id, sum(m.n) AS s
+    FROM (SELECT DISTINCT author_id FROM candidates) a
+    JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
+    JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
+    GROUP BY a.author_id
+  ),
   scored AS (
     SELECT c.*, (
       10 * (SELECT count(*) FROM (
@@ -212,15 +298,23 @@ var feedFriendsOfFriendsQuery = `
               SELECT cm.author_id FROM comments cm JOIN users cu ON cu.id = cm.author_id AND cu.status = 'active'
               WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
             ) e WHERE e.user_id IN (SELECT id FROM friends))
-      + 3 * COALESCE((SELECT n FROM mutual WHERE id = c.author_id), 0)
-      + LEAST(COALESCE((SELECT sum(m.n) FROM friendships fs
-                        JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = c.author_id THEN fs.user_high_id ELSE fs.user_low_id END
-                        WHERE fs.user_low_id = c.author_id OR fs.user_high_id = c.author_id), 0), 30)
+      + 3 * COALESCE(mm.n, 0)
+      + LEAST(COALESCE(af.s, 0), 30)
       )::bigint AS score
     FROM candidates c
+    LEFT JOIN mutual mm ON mm.id = c.author_id
+    LEFT JOIN author_fof af ON af.author_id = c.author_id
   )
-  SELECT * FROM scored
-  WHERE $4::bigint IS NULL OR (score, posted_at, id) < ($4, $2::timestamptz, $3)
-  ORDER BY score DESC, posted_at DESC, id DESC
-  LIMIT 51
+  SELECT v.sess_region, r.id IS NOT NULL AS found,
+    ` + postWithAuthorColumnsCoalesced("r") + `,
+    COALESCE(r.score, 0)::bigint AS score
+  FROM viewer v
+  LEFT JOIN LATERAL (
+    SELECT * FROM scored
+    WHERE $4::bigint IS NULL OR (score, posted_at, id) < ($4, $2::timestamptz, $3)
+    ORDER BY score DESC, posted_at DESC, id DESC
+    LIMIT 51
+  ) r ON true
+  ORDER BY r.score DESC, r.posted_at DESC, r.id DESC
 `
+}

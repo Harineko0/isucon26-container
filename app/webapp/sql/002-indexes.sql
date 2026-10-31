@@ -4,7 +4,11 @@ CREATE INDEX IF NOT EXISTS administrator_sessions_token_hash ON administrator_se
 DROP INDEX IF EXISTS users_username;
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users(username);
 CREATE INDEX IF NOT EXISTS users_region_active ON users(region) WHERE status = 'active';
-CREATE INDEX IF NOT EXISTS friendships_user_high_id ON friendships(user_high_id);
+-- user_high_id からの逆引き (mutual、フィードの friends_of_friends 判定、閲覧可否) は相手の user_low_id も読むので、
+-- (user_high_id, user_low_id) にして Index Only Scan にする (以前は 1 行ごとにヒープを読んでいた)。
+-- user_high_id 単独の索引はこれで代わる。friendships は 2.5 万行 (6MB) なので作成は 0.1 秒未満。
+CREATE INDEX IF NOT EXISTS friendships_high_low ON friendships(user_high_id, user_low_id);
+DROP INDEX IF EXISTS friendships_user_high_id;
 CREATE INDEX IF NOT EXISTS follows_followee_id ON follows(followee_id);
 CREATE INDEX IF NOT EXISTS block_relations_blocked_id ON block_relations(blocked_id);
 CREATE INDEX IF NOT EXISTS friend_requests_recipient_status ON friend_requests(recipient_id, status);
@@ -39,8 +43,30 @@ CREATE TABLE IF NOT EXISTS user_search_norms (user_id text PRIMARY KEY, username
 -- user_search_dirty は名前が変わって正規化が追いついていない利用者 (検索はアプリで照合する)。
 -- 以下は go/user_read_api.go の searchNormsSchema と同じ (起動時にも作る。変えるときは両方)。
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE INDEX IF NOT EXISTS user_search_norms_username_trgm ON user_search_norms USING gin (username_norm gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS user_search_norms_display_name_trgm ON user_search_norms USING gin (display_name_norm gin_trgm_ops);
+-- fastupdate = off: 既定の fastupdate (on) では INSERT が pending list に積まれ、4MB (gin_pending_list_limit) に
+-- 達したときの INSERT が全部を本体にマージする (保存 1 回の平均 44ms、1 ベンチ 58 秒) うえ、検索のたびに
+-- pending list も線形に読む。off なら INSERT ごとに本体へ入れる (数十エントリ、1〜2ms) ので、検索も保存も均一になる。
+CREATE INDEX IF NOT EXISTS user_search_norms_username_trgm ON user_search_norms USING gin (username_norm gin_trgm_ops) WITH (fastupdate = off);
+CREATE INDEX IF NOT EXISTS user_search_norms_display_name_trgm ON user_search_norms USING gin (display_name_norm gin_trgm_ops) WITH (fastupdate = off);
+-- 既にある索引 (fastupdate = on で作られたもの) は一度だけ切り替える。ALTER INDEX は短い ACCESS EXCLUSIVE を取るので、
+-- 切り替え済みなら何もしない (毎回の initialize でロックを取らない)。ロックが取れないときは次の initialize に回す。
+DO $$
+DECLARE idx text;
+BEGIN
+  FOR idx IN SELECT c.relname FROM pg_class c
+             WHERE c.relname IN ('user_search_norms_username_trgm', 'user_search_norms_display_name_trgm')
+               AND c.relkind = 'i'
+               AND NOT COALESCE(c.reloptions::text[] @> ARRAY['fastupdate=off'], false)
+  LOOP
+    SET LOCAL lock_timeout = '2s';
+    EXECUTE format('ALTER INDEX %I SET (fastupdate = off)', idx);
+    -- 溜まっている pending list を本体に移す (この後は溜まらない)。
+    EXECUTE format('SELECT gin_clean_pending_list(%L::regclass)', idx);
+  END LOOP;
+EXCEPTION
+  WHEN lock_not_available THEN
+    RAISE NOTICE 'gin fastupdate=off skipped: lock not available';
+END $$;
 CREATE TABLE IF NOT EXISTS user_search_dirty (user_id text PRIMARY KEY);
 CREATE OR REPLACE FUNCTION isureal_mark_search_dirty() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -55,3 +81,29 @@ INSERT INTO user_search_dirty (user_id)
   SELECT u.id FROM users u LEFT JOIN user_search_norms s ON s.user_id = u.id
   WHERE s.display_name IS DISTINCT FROM u.display_name
   ON CONFLICT DO NOTHING;
+
+-- users を参照する外部キーを外す (一度だけ)。users の行は消さない (退会は status の更新) ので、参照整合性は
+-- 外部キー無しでも崩れない。各 INSERT が users の行に FOR KEY SHARE を取る内部の SELECT を走らせていた
+-- (1 ベンチ 17,473 回、平均 0.45ms) うえ、同じ利用者の行を投稿 (FOR NO KEY UPDATE) と同時にロックすると
+-- MultiXact を作る。利用者の存在確認は関数の中で別に行っている (isureal_create_post / isureal_replace_realmoji /
+-- isureal_put_profile_image は外部キー違反と同じ結果を自前の確認で返す。isureal_lock_pair は 2 人の active を確認する)。
+-- posts → posting_windows、comments / realmojis → posts の外部キーはそのまま (投稿期間の切替との直列化に関わる)。
+-- DROP CONSTRAINT は両方の表に ACCESS EXCLUSIVE を取る (image_objects は全パーティション) ので、無いときだけ実行し、
+-- ロックが取れなければ次の initialize に回す。
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT con.conname, con.conrelid::regclass AS rel
+           FROM pg_constraint con
+           WHERE con.contype = 'f' AND con.confrelid = 'users'::regclass
+             AND con.conrelid IN ('image_objects'::regclass, 'login_sessions'::regclass, 'friendships'::regclass,
+                                  'follows'::regclass, 'block_relations'::regclass, 'posts'::regclass,
+                                  'friend_requests'::regclass, 'realmojis'::regclass, 'comments'::regclass)
+  LOOP
+    SET LOCAL lock_timeout = '2s';
+    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.rel, r.conname);
+  END LOOP;
+EXCEPTION
+  WHEN lock_not_available THEN
+    RAISE NOTICE 'dropping users foreign keys skipped: lock not available';
+END $$;

@@ -272,9 +272,18 @@ var deferredSessionRoutes = map[string]bool{
 }
 
 // 読み取りだが、セッションの確認をハンドラの SQL に同居させるルート (notification_api.go, posting_window_api.go)。
+// 下の 5 つは getWithSession / selectWithSession で 1 文にする (#82)。EU/US では投機的な確認
+// (GET 1 回で接続 2〜3 本) をやめ、asia でも lookupSession の 1 往復 (接続の取り出し 1 回) を省く。
 func init() {
 	deferredSessionRoutes["GET /api/notifications"] = true
 	deferredSessionRoutes["GET /api/posting-window/current"] = true
+	deferredSessionRoutes["GET /api/me"] = true
+	deferredSessionRoutes["GET /api/users/:userId"] = true
+	deferredSessionRoutes["GET /api/relationships/:kind"] = true
+	deferredSessionRoutes["GET /api/posts/:postId/comments"] = true
+	deferredSessionRoutes["GET /api/posts/:postId/realmojis"] = true
+	deferredSessionRoutes["GET /api/memories"] = true
+	deferredSessionRoutes["GET /api/memories/:date"] = true
 }
 
 // deferredSessionCheckedKey は、deferred 経路でハンドラがセッションを確認する SQL を実行したことを示す。
@@ -294,6 +303,10 @@ func verifyDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string,
 	region := ""
 	if session != nil {
 		region = session.Region
+		if anyRegionDeferredRoutes[c.Request().Method+" "+c.RouteInfo().Path] {
+			// RegionMiddleware の無いルートなので、リージョンが違っても 403 にしない。
+			region = h.Config.Region
+		}
 	}
 	if err := rejectDeferredSession(c, h, tokenHash, session != nil, region); err != nil {
 		return err
@@ -326,22 +339,29 @@ func deferredSession(c *echo.Context) (string, bool) {
 // セッションの確認と同じ 1 文で実行する。{user} はセッションの利用者 id に置き換わる。
 // 結果の行は sess_region 列を持つ構造体で受ける。セッションが無効なら 401、リージョン違いなら 403。
 func callWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion func() *string, call string, args ...any) error {
+	return callWithSessionColumns(c, h, dest, sessRegion, "r.*", call, args...)
+}
+
+// callWithSessionColumns は callWithSession の、結果の選択リスト (既定 `r.*`) を差し替えられる版。
+// リージョン違いでは関数が呼ばれず r の列が NULL になるので、NOT NULL の列を COALESCE で埋めれば
+// 値の型 (string など) のまま受けられる (#17 PATCH /api/posts/:postId)。
+func callWithSessionColumns(c *echo.Context, h *HandlerContext, dest any, sessRegion func() *string, columns, call string, args ...any) error {
 	ctx := c.Request().Context()
 	tokenHash, deferred := deferredSession(c)
 	if !deferred {
 		args = append(args, GetSession(c).UserID)
-		query := `SELECT NULL::text AS sess_region, r.* FROM ` + strings.ReplaceAll(call, "{user}", fmt.Sprintf("$%d", len(args))) + ` r`
+		query := `SELECT NULL::text AS sess_region, ` + columns + ` FROM ` + strings.ReplaceAll(call, "{user}", fmt.Sprintf("$%d", len(args))) + ` r`
 		return h.DB.GetContext(ctx, dest, query, args...)
 	}
 	args = append(args, tokenHash, h.Config.Region)
 	n := len(args)
 	query := fmt.Sprintf(`
-		SELECT s.sess_region, r.* FROM (
+		SELECT s.sess_region, %s FROM (
 			SELECT s.user_id AS sess_user_id, u.region AS sess_region
 			FROM login_sessions s JOIN users u ON u.id = s.user_id
 			WHERE s.token_hash = $%d AND s.active = true AND u.status = 'active'
 		) s LEFT JOIN LATERAL (SELECT * FROM %s WHERE s.sess_region = $%d OFFSET 0) r ON true`,
-		n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
+		columns, n-1, strings.ReplaceAll(call, "{user}", "s.sess_user_id"), n)
 	err := h.DB.GetContext(ctx, dest, query, args...)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.Set(deferredSessionCheckedKey, true)
@@ -358,4 +378,79 @@ func callWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion fu
 		return NewAPIError(http.StatusForbidden, "region_mismatch")
 	}
 	return nil
+}
+
+// sessionSource は読み取りの 1 文に同居させるセッションの FROM 句の要素 `s` (sess_user_id, sess_region) を返す。
+// deferred (覚えているセッションがある) なら login_sessions を引き、セッションが無効なら 0 行になる。
+// そうでなければ SessionMiddleware で確認済みの利用者 id だけの 1 行 (sess_region は NULL = 確認済み)。
+func sessionSource(c *echo.Context, args []any) (source string, sessionArgs []any, tokenHash string, deferred bool) {
+	tokenHash, deferred = deferredSession(c)
+	if !deferred {
+		args = append(args, GetSession(c).UserID)
+		return fmt.Sprintf(`(SELECT $%d::text AS sess_user_id, NULL::text AS sess_region) s`, len(args)), args, "", false
+	}
+	args = append(args, tokenHash)
+	return fmt.Sprintf(`(SELECT s.user_id AS sess_user_id, u.region AS sess_region
+		FROM login_sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $%d AND s.active = true AND u.status = 'active') s`, len(args)), args, tokenHash, true
+}
+
+// finishWithSession は 1 文で確認したセッションの結果 (行の有無と sess_region) を 401/403/nil にする。
+// deferred でなければセッションは確認済みなので何もしない。
+func finishWithSession(c *echo.Context, h *HandlerContext, tokenHash string, deferred, found bool, sessRegion *string) error {
+	if !deferred {
+		return nil
+	}
+	region := ""
+	if sessRegion != nil {
+		region = *sessRegion
+	}
+	return rejectDeferredSession(c, h, tokenHash, found, region)
+}
+
+// getWithSession は 1 行を返す読み取りの query を、セッションの確認と同じ 1 文で実行する (callWithSession の読み取り版)。
+// query の {session} には sess_user_id と sess_region を持つ 1 行の `s` が入り、結果の行は sess_region 列を持つ。
+// deferred のとき 0 行なら 401、sess_region がこのサーバと違えば 403。deferred でない 0 行は sql.ErrNoRows のまま返す。
+func getWithSession(c *echo.Context, h *HandlerContext, dest any, sessRegion func() *string, query string, args ...any) error {
+	source, args, tokenHash, deferred := sessionSource(c, args)
+	err := h.DB.GetContext(c.Request().Context(), dest, strings.ReplaceAll(query, "{session}", source), args...)
+	if deferred && errors.Is(err, sql.ErrNoRows) {
+		return finishWithSession(c, h, tokenHash, deferred, false, nil)
+	}
+	if err != nil {
+		return err
+	}
+	return finishWithSession(c, h, tokenHash, deferred, true, sessRegion())
+}
+
+// selectWithSession は複数行を返す読み取りの query を、セッションの確認と同じ 1 文で実行する。
+// query は `{session} LEFT JOIN LATERAL (...) r ON true` の形にして、セッションが有効なら一覧が空でも
+// 必ず 1 行 (r.* が NULL の番兵) を返すこと。rows は行数と先頭行の sess_region を返す。
+// 0 行は deferred のときだけ起こり、セッションが無効 (401)。
+func selectWithSession(c *echo.Context, h *HandlerContext, dest any, rows func() (int, *string), query string, args ...any) error {
+	source, args, tokenHash, deferred := sessionSource(c, args)
+	if err := h.DB.SelectContext(c.Request().Context(), dest, strings.ReplaceAll(query, "{session}", source), args...); err != nil {
+		return err
+	}
+	n, sessRegion := rows()
+	return finishWithSession(c, h, tokenHash, deferred, n > 0, sessRegion)
+}
+
+// userColumnsCoalesced は LEFT JOIN LATERAL の番兵の行 (全列 NULL) を User にそのまま読めるよう、
+// NOT NULL の列を空文字で埋めた選択リストを返す。profile_image_id は NULL を区別するのでそのまま。
+// prefix が空なら列名そのまま、あれば alias."prefix.col" を読んで同じ名前で返す。
+func userColumnsCoalesced(alias, prefix string) string {
+	columns := make([]string, len(userColumns))
+	for i, column := range userColumns {
+		name := column
+		if prefix != "" {
+			name = fmt.Sprintf(`"%s.%s"`, prefix, column)
+		}
+		if column == "profile_image_id" {
+			columns[i] = fmt.Sprintf(`%s.%s AS %s`, alias, name, name)
+			continue
+		}
+		columns[i] = fmt.Sprintf(`COALESCE(%s.%s, '') AS %s`, alias, name, name)
+	}
+	return strings.Join(columns, ", ")
 }

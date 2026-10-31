@@ -4,13 +4,15 @@
 -- 投稿時刻 (posted_at) はアプリの時計ではなく、この関数の中で DB の時計 (clock_timestamp()) から決めて返す。
 -- 投稿期間の starts_at / ended_at / on_time_deadline も DB の時計なので、ホスト間の時計ずれが
 -- onTime 判定や「p_posted_at < starts_at → 409」に影響しない。
--- 引数と戻り値が変わったので、古い定義 (p_posted_at 付き) は消してから作る (CREATE OR REPLACE では戻り値を変えられない)。
+-- p_stored_region: 画像の本体を置いたリージョン (data は空)。NULL なら本体は p_data (007-image-location.sql)。
+-- 引数と戻り値が変わったので、古い定義は消してから作る (CREATE OR REPLACE では戻り値を変えられない)。
 DROP FUNCTION IF EXISTS isureal_create_post(text, text, text, bytea, text, text, text, numeric, numeric, text, timestamptz);
 DROP FUNCTION IF EXISTS isureal_create_post(text, text, text, bytea, text, text, text, numeric, numeric, text);
+DROP FUNCTION IF EXISTS isureal_create_post(text, text, text, bytea, text, text, text, numeric, numeric, text, text);
 
 CREATE FUNCTION isureal_create_post(
   p_user_id text, p_image_id text, p_post_id text, p_data bytea, p_caption text, p_visibility text,
-  p_location_kind text, p_latitude numeric, p_longitude numeric, p_locality text
+  p_location_kind text, p_latitude numeric, p_longitude numeric, p_locality text, p_stored_region text
 ) RETURNS TABLE (
   o_result text, o_window_id text, o_on_time_deadline timestamptz, o_posted_at timestamptz,
   o_latitude double precision, o_longitude double precision, o_locality text,
@@ -36,8 +38,8 @@ BEGIN
     v_image_at := clock_timestamp();
     v_posted_at := v_image_at;
     -- 利用者が存在しなければ外部キー違反(23503) → 'no_user'(従来と同じ結果)。
-    INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
-    VALUES (p_image_id, p_user_id, p_data, 'image/jpeg', v_image_at);
+    INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at, stored_region)
+    VALUES (p_image_id, p_user_id, p_data, 'image/jpeg', v_image_at, p_stored_region);
     PERFORM 1 FROM users WHERE id = p_user_id FOR NO KEY UPDATE;
     IF NOT FOUND THEN
       v_fail := 'no_user'; RAISE SQLSTATE 'IR001';
@@ -308,7 +310,7 @@ END $$;
 
 -- o_result: ok / forbidden(403 interaction_forbidden) / not_found(404 relationship_not_found)
 CREATE OR REPLACE FUNCTION isureal_replace_realmoji(
-  p_actor text, p_post text, p_id text, p_image_id text, p_data bytea, p_reaction_type text
+  p_actor text, p_post text, p_id text, p_image_id text, p_data bytea, p_reaction_type text, p_stored_region text
 ) RETURNS TABLE (
   o_result text, o_created_at timestamptz,
   o_id text, o_username text, o_secret_key_hash text, o_display_name text, o_bio text,
@@ -325,7 +327,7 @@ BEGIN
   -- (isureal_create_post と同じ。画像を孤児にしない)。
   BEGIN
     -- リアクションした人が存在しなければ外部キー違反(23503) → 'not_found'(従来と同じ結果)。
-    INSERT INTO image_objects (id, owner_user_id, data, media_type) VALUES (p_image_id, p_actor, p_data, 'image/jpeg');
+    INSERT INTO image_objects (id, owner_user_id, data, media_type, stored_region) VALUES (p_image_id, p_actor, p_data, 'image/jpeg', p_stored_region);
     PERFORM 1 FROM users WHERE id = least(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
     IF NOT FOUND THEN v_fail := 'not_found'; RAISE SQLSTATE 'IR001'; END IF;
     PERFORM 1 FROM users WHERE id = greatest(p_actor, p_author) AND status = 'active' FOR NO KEY UPDATE;
@@ -386,7 +388,7 @@ BEGIN
 END $$;
 
 -- o_result: ok / not_found(404 account_not_found)
-CREATE OR REPLACE FUNCTION isureal_put_profile_image(p_user text, p_image_id text, p_data bytea)
+CREATE OR REPLACE FUNCTION isureal_put_profile_image(p_user text, p_image_id text, p_data bytea, p_stored_region text)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
   v_old text;
@@ -394,7 +396,7 @@ BEGIN
   -- 画像の INSERT は利用者のロックを取る前に済ませる。'not_found' のときはブロックごと巻き戻す。
   BEGIN
     -- 利用者が存在しなければ外部キー違反(23503) → 'not_found'(従来と同じ結果)。
-    INSERT INTO image_objects (id, owner_user_id, data, media_type) VALUES (p_image_id, p_user, p_data, 'image/jpeg');
+    INSERT INTO image_objects (id, owner_user_id, data, media_type, stored_region) VALUES (p_image_id, p_user, p_data, 'image/jpeg', p_stored_region);
     SELECT profile_image_id INTO v_old FROM users WHERE id = p_user FOR NO KEY UPDATE;
     IF NOT FOUND THEN RAISE SQLSTATE 'IR001'; END IF;
   EXCEPTION

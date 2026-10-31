@@ -24,12 +24,15 @@ func NewServer(config *Config) *echo.Echo {
 	e := echo.New()
 	e.IPExtractor = extractClientIP
 
+	setInternalSecret(config)
+	if err := ensureImageStoreDirs(); err != nil {
+		panic("failed to prepare image store: " + err.Error())
+	}
+	go removeImageStoreTrash()
+	startImagePushers(config.Region)
+
 	ipBans := newIPBanList()
-	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, func(action string, status int, ip, abuse string) {
-		if kind := abuseKind(action, status, abuse); kind != "" {
-			ipBans.abuse.observe(kind, ip, time.Now())
-		}
-	}))
+	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, ipBans.observeActionLog))
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
@@ -59,11 +62,13 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans:  ipBans,
 		Windows: newPostingWindowWatcher(db, config.Region),
 	}
+	e.Pre(InternalMiddleware(handlerContext))
 	go ipBans.abuse.writeLoop(db)
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)
 	go cleanSearchDirtyLoop(db)
 	go loadInitialDataBoundary(db)
+	go loadProfileImageHints(db)
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
 	e.POST("/api/auth/register", registerHandler(handlerContext))

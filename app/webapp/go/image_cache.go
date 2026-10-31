@@ -79,6 +79,26 @@ func imageDiskAccelPath(id string) (string, bool) {
 	return "/_imgcache/" + id[:2] + "/" + id, true
 }
 
+// imageOwnerKeys は画像 id → 所有者の署名鍵 (users.secret_key_hash を decode したもの)。
+// image_objects.owner_user_id も secret_key_hash も UPDATE されない (git grep で確認) ので不変。
+// 署名が合わないリクエストを DB に問い合わせる前に 403 にするために使う (#95)。
+// 投稿・RealMoji の作成時と、画像取得で DB から読んだときに覚える。上限を超えて捨てても DB での確認に戻るだけ。
+var imageOwnerKeys = &boundedMap{limit: 2_000_000}
+
+func rememberImageKey(id string, key []byte) {
+	if len(key) != 0 {
+		imageOwnerKeys.Store(id, key)
+	}
+}
+
+func loadImageKey(id string) ([]byte, bool) {
+	v, ok := imageOwnerKeys.Load(id)
+	if !ok {
+		return nil, false
+	}
+	return v.([]byte), true
+}
+
 func readImageFromDisk(id string) ([]byte, bool) {
 	path, ok := imageDiskPath(id)
 	if !ok {
@@ -152,33 +172,12 @@ func saveInitialImageToDisk(id string, createdAt time.Time, data []byte) {
 	}
 }
 
-// imageHint は画像 id ごとに覚える不変の手がかり。
-//   - createdAt: created_at の上限。パーティションを絞るために使う。画像の created_at は [値 - 1 時間, 値] に入る
-//     (投稿画像と画像取得で得た値は created_at そのもの、RealMoji は realmojis.created_at:
-//     画像は同じトランザクションでそれより先に INSERT される)。外れていても id だけで引き直すので結果は変わらない。
-//   - key: 所有者の署名鍵 (users.secret_key_hash を decode したもの)。image_objects.owner_user_id も
-//     secret_key_hash も UPDATE されない (git grep で確認) ので不変。署名が合わないリクエストを DB に
-//     問い合わせる前に 403 にするために使う (#95)。nil なら不明。
-//
-// 1 件 200 バイト程度。上限を超えて捨てても id だけの検索と DB での署名確認に戻るだけ。
-type imageHint struct {
-	createdAt time.Time
-	key       []byte
-}
-
-var imageHints = &boundedMap{limit: 2_000_000}
-
-func rememberImage(id string, createdAt time.Time, key []byte) {
-	imageHints.Store(id, imageHint{createdAt: createdAt, key: key})
-}
-
-func loadImageHint(id string) (imageHint, bool) {
-	v, ok := imageHints.Load(id)
-	if !ok {
-		return imageHint{}, false
-	}
-	return v.(imageHint), true
-}
+// imageCreatedAt は画像 id → created_at (不変)。パーティションを絞るために使う。
+// 値は created_at の上限 (手がかり) で、画像の created_at は [値 - 1 時間, 値] に入る
+// (投稿画像と画像取得で得た値は created_at そのもの、RealMoji は realmojis.created_at:
+// 画像は同じトランザクションでそれより先に INSERT される)。外れていても id だけで引き直すので結果は変わらない。
+// 1 件 150 バイト程度。上限を超えて捨てても id だけの検索に戻るだけ。
+var imageCreatedAt = &boundedMap{limit: 2_000_000}
 
 // 画像の本体は id ごとに不変なので、リージョンごとにメモリへ置いて DB からの転送を省く。
 // 閲覧可否は毎回 DB で確認するので、ここに残った削除済み画像が返ることはない。
@@ -212,12 +211,16 @@ func (c *imageDataCache) getMemory(id string) ([]byte, bool) {
 	return data, ok && data != nil
 }
 
-// get はヒープに無ければディスクから読んでヒープに入れる (エクスポートのように本体が要る呼び出し向け)。
+// get はヒープに無ければディスクから読んでヒープに入れる。
 func (c *imageDataCache) get(id string) ([]byte, bool) {
 	if data, ok := c.getMemory(id); ok {
 		return data, true
 	}
 	if data, ok := readImageFromDisk(id); ok {
+		c.put(id, data)
+		return data, true
+	}
+	if data, ok := readImageFromStore(id); ok {
 		c.put(id, data)
 		return data, true
 	}

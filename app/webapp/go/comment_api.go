@@ -70,25 +70,49 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 		if (input.AfterCreatedAt == nil) != (input.AfterID == "") {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
-		ctx := c.Request().Context()
-		// 権限の判定と一覧の取得を並行に行い、権限がなければ一覧は捨てる。
-		var comments []CommentWithAuthor
-		var listErr error
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			comments, listErr = selectCommentsWithAuthor(ctx, h.DB, `AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3)) ORDER BY c.created_at,c.id LIMIT 51`, input.PostID, input.AfterCreatedAt, input.AfterID)
-		}()
-		_, allowed, err := postAccess(ctx, h.DB, GetSession(c).UserID, input.PostID)
-		<-done
-		if err != nil {
+		// セッションの確認・権限の判定 (isureal_post_access)・一覧の取得を 1 文・接続 1 本で行う (#82)。
+		// 権限が無いか一覧が空なら番兵の行 (found = false) が 1 行返る。
+		var rows []struct {
+			SessRegion *string `db:"sess_region"`
+			Allowed    bool    `db:"allowed"`
+			Found      bool    `db:"found"`
+			CommentWithAuthor
+		}
+		if err := selectWithSession(c, h, &rows, func() (int, *string) {
+			if len(rows) == 0 {
+				return 0, nil
+			}
+			return len(rows), rows[0].SessRegion
+		}, `
+   SELECT s.sess_region, a.can_comment AS allowed, r.id IS NOT NULL AS found,
+          COALESCE(r.id, '') AS id, COALESCE(r.post_id, '') AS post_id, COALESCE(r.author_id, '') AS author_id,
+          COALESCE(r.body, '') AS body, COALESCE(r.created_at, 'epoch') AS created_at, r.deleted_at,
+          `+userColumnsCoalesced("r", "author")+`
+   FROM {session}
+   CROSS JOIN LATERAL isureal_post_access(s.sess_user_id, $1) a
+   LEFT JOIN LATERAL (
+     SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, `+userColumnsAs("u", "author")+`
+     FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
+     WHERE a.can_comment AND c.deleted_at IS NULL AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3))
+     ORDER BY c.created_at,c.id LIMIT 51
+   ) r ON true
+   ORDER BY r.created_at, r.id
+  `, input.PostID, input.AfterCreatedAt, input.AfterID); err != nil {
 			return err
 		}
-		if !allowed {
+		if len(rows) == 0 || !rows[0].Allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		if listErr != nil {
-			return listErr
+		comments := make([]CommentWithAuthor, 0, len(rows))
+		for _, row := range rows {
+			if !row.Found {
+				continue
+			}
+			comment := row.CommentWithAuthor
+			if err := comment.Author.setImageKey(); err != nil {
+				return err
+			}
+			comments = append(comments, comment)
 		}
 		plan := newSignaturePlan()
 		for _, comment := range comments {
@@ -117,11 +141,16 @@ func deleteCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_delete_comment($1, $2)`, actor, input.CommentID); err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_comment({user}, $1) AS result)`, input.CommentID); err != nil {
 			return err
+		}
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
 		}
 		switch result {
 		case "ok":
