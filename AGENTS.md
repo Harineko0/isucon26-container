@@ -43,6 +43,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
   | `app-america/` | america1 | <https://github.com/Harineko0/isucon26-america> | `ISUREAL_REGION=america` |
 
   `app-europe/` と `app-america/` は各サーバの初期状態（`init` コミット）のまま。改善中のコードは `app/` にあり、ルートの `deploy.sh` は `app/webapp` の Go と SQL を 3 台すべてに配る。
+- `/home` 以外の設定（nginx、systemd unit、sysctl、PostgreSQL）は `infra/` で管理する。サーバ上で直接編集せず、`infra/` を直して `infra/deploy.sh` で配る。使い方は [infra/README.md](infra/README.md)。
 - 稼働中は Go 実装（`isureal-go.service`、`:8080`、前段に nginx）。`webapp/{go,rust,nodejs,perl,php,python,ruby}` は同一 API の参照実装で、Rust 版は `xxx.go` ⇔ `src/xxx.rs` でファイル名・SQL・ロック順が揃っている。
 - 設定は `/home/isucon/env.sh`（`ISUREAL_REGION` / `ISUREAL_DB_*`、`ISUREAL_LOG_LEVEL`）。region 値はサーバごとに異なる。
 - ビルド: `cd app/webapp/go && make`（`go build -o isureal cmd/isureal/main.go`）。Rust は `cd app/webapp/rust && make` / `make lint`。Go にも Rust にもテストは同梱されていない。
