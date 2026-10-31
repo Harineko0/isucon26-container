@@ -75,7 +75,7 @@
 ルール:
 - 共有関数のシグネチャは変えない(例: `signedImageURL(user, imageID)` は C が中身だけ変え、D はそのまま呼ぶ)。
 - 索引は `sql/` の冪等なファイル(`CREATE INDEX IF NOT EXISTS`)に追記し、`init.sh` から reset 前に流す。B がレビューする。
-- **ベンチとデプロイは CI だけ**（[ci/README.md](ci/README.md)）。各自が PR を open すると（測り直しは `/bench` コメント）、CI が到着順に 1 本ずつデプロイしてベンチし、同じ PR の前回との差（初回は main の基準値との差）を PR にコメントする。効いた PR から main にマージする。マージすると main の基準値が自動で測り直される。
+- **ベンチとデプロイは CI だけ**（[ci/README.md](ci/README.md)）。各自が PR に `/bench` とコメントすると、CI が到着順に 1 本ずつデプロイしてベンチし、同じ PR の前回との差（初回は main の基準値との差）を PR にコメントする。効いた PR から main にマージする。マージすると main の基準値が自動で測り直される。
 - ローカルでは既存のテスト(`make test`)と簡単なスモークテストで仕様の後退を防ぐ。
 - 新しく入れたキャッシュは、必ず initialize で全リージョン分を消す。
 

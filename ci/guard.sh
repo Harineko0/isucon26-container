@@ -5,7 +5,7 @@
 if [ -z "${GITHUB_ACTIONS:-}" ] && [ "${ALLOW_LOCAL_DEPLOY:-}" != 1 ]; then
   cat >&2 <<'EOF'
 ERROR: デプロイ・スモーク・ベンチは CI からのみ実行する。
-  isucon26-container に PR を open すると自動で走る（測り直しは PR に `/bench [メモ]` とコメント）。
+  isucon26-container の PR に `/bench [メモ]` とコメントすると走る。
   main を回す: gh workflow run bench.yml -R Harineko0/isucon26-container
   詳細: ci/README.md
 EOF
