@@ -60,7 +60,7 @@ func openDB(config *Config) (*sqlx.DB, error) {
 	})}
 	if preparedWarmEnabled(config.Region) {
 		// 前回のプロセスでよく実行した文面を、接続を張った直後に 1 往復で Prepare しておく (prepared_warm.go)。
-		if schema, err := schemaFingerprint(preparedWarmSchemaDir); err != nil {
+		if schema, err := buildFingerprint(preparedWarmSchemaDir); err != nil {
 			fmt.Fprintf(os.Stderr, "prepared-warm: disabled: %v\n", err)
 		} else {
 			setWarmStatements(loadWarmStatementsFile(preparedWarmFile, schema))

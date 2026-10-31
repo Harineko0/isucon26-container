@@ -51,7 +51,7 @@ func TestWarmStatementsFileRoundTrip(t *testing.T) {
 	if got := loadWarmStatementsFile(path, "s1"); !slices.Equal(got, list) {
 		t.Fatalf("loaded %q, want %q", got, list)
 	}
-	// sql/ が変わった (別の指紋) なら使わず、ファイルも空になる (後で s1 に戻っても使わない)。
+	// sql/ かバイナリが変わった (別の指紋) なら使わず、ファイルも空になる (後で s1 に戻っても使わない)。
 	if got := loadWarmStatementsFile(path, "s2"); got != nil {
 		t.Fatalf("other schema = %q, want nil", got)
 	}
@@ -66,31 +66,39 @@ func TestWarmStatementsFileRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSchemaFingerprint(t *testing.T) {
+func TestBuildFingerprint(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := schemaFingerprint(dir); err == nil {
+	if _, err := contentFingerprint(dir); err == nil {
 		t.Fatal("empty dir: want error")
 	}
-	write := func(name, body string) {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		return path
 	}
 	write("001-schema.sql", "CREATE TABLE a (id int);")
 	write("init.sh", "#!/bin/bash")
-	first, err := schemaFingerprint(dir)
+	binary := write("isureal.bin", "v1")
+	first, err := contentFingerprint(dir, binary)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again, _ := schemaFingerprint(dir); again != first {
+	if again, _ := contentFingerprint(dir, binary); again != first {
 		t.Fatal("fingerprint is not stable")
 	}
+	write("isureal.bin", "v2")
+	second, _ := contentFingerprint(dir, binary)
+	if second == first {
+		t.Fatal("changing the binary did not change the fingerprint")
+	}
 	write("004-functions.sql", "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';")
-	if changed, _ := schemaFingerprint(dir); changed == first {
+	if third, _ := contentFingerprint(dir, binary); third == second {
 		t.Fatal("adding a sql file did not change the fingerprint")
 	}
-	if _, err := schemaFingerprint("../sql"); err != nil {
-		t.Fatalf("repository sql/: %v", err)
+	if _, err := buildFingerprint("../sql"); err != nil {
+		t.Fatalf("repository sql/ and the test binary: %v", err)
 	}
 }
 

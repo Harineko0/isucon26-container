@@ -31,7 +31,10 @@ import (
 //
 // 接続時の Prepare は、そのデプロイの最初の initialize (sql/ の DDL を流す) より前に起こる。sql/ が前回と違うと、
 // initialize で関数の戻り値や表の列が変わり、先に Prepare した文が初回の実行で "cached plan must not change
-// result type" になりうる。そこでファイルには sql/ の指紋を添え、指紋が違えば使わずに空にする (そのデプロイは従来どおり)。
+// result type" になりうる。またアプリの文面が変わると、前回の文面は Prepare しても使われず、DB のバックエンド
+// 80 本 (EU/US) の記憶域だけを食う (asia2 は山場で MemAvailable 90MB)。そこでファイルには sql/ とアプリの
+// バイナリの指紋を添え、指紋が違えば使わずに空にする (そのデプロイは従来どおり)。同じ版を続けて測るとき
+// (最終ベンチの 2 回目以降、再起動後の追試) に効く。
 
 const (
 	// preparedWarmMinCount 未満しか実行していない文面は覚えない。プール 40 本の接続あたり 5 回以上使う文面は、
@@ -54,8 +57,17 @@ var preparedWarmFile = envOrDefault("ISUREAL_PREPARED_STATEMENTS_FILE", "/home/i
 // preparedWarmSchemaDir は initialize が流す SQL の置き場所 (initialize.go の ../sql/init.sh と同じ)。
 var preparedWarmSchemaDir = "../sql"
 
-// schemaFingerprint は dir の *.sql と init.sh の中身の指紋。
-func schemaFingerprint(dir string) (string, error) {
+// buildFingerprint は dir の *.sql と init.sh、実行中のバイナリの中身の指紋。
+func buildFingerprint(dir string) (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return contentFingerprint(dir, executable)
+}
+
+// contentFingerprint は dir の *.sql と init.sh、extra (バイナリ) の中身の指紋。
+func contentFingerprint(dir string, extra ...string) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.sql"))
 	if err != nil {
 		return "", err
@@ -65,6 +77,7 @@ func schemaFingerprint(dir string) (string, error) {
 	}
 	files = append(files, filepath.Join(dir, "init.sh"))
 	slices.Sort(files)
+	files = append(files, extra...)
 	h := sha256.New()
 	for _, file := range files {
 		data, err := os.ReadFile(file)
@@ -190,8 +203,8 @@ func dropWarmStatements(bad []string) {
 	})
 }
 
-// loadWarmStatementsFile は path に覚えた文面を返す。sql/ の指紋 (schema) が違えば使わず、ファイルを空にする
-// (別の sql/ のデプロイを挟んだあとで同じ sql/ に戻ったとき、間で変わったスキーマに対して Prepare しないように)。
+// loadWarmStatementsFile は path に覚えた文面を返す。指紋 (schema: sql/ とバイナリ) が違えば使わず、ファイルを空にする
+// (別の版のデプロイを挟んだあとで同じ版に戻ったとき、間で変わったスキーマに対して Prepare しないように)。
 func loadWarmStatementsFile(path, schema string) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -203,7 +216,7 @@ func loadWarmStatementsFile(path, schema string) []string {
 		return nil
 	}
 	if file.Schema != schema {
-		fmt.Fprintf(os.Stderr, "prepared-warm: sql/ changed since %s was written; not preparing on connect\n", path)
+		fmt.Fprintf(os.Stderr, "prepared-warm: sql/ or the binary changed since %s was written; not preparing on connect\n", path)
 		if err := saveWarmStatementsFile(path, schema, nil); err != nil {
 			fmt.Fprintf(os.Stderr, "prepared-warm: failed to reset %s: %v\n", path, err)
 		}
