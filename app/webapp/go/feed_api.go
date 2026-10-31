@@ -268,6 +268,14 @@ func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 // おすすめ度の「著者の mutual 数」と「著者の友達の mutual 数の和」は、以前は候補ごとの相関副問い合わせで
 // mutual（CTE、友達の多い閲覧者では千数百行）を毎回全件なめていた（候補 36 件で約 13ms）。
 // mutual は id で一意なので LEFT JOIN、著者の友達の和は候補の著者ごとに 1 回だけ集計して LEFT JOIN する（値は同じ）。
+//
+// author_fof は「著者 → 和」を 1 つの jsonb にまとめ、候補ごとに ->> で引く（jsonb のキー検索は二分探索）。
+// 以前の LEFT JOIN author_fof は、candidates の見積もりが数行（実際は友達の多い閲覧者で数百行）のため
+// Nested Loop + Materialize になり、候補数 × 著者数の比較をしていた（候補 396 件で 7.8 万回）。
+// 著者が author_fof に無い（著者の友達が mutual にいない）ときは ->> が NULL になり、以前の LEFT JOIN の NULL と同じく 0 になる。
+// 反応・コメントの数は、友達かどうか（friends のハッシュ）を先に見て、友達だった利用者だけ active かを主キーで確かめる
+// （以前は反応・コメントした全員の users を主キーで引いてから友達で絞っていた）。active は利用者ごとの性質なので、
+// 「active な反応者・コメント者の集合 ∩ 友達」と「反応者・コメント者の集合 ∩ 友達 ∩ active」は同じ集合で、件数も同じ。
 func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
 	return `
   WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
@@ -282,28 +290,30 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
       AND p.author_id NOT IN (SELECT id FROM friends) AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
       AND p.visibility IN ('public', 'friends_of_friends')
   ),
-  author_fof AS MATERIALIZED (
-    SELECT a.author_id, sum(m.n) AS s
-    FROM (SELECT DISTINCT author_id FROM candidates) a
-    JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
-    JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
-    GROUP BY a.author_id
+  author_fof AS (
+    SELECT jsonb_object_agg(t.author_id, t.s) AS by_author FROM (
+      SELECT a.author_id, sum(m.n) AS s
+      FROM (SELECT DISTINCT author_id FROM candidates) a
+      JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
+      JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
+      GROUP BY a.author_id
+    ) t
   ),
   scored AS MATERIALIZED (
     SELECT c.*, (
       10 * (SELECT count(*) FROM (
-              SELECT r.reactor_id AS user_id FROM realmojis r JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
+              SELECT r.reactor_id AS user_id FROM realmojis r
               WHERE r.post_id = c.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
               UNION
-              SELECT cm.author_id FROM comments cm JOIN users cu ON cu.id = cm.author_id AND cu.status = 'active'
+              SELECT cm.author_id FROM comments cm
               WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
-            ) e WHERE e.user_id IN (SELECT id FROM friends))
+            ) e WHERE e.user_id IN (SELECT id FROM friends)
+                AND EXISTS(SELECT 1 FROM users eu WHERE eu.id = e.user_id AND eu.status = 'active'))
       + 3 * COALESCE(mm.n, 0)
-      + LEAST(COALESCE(af.s, 0), 30)
+      + LEAST(COALESCE(((SELECT by_author FROM author_fof) ->> c.author_id)::numeric, 0), 30)
       )::bigint AS score
     FROM candidates c
     LEFT JOIN mutual mm ON mm.id = c.author_id
-    LEFT JOIN author_fof af ON af.author_id = c.author_id
   )
   SELECT v.sess_region, r.id IS NOT NULL AS found,
     ` + postWithAuthorColumnsCoalesced("r") + `,
