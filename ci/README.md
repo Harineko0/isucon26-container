@@ -27,7 +27,7 @@ PR は isucon26-container に作る。app のコード変更は、`app/` サブ�
    2. CI の記録（results.jsonl）に無いポータルのジョブを探す。あれば誰かが手でベンチを投げたので警告に出す。
    3. `deploy.sh`（app を 3 台でビルド・再起動）と `infra/deploy.sh`（設定を全台に配って reload、envcheck）。
    4. ルーター経由で `POST /api/initialize` が 200 を返すか確かめる（壊れた版でベンチ枠を使わない）。
-   5. `fingerprint.sh` でサーバの状態（バイナリの hash、isureal-go/nginx/PG の起動時刻）を記録。
+   5. `fingerprint.sh` でサーバの状態（配った app の commit、バイナリの hash、isureal-go/nginx/PG の起動時刻）を記録し、app 3 台がこの run の app commit で動いているか確かめる。配った commit はサーバの `~/webapp/DEPLOYED_SHA` にある（rsync で配るのでサーバの `git log` は進まない。今何が動いているかは `ssh isucon26-asia cat webapp/DEPLOYED_SHA`）。
    6. `portal.py enqueue` → `portal.py wait`。
    7. もう一度 `fingerprint.sh` と `infra/deploy.sh -n` を取り、ベンチ中にデプロイ・再起動・設定変更が無かったか確かめる。あれば警告に出す。
 3. `finalize.sh`（失敗・キャンセル時も実行）: `bench-results` に記録し、コメントを最終版にする。ベンチが FAIL か run が失敗なら check を赤にする。

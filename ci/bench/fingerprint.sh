@@ -6,7 +6,7 @@ set -eu
 
 for host in $ALL_HOSTS; do
   if [ "$(host_role "$host")" = app ]; then
-    cmd='sha256sum ~/webapp/go/isureal | cut -c1-16; systemctl show -p ActiveEnterTimestamp --value isureal-go nginx'
+    cmd='cut -c1-12 ~/webapp/DEPLOYED_SHA 2>/dev/null || echo no-sha; sha256sum ~/webapp/go/isureal | cut -c1-16; systemctl show -p ActiveEnterTimestamp --value isureal-go nginx'
   else
     cmd='systemctl show -p ActiveEnterTimestamp --value postgresql@16-main'
   fi
