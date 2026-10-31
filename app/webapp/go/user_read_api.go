@@ -209,11 +209,19 @@ func cleanSearchDirty(ctx context.Context, db *sqlx.DB) error {
 	return err
 }
 
+// cleanSearchDirtyLoop の間隔と 1 回の制限時間。ベンチ中 (DB の CPU 100%) に 1 秒では
+// "context deadline exceeded" で失敗していた (#114 の続き)。ループは逐次なので、5 秒かかっても実行は重ならない
+// (time.Tick は遅れた分の tick を捨てる)。
+const (
+	cleanSearchDirtyInterval = 2 * time.Second
+	cleanSearchDirtyTimeout  = 5 * time.Second
+)
+
 // cleanSearchDirtyLoop は dirty を小さく保つ。登録や名前の変更のあと、正規化は非同期に保存されるので、
 // 保存が済んだ利用者をここで外す。
 func cleanSearchDirtyLoop(db *sqlx.DB) {
-	for range time.Tick(2 * time.Second) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	for range time.Tick(cleanSearchDirtyInterval) {
+		ctx, cancel := context.WithTimeout(context.Background(), cleanSearchDirtyTimeout)
 		if err := cleanSearchDirty(ctx, db); err != nil {
 			log.Printf("failed to clean user_search_dirty: %v", err)
 		}

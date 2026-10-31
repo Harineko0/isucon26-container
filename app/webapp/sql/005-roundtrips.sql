@@ -65,8 +65,11 @@ BEGIN
   RETURN 'ok';
 END $$;
 
--- updateMeHandler の UPDATE ... RETURNING と同じ (NULL の引数は変更しない)。status が active でなくても
--- 行は返す (従来どおり呼び出し側が 404 にする)。
+-- updateMeHandler の UPDATE ... RETURNING と同じ (NULL の引数は変更しない)。
+-- active な利用者だけを書き換える (#83)。以前は status を見ずに UPDATE して行を返し、呼び出し側が 404 に
+-- していたので、セッション確認の後に退会が割り込むと、退会済みの行を書き換えてコミットしてから 404 を返していた。
+-- 退会 (isureal_delete_account) が行ロックを持っている間はその UPDATE を待ち、コミット後の行で
+-- status を見直す (EvalPlanQual) ので、退会済みなら 0 行 → not_found → 404。引数と戻り値は変えない。
 CREATE OR REPLACE FUNCTION isureal_update_me(p_user text, p_display_name text, p_bio text, p_region text)
 RETURNS TABLE (
   o_result text, o_id text, o_username text, o_secret_key_hash text, o_display_name text, o_bio text,
@@ -76,7 +79,7 @@ BEGIN
   RETURN QUERY
     UPDATE users SET display_name = COALESCE(p_display_name, display_name), bio = COALESCE(p_bio, bio),
                      region = COALESCE(p_region, region), updated_at = clock_timestamp()
-    WHERE id = p_user
+    WHERE id = p_user AND status = 'active'
     RETURNING 'ok'::text, id::text, username::text, secret_key_hash, display_name, bio,
               profile_image_id::text, region, account_type, status;
   IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; END IF;
