@@ -38,13 +38,15 @@ SQL
 "${sql[@]}" < 003-initial-snapshot.sql >/dev/null
 db_env=(-e ISUREAL_DB_USER=postgres -e ISUREAL_DB_PASSWORD=test -e ISUREAL_DB_NAME=postgres)
 docker exec "${db_env[@]}" "$name" bash /test/sql/init.sh >/dev/null
-# 競技用の nginx 設定で、投稿元のポートとローカルのストアパスだけを差し替える。
+# 競技用の nginx 全体設定と site 設定を使い、コンテナのユーザー・ポート・ストアパスに合わせる。
+sed 's/^user www-data;/user nginx;/' ../../../infra/app/etc/nginx/nginx.conf > "$tmp/nginx.conf"
 sed -e 's/127.0.0.1:8080/127.0.0.1:18082/' \
     -e 's@/home/isucon/imgstore/@/images/europe/store/@' \
     -e 's@/home/isucon/imgcache/@/images/europe/cache/@' \
     ../../../infra/app/etc/nginx/sites-available/isureal.conf > "$tmp/default.conf"
 docker create --name "$name-nginx" --network "container:$name" \
   -v "$name-images:/images:ro" nginx:1.26-alpine >/dev/null
+docker cp "$tmp/nginx.conf" "$name-nginx:/etc/nginx/nginx.conf"
 docker cp "$tmp/default.conf" "$name-nginx:/etc/nginx/conf.d/default.conf"
 docker start "$name-nginx" >/dev/null
 peers=asia=127.0.0.1:18081,europe=127.0.0.1:80,america=127.0.0.1:18083
