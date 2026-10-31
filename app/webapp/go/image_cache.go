@@ -51,11 +51,16 @@ func readImageFromDisk(id string) ([]byte, bool) {
 }
 
 // imageCreatedAt は画像 id → created_at (不変)。パーティションを絞るために使う。
-var imageCreatedAt sync.Map
+// 1 件 150 バイト程度。上限を超えて捨てても id だけの検索に戻るだけ。
+var imageCreatedAt = &boundedMap{limit: 2_000_000}
 
 // 画像の本体は id ごとに不変なので、リージョンごとにメモリへ置いて DB からの転送を省く。
 // 閲覧可否は毎回 DB で確認するので、ここに残った削除済み画像が返ることはない。
-const imageDataGenerationBytes = 384 << 20
+// 2 世代で最大 384MiB。追い出された画像はディスクの imgcache (ページキャッシュ) から戻る。
+const imageDataGenerationBytes = 192 << 20
+
+// これより大きい画像は 1 枚で世代を押し出すのでメモリに置かない。
+const imageDataMaxEntryBytes = imageDataGenerationBytes / 8
 
 type imageDataCache struct {
 	mu           sync.RWMutex
@@ -88,7 +93,7 @@ func (c *imageDataCache) get(id string) ([]byte, bool) {
 }
 
 func (c *imageDataCache) put(id string, data []byte) {
-	if data == nil {
+	if data == nil || len(data) > imageDataMaxEntryBytes {
 		return
 	}
 	c.mu.Lock()
