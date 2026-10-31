@@ -348,6 +348,63 @@ BEGIN
   END IF;
 END $$;
 
+-- isureal_post_access と同じ判定を 1 つの SELECT で書いた読み取り専用版 (投稿詳細・RealMoji 一覧・コメント一覧の SELECT 用)。
+-- LANGUAGE sql・STABLE・RETURNS TABLE・非 STRICT なので、呼び出し側の文にインライン展開され、PL/pgSQL の関数呼び出しと
+-- 中の 3〜5 文ごとの実行・ロックの取得が無くなる。どの場合も必ず 1 行返す (投稿か閲覧者が無ければ false, false)。
+-- 判定は 1 つの CASE で code (0: 見られない、1: 見られるがコメントできない、2: 見られてコメントできる) にまとめ、
+-- OFFSET 0 で 1 回だけ評価する (CASE の中の EXISTS は必要な分岐でだけ実行される)。
+-- 書き込みの関数 (isureal_replace_realmoji / isureal_create_comment) は isureal_post_access を使い続ける。
+-- 新旧の一致は tests/post_access_read.sh で総当たりする。判定を変えるときは両方を同じように直すこと。
+CREATE OR REPLACE FUNCTION isureal_post_access_read(p_viewer text, p_post text)
+RETURNS TABLE (can_view boolean, can_comment boolean)
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(y.code >= 1, false), COALESCE(y.code = 2, false)
+  FROM (SELECT 1) one
+  LEFT JOIN LATERAL (
+    SELECT CASE
+      -- 終わった期間の投稿: 投稿者本人だけが見られる。コメントはできない。
+      WHEN pw.ended_at IS NOT NULL THEN CASE WHEN pp.author_id = p_viewer THEN 1 ELSE 0 END
+      -- 自分の投稿: 見られる。コメントは当日に投稿済みのときだけ。
+      WHEN pp.author_id = p_viewer THEN CASE WHEN EXISTS(
+          SELECT 1 FROM posts op
+          JOIN posting_windows opw ON opw.id = op.posting_window_id
+          JOIN posting_windows cur ON cur.region = v.region AND cur.ended_at IS NULL AND cur.local_date = opw.local_date
+          WHERE op.author_id = p_viewer AND op.deleted_at IS NULL) THEN 2 ELSE 1 END
+      -- 他人の投稿: 当日未投稿か、どちらかがブロックしていれば見られない。
+      WHEN NOT EXISTS(
+          SELECT 1 FROM posts op
+          JOIN posting_windows opw ON opw.id = op.posting_window_id
+          JOIN posting_windows cur ON cur.region = v.region AND cur.ended_at IS NULL AND cur.local_date = opw.local_date
+          WHERE op.author_id = p_viewer AND op.deleted_at IS NULL)
+        OR EXISTS(
+          SELECT 1 FROM block_relations WHERE blocker_id = p_viewer AND blocked_id = pp.author_id
+          UNION ALL
+          SELECT 1 FROM block_relations WHERE blocker_id = pp.author_id AND blocked_id = p_viewer) THEN 0
+      WHEN pp.visibility = 'public' THEN 2
+      WHEN pp.visibility = 'friends' THEN CASE WHEN EXISTS(
+          SELECT 1 FROM friendships
+          WHERE user_low_id = least(p_viewer, pp.author_id) AND user_high_id = greatest(p_viewer, pp.author_id)) THEN 2 ELSE 0 END
+      -- 友達の友達まで: 友達なら見られてコメントもできる。友達の友達は見られるがコメントできない。
+      WHEN pp.visibility = 'friends_of_friends' THEN CASE
+        WHEN EXISTS(
+          SELECT 1 FROM friendships
+          WHERE user_low_id = least(p_viewer, pp.author_id) AND user_high_id = greatest(p_viewer, pp.author_id)) THEN 2
+        WHEN EXISTS(
+          SELECT 1 FROM friendships f1
+          CROSS JOIN LATERAL (SELECT CASE WHEN f1.user_low_id = p_viewer THEN f1.user_high_id ELSE f1.user_low_id END AS mid) m
+          JOIN friendships f2 ON (f2.user_low_id = m.mid AND f2.user_high_id = pp.author_id) OR (f2.user_high_id = m.mid AND f2.user_low_id = pp.author_id)
+          WHERE f1.user_low_id = p_viewer OR f1.user_high_id = p_viewer) THEN 1
+        ELSE 0 END
+      ELSE 0 END AS code
+    FROM posts pp
+    JOIN users a ON a.id = pp.author_id AND a.status = 'active'
+    JOIN posting_windows pw ON pw.id = pp.posting_window_id
+    JOIN users v ON v.id = p_viewer AND v.status = 'active'
+    WHERE pp.id = p_post AND pp.deleted_at IS NULL
+    OFFSET 0
+  ) y ON true
+$$;
+
 -- o_result: ok / forbidden(403 interaction_forbidden) / not_found(404 relationship_not_found)
 CREATE OR REPLACE FUNCTION isureal_replace_realmoji(
   p_actor text, p_post text, p_id text, p_image_id text, p_data bytea, p_reaction_type text, p_stored_region text

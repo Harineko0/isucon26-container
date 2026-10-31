@@ -70,7 +70,7 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 		if (input.AfterCreatedAt == nil) != (input.AfterID == "") {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
-		// セッションの確認・権限の判定 (isureal_post_access)・一覧の取得を 1 文・接続 1 本で行う (#82)。
+		// セッションの確認・権限の判定 (isureal_post_access_read)・一覧の取得を 1 文・接続 1 本で行う (#82)。
 		// 権限が無いか一覧が空なら番兵の行 (found = false) が 1 行返る。
 		var rows []struct {
 			SessRegion *string `db:"sess_region"`
@@ -89,7 +89,7 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
           COALESCE(r.body, '') AS body, COALESCE(r.created_at, 'epoch') AS created_at, r.deleted_at,
           `+userColumnsCoalesced("r", "author")+`
    FROM {session}
-   CROSS JOIN LATERAL isureal_post_access(s.sess_user_id, $1) a
+   CROSS JOIN LATERAL isureal_post_access_read(s.sess_user_id, $1) a
    LEFT JOIN LATERAL (
      SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, `+userColumnsAs("u", "author")+`
      FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'

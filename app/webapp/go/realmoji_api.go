@@ -105,7 +105,7 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 		if (input.BeforeCreatedAt == nil) != (input.BeforeID == "") {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
-		// セッションの確認・閲覧可否 (isureal_post_access)・一覧の取得を 1 文・接続 1 本で行う (#82)。
+		// セッションの確認・閲覧可否 (isureal_post_access_read)・一覧の取得を 1 文・接続 1 本で行う (#82)。
 		// 閲覧できないか一覧が空なら番兵の行 (found = false) が 1 行返る。
 		var rows []struct {
 			SessRegion *string `db:"sess_region"`
@@ -125,7 +125,7 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
           COALESCE(r.created_at, 'epoch') AS created_at, r.replaced_at, r.deleted_at,
           `+userColumnsCoalesced("r", "reactor")+`
    FROM {session}
-   CROSS JOIN LATERAL isureal_post_access(s.sess_user_id, $1) a
+   CROSS JOIN LATERAL isureal_post_access_read(s.sess_user_id, $1) a
    LEFT JOIN LATERAL (
      SELECT m.id, m.post_id, m.reactor_id, m.image_id, m.reaction_type, m.created_at, m.replaced_at, m.deleted_at,
             `+userColumnsAs("u", "reactor")+`
