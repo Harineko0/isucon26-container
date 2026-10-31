@@ -11,10 +11,11 @@ import (
 )
 
 type HandlerContext struct {
-	DB      *sqlx.DB
-	Config  *Config
-	IPBans  *IPBanList
-	Windows *postingWindowWatcher
+	DB         *sqlx.DB
+	Config     *Config
+	IPBans     *IPBanList
+	Windows    *postingWindowWatcher
+	heavyReads chan struct{}
 }
 
 func NewServer(config *Config) *echo.Echo {
@@ -57,10 +58,11 @@ func NewServer(config *Config) *echo.Echo {
 	}()
 
 	handlerContext := &HandlerContext{
-		DB:      db,
-		Config:  config,
-		IPBans:  ipBans,
-		Windows: newPostingWindowWatcher(db, config.Region),
+		DB:         db,
+		Config:     config,
+		IPBans:     ipBans,
+		Windows:    newPostingWindowWatcher(db, config.Region),
+		heavyReads: newHeavyReadSlots(config.Region),
 	}
 	e.Pre(InternalMiddleware(handlerContext))
 	go ipBans.abuse.writeLoop(db)

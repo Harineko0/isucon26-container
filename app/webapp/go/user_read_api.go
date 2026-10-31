@@ -56,7 +56,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 			Stale   bool `db:"stale"`
 			Matched bool `db:"matched"`
 		}
-		err := h.DB.SelectContext(ctx, &rows, `
+		err := h.selectHeavy(ctx, &rows, `
   WITH cand AS (
     SELECT user_id FROM user_search_norms WHERE username_norm LIKE $5 OR display_name_norm LIKE $5
     UNION

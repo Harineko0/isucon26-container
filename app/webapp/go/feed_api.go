@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
 
@@ -52,7 +51,9 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		var rows []feedRow
 		var query string
 		var args []any
+		selectRows := h.DB.SelectContext
 		if ranked {
+			selectRows = h.selectHeavy
 			if deferred {
 				query = feedDeferredQueries[input.Feed]
 				args = []any{userID, input.BeforePostedAt, input.BeforeID, input.BeforeScore, h.Config.Region, tokenHash}
@@ -69,7 +70,7 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 				args = []any{userID, input.BeforePostedAt, input.BeforeID}
 			}
 		}
-		if err := sqlx.SelectContext(ctx, h.DB, &rows, query, args...); err != nil {
+		if err := selectRows(ctx, &rows, query, args...); err != nil {
 			return err
 		}
 		var sessRegion *string
