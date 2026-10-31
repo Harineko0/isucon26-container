@@ -20,7 +20,14 @@ type getImageRequest struct {
 	Sig     string `query:"sig" json:"-"`
 }
 
+// imageAccelRegions は、ディスクにある画像を Go のヒープに載せず X-Accel-Redirect で nginx に返させる (#94)
+// リージョン。PR #130 の初回ベンチ (job 21475) では、EU/US の画像取得は 0.235/0.206 → 0.175/0.178 秒と速くなった
+// 一方、asia1 は 0.161 → 0.265 秒に遅くなり iowait が 22% に上がった (16GB の imgcache に対してページキャッシュが
+// 小さく、ヒープのキャッシュが外れた分がディスク読みになったとみられる)。asia はヒープのキャッシュに戻す。
+var imageAccelRegions = map[string]bool{"europe": true, "america": true}
+
 func getImageHandler(h *HandlerContext) echo.HandlerFunc {
+	useAccel := imageAccelRegions[h.Config.Region]
 	return func(c *echo.Context) error {
 		c.Response().Header().Set("Cache-Control", "no-store")
 		var input getImageRequest
@@ -49,12 +56,21 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			c.Set("abuse", "invalid_signature")
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		// 本体はヒープ → ディスク (imgcache) の順に探す。ディスクにある画像はヒープに載せず、
-		// 閲覧可否を確かめたあと X-Accel-Redirect で nginx に返させる (#94)。
-		cached, inMemory := imageDataStore.getMemory(input.ImageID)
-		accelPath, onDisk := "", false
-		if !inMemory {
-			accelPath, onDisk = imageDiskAccelPath(input.ImageID)
+		// 本体はヒープ → ディスク (imgcache) の順に探す。useAccel のリージョンでは、ディスクにある画像はヒープに
+		// 載せず、閲覧可否を確かめたあと X-Accel-Redirect で nginx に返させる (#94)。それ以外はヒープに読み込む。
+		var (
+			cached    []byte
+			inMemory  bool
+			accelPath string
+			onDisk    bool
+		)
+		if useAccel {
+			cached, inMemory = imageDataStore.getMemory(input.ImageID)
+			if !inMemory {
+				accelPath, onDisk = imageDiskAccelPath(input.ImageID)
+			}
+		} else {
+			cached, inMemory = imageDataStore.get(input.ImageID)
 		}
 		hasData := inMemory || onDisk
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
