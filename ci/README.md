@@ -5,17 +5,17 @@
 
 ## 使い方
 
-PR は isucon26-container に作る。app のコード変更は、`app/` サブモジュールの中でブランチを切ってコミット・push し、container 側のブランチでサブモジュールの指す commit を進めて PR にする。
+PR は isucon26-container に作る。このリポジトリは monorepo なので、app のコード（`app/`）も設定（`infra/`）も同じブランチで直して 1 つの PR にする。
 
 | やりたいこと | 方法 | 何がデプロイされるか |
 |---|---|---|
-| PR の変更を測る | isucon26-container に PR を open する（自動で 1 回走る。draft は Ready for review にした時点） | PR の head（infra/ 等）と、その commit の `app/` が指す commit |
-| push 後に測り直す | PR に `/bench [メモ]` とコメント | その時点の PR の head と、その `app/` が指す commit |
-| main（基準値）を更新する | 自動: main に `app`（サブモジュール）・`infra/**`・`deploy.sh` を変える commit が入ったとき（PR のマージ）。文書や `ci/` だけの変更では走らない | main と、main の `app/` が指す commit |
+| PR の変更を測る | isucon26-container に PR を open する（自動で 1 回走る。draft は Ready for review にした時点） | PR の head（`app/` も `infra/` も） |
+| push 後に測り直す | PR に `/bench [メモ]` とコメント | その時点の PR の head |
+| main（基準値）を更新する | 自動: main に `app/**`・`infra/**`・`deploy.sh` を変える commit が入ったとき（PR のマージ）。文書や `ci/` だけの変更では走らない | main の head |
 | main を手で測る | `gh workflow run bench.yml -R Harineko0/isucon26-container` | 同上 |
-| 任意の組み合わせ | `gh workflow run bench.yml -R Harineko0/isucon26-container -f container_ref=<ref> [-f app_ref=<sha>]` | 指定どおり（`app_ref` を省くとサブモジュールの指す commit） |
+| 任意の commit | `gh workflow run bench.yml -R Harineko0/isucon26-container -f container_ref=<ref>` | 指定した commit |
 
-- `app/` の commit は isucon26 に push 済みである必要がある（CI はそこから取る）。`app-europe/` `app-america/` は使わない（3 台とも `app/` を配る）。
+- 3 台とも `app/webapp` を配る。`app-europe/` `app-america/` には各台の `env.sh` の写しがあるだけで、配らない。
 - 結果は PR のコメント（キュー待ち → デプロイ中 → 実行中 → 結果、と 1 つのコメントが書き換わる）と、`bench-results` ブランチの `results.jsonl` に残る。
 - ベンチした commit には commit status `Benchmark` が付き、PR の status checks に出る（`/bench` での測り直しも、その時点の head に付く）。pending（キュー待ち・デプロイ中・実行中）→ success（`PASS 45500（前回比 +534 (+1.2%)）`）/ failure（ベンチ FAIL、17:30 以降の拒否）/ error（デプロイ等で失敗、またはベンチ中にサーバの状態が変わった）。Details から run に飛べる。
   `git fetch origin bench-results && git show FETCH_HEAD:results.jsonl | jq -c '{job_id,score,passed,label,app_sha}'`
@@ -31,7 +31,7 @@ PR は isucon26-container に作る。app のコード変更は、`app/` サブ�
    2. CI の記録（results.jsonl）に無いポータルのジョブを探す。あれば誰かが手でベンチを投げたので警告に出す。
    3. `deploy.sh`（app を 3 台でビルド・再起動）と `infra/deploy.sh`（設定を全台に配って reload、envcheck）。
    4. ルーター経由で `POST /api/initialize` が 200 を返すか確かめる（壊れた版でベンチ枠を使わない）。
-   5. `fingerprint.sh` でサーバの状態（配った app の commit、バイナリの hash、isureal-go/nginx/PG の起動時刻）を記録し、app 3 台がこの run の app commit で動いているか確かめる。配った commit はサーバの `~/webapp/DEPLOYED_SHA` にある（rsync で配るのでサーバの `git log` は進まない。今何が動いているかは `ssh isucon26-asia cat webapp/DEPLOYED_SHA`）。
+   5. `fingerprint.sh` でサーバの状態（配った app の commit、バイナリの hash、isureal-go/nginx/PG の起動時刻）を記録し、app 3 台がこの run の app commit で動いているか確かめる。配った commit はサーバの `~/webapp/DEPLOYED_SHA` にある（中身はこのリポジトリの commit。サーバの `/home/isucon` は git 管理しない。今何が動いているかは `ssh isucon26-asia cat webapp/DEPLOYED_SHA`）。
    6. `portal.py enqueue` → `portal.py wait`。
    7. もう一度 `fingerprint.sh` と `infra/deploy.sh -n` を取り、ベンチ中にデプロイ・再起動・設定変更が無かったか確かめる。あれば警告に出す。
 3. `finalize.sh`（失敗・キャンセル時も実行）: `bench-results` に記録し、コメントを最終版にする。ベンチが FAIL か run が失敗なら check を赤にする。
@@ -61,13 +61,11 @@ Secrets:
 | isucon26-container | `PORTAL_COOKIE` | ブラウザでポータルを開き、DevTools → Network → 任意のリクエストの `Cookie` ヘッダの値をそのまま |
 | isucon26-container | `DEPLOY_SSH_KEY` | 4 台に `isucon` で入れる秘密鍵（手元の `~/.ssh/id_ed25519_github` 相当） |
 | isucon26-container | `DEPLOY_SSH_PASSPHRASE` | その鍵のパスフレーズ（パスフレーズなしの鍵なら不要）。CI は runner 上でだけパスフレーズを外して使う |
-| isucon26-container | `BENCH_GH_TOKEN` | private な isucon26（app サブモジュール）を読める PAT（Contents read） |
 
 ```bash
 gh secret set PORTAL_COOKIE -R Harineko0/isucon26-container
 gh secret set DEPLOY_SSH_KEY -R Harineko0/isucon26-container < ~/.ssh/id_ed25519_github
 gh secret set DEPLOY_SSH_PASSPHRASE -R Harineko0/isucon26-container
-gh secret set BENCH_GH_TOKEN -R Harineko0/isucon26-container
 ```
 
 Variables（任意）: `BENCH_FREEZE_AT`（ISO 8601）、`PORTAL_TARGET_ID`（既定 1707 = asia1。ポータルのジョブ詳細の target と同じ）。

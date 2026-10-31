@@ -2,9 +2,9 @@
 #
 # - PR を open（draft なら Ready for review）すると自動で 1 回走る
 # - PR に `/bench [メモ]` とコメント → その時点の PR の head でもう一度走る（push 後の再計測など）
-#   どちらも PR の head（infra/ 等）と、その commit が指す app サブモジュールをデプロイする
+#   どちらも PR の head（app/ も infra/ も同じ commit）をデプロイする
 # - main に app/・infra/・deploy.sh を変える commit が入る（PR のマージ）と自動で main を測る（基準値の更新）
-# - 手動: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...] [-f app_ref=...]
+# - 手動: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...]
 #
 # run は到着順に 1 本ずつ進む（ci/bench/queue.sh）。結果は PR コメントと bench-results ブランチの
 # results.jsonl に残る。詳細は ci/README.md。
@@ -13,7 +13,7 @@ run-name: >-
   bench ${{ github.event_name == 'issue_comment' && format('#{0}', github.event.issue.number)
   || github.event_name == 'pull_request_target' && format('#{0}', github.event.pull_request.number)
   || github.event_name == 'push' && 'main'
-  || format('{0}{1}', inputs.container_ref, inputs.app_ref != '' && format(' app@{0}', inputs.app_ref) || '') }}
+  || inputs.container_ref }}
 
 on:
   # pull_request_target: main にあるこのファイルの定義で動く（PR 側で workflow を書き換えても trigger は変わらない）
@@ -24,15 +24,12 @@ on:
   # main の基準値を最新に保つ。スコアに関係しない変更（文書、ci/ のスクリプト等）では走らせない
   push:
     branches: [main]
-    paths: [app, infra/**, deploy.sh]
+    paths: [app/**, infra/**, deploy.sh]
   workflow_dispatch:
     inputs:
       container_ref:
         description: このリポジトリの ref / sha
         default: main
-      app_ref:
-        description: app（Harineko0/isucon26）の ref / sha。空ならサブモジュールが指す commit
-        default: ""
       note:
         description: メモ（コメントに載る）
         default: ""
@@ -43,9 +40,6 @@ permissions:
   pull-requests: write
   statuses: write # PR の status checks に「Benchmark」を出す
   actions: read # queue.sh が run 一覧を読む
-
-env:
-  APP_REPO: Harineko0/isucon26
 
 jobs:
   bench:
@@ -63,7 +57,6 @@ jobs:
       - name: Resolve target
         env:
           GH_TOKEN: ${{ github.token }}
-          APP_TOKEN: ${{ secrets.BENCH_GH_TOKEN }}
           EVENT: ${{ github.event_name }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
@@ -71,14 +64,13 @@ jobs:
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           IN_CONTAINER_REF: ${{ inputs.container_ref }}
-          IN_APP_REF: ${{ inputs.app_ref }}
           IN_NOTE: ${{ inputs.note }}
           ACTOR: ${{ github.actor }}
         run: |
           set -eu
           STATE_DIR=$RUNNER_TEMP/bench
           mkdir -p "$STATE_DIR"
-          pr_number= app_ref=
+          pr_number=
           if [ "$EVENT" = issue_comment ]; then
             gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null || true
             pr_number=$ISSUE_NUMBER
@@ -89,24 +81,20 @@ jobs:
           elif [ "$EVENT" = pull_request_target ]; then
             pr_number=$PR_EVENT_NUMBER container_ref=$PR_EVENT_SHA note="PR open 時の自動ベンチ"
           else
-            container_ref=${IN_CONTAINER_REF:-main} app_ref=$IN_APP_REF note=$IN_NOTE
+            container_ref=${IN_CONTAINER_REF:-main} note=$IN_NOTE
           fi
           container_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$container_ref" --jq .sha)
-          if [ -n "$app_ref" ]; then
-            app_sha=$(GH_TOKEN=$APP_TOKEN gh api "repos/$APP_REPO/commits/$app_ref" --jq .sha)
-          else
-            # サブモジュールの gitlink（この commit が指す app の commit）
-            app_sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/app?ref=$container_sha" --jq .sha)
-          fi
+          # monorepo なので app/ もこの commit。サーバの DEPLOYED_SHA との照合と記録の app_sha に使う
+          app_sha=$container_sha
           if [ -n "$pr_number" ]; then
             label="#$pr_number"
-          elif { [ "$container_ref" = main ] || [ "$EVENT" = push ]; } && [ -z "$app_ref" ]; then
+          elif [ "$container_ref" = main ] || [ "$EVENT" = push ]; then
             label=main
           else
-            label="container@${container_sha:0:7} app@${app_sha:0:7}"
+            label="container@${container_sha:0:7}"
           fi
           jq -n --arg label "$label" --arg pr_repo "$GITHUB_REPOSITORY" --arg pr_number "$pr_number" \
-            --arg app_repo "$APP_REPO" --arg app_sha "$app_sha" \
+            --arg app_repo "$GITHUB_REPOSITORY" --arg app_sha "$app_sha" \
             --arg container_repo "$GITHUB_REPOSITORY" --arg container_sha "$container_sha" \
             --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg note "$note" --arg actor "$ACTOR" '$ARGS.named' >"$STATE_DIR/meta.json"
@@ -125,14 +113,6 @@ jobs:
         with:
           ref: ${{ env.CONTAINER_SHA }}
           fetch-depth: 0 # bench-results を fetch するため
-
-      - name: Checkout app (${{ env.APP_SHA }})
-        env:
-          TOKEN: ${{ secrets.BENCH_GH_TOKEN }}
-        run: |
-          rm -rf app
-          git clone -q --filter=blob:none "https://x-access-token:$TOKEN@github.com/$APP_REPO" app
-          git -C app checkout -q "$APP_SHA"
 
       - name: Freeze check
         env:

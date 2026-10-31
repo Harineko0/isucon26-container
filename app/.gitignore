@@ -1,0 +1,5 @@
+# ビルド成果物（サーバ上でビルドする）
+/webapp/go/isureal
+/webapp/go/isureal.new
+/imgsync-bin
+*.pprof
