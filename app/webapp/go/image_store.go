@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -440,7 +439,8 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 var regionImageIDTags = map[string]string{"asia": "f1", "europe": "f2", "america": "f3"}
 
 func newImageID(region string) string {
-	id := uuid.NewString()
+	// 時刻先頭の ID (ids.go の newTimeID、索引への追記を局所化する) の末尾 2 文字を置き場のリージョンの印にする。
+	id := newTimeID()
 	if tag, ok := regionImageIDTags[region]; ok {
 		id = id[:len(id)-len(tag)] + tag
 	}

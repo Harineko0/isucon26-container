@@ -2,16 +2,15 @@ package isureal
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"image/jpeg"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"time"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -47,7 +46,39 @@ type createPostResponse struct {
 	LateSeconds     int64              `json:"lateSeconds"`
 }
 
+// createPostGate は isureal_create_post (image_objects への画像 INSERT を含む) のサーバごとの同時実行数を
+// 絞る。image_objects の TOAST の拡張ロック (Lock:extend) は、同時に走る backend が 12 本以下なら
+// 待ちがほぼ 0 で、asia のプール 80 本では最大 50 本ほどがロック待ちのままプールの接続を占めていた
+// (DB の wait の 28%、INSERT の平均 390 ms)。待ちは DB のロックではなく、接続を取り出す前の goroutine で
+// させる。RealMoji・プロフィール画像の INSERT (68 ms) は対象にしない。
+type createPostGate chan struct{}
+
+// createPostGateSize はサーバ (リージョン) ごとの同時実行数。asia は EU/US の約 5 倍の投稿を受ける。
+// 3 台合計で 8 + 4 + 4 = 16 本 (待ちが 0 だった 12 本に近い値。asia に寄せる)。
+var createPostGateSize = map[string]int{"asia": 8, "europe": 4, "america": 4}
+
+func newCreatePostGate(region string) createPostGate {
+	n, ok := createPostGateSize[region]
+	if !ok {
+		n = 6
+	}
+	return make(createPostGate, n)
+}
+
+// acquire は枠が空くか ctx が取り消されるまで待つ。取り消された要求は DB に行かない。
+func (g createPostGate) acquire(ctx context.Context) error {
+	select {
+	case g <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g createPostGate) release() { <-g }
+
 func createPostHandler(h *HandlerContext) echo.HandlerFunc {
+	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
 		var input createPostRequest
 		if err := c.Bind(&input); err != nil {
@@ -73,7 +104,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer imageFile.Close()
-		imageData, err := io.ReadAll(imageFile)
+		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
+		imageData, err := readUpload(imageFile, input.Image.Size)
 		if err != nil {
 			return err
 		}
@@ -90,7 +122,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// (投稿期間の starts_at / ended_at と同じ時計にそろえる。アプリの時計で先に決めると、
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
 		imageID := newImageID(h.Config.Region)
-		postID := uuid.NewString()
+		postID := newTimeID()
 		var row struct {
 			SessRegion     *string    `db:"sess_region"`
 			Result         string     `db:"o_result"`
@@ -111,10 +143,17 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			Status         *string    `db:"o_status"`
 		}
 		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
+		// ディスクへの書き込みは gate の外で済ませ、gate では DB の呼び出しだけを絞る。
 		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
-		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		if err := gate.acquire(c.Request().Context()); err != nil {
+			discardUploadedImage(imageID, storedRegion)
+			return err
+		}
+		err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 			imageID, postID, dbImageData, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion); err != nil {
+			location.Kind, location.Latitude, location.Longitude, location.Locality, storedRegion)
+		gate.release()
+		if err != nil {
 			return err
 		}
 		switch row.Result {

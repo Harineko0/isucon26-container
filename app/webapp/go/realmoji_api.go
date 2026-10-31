@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"image/jpeg"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"time"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -54,7 +52,8 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer file.Close()
-		data, err := io.ReadAll(file)
+		// multipart が既にメモリに持っている部分なので長さは確定している (#93)。
+		data, err := readUpload(file, input.Image.Size)
 		if err != nil {
 			return err
 		}
@@ -67,7 +66,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 
-		id, imageID := uuid.NewString(), newImageID(h.Config.Region)
+		id, imageID := newTimeID(), newImageID(h.Config.Region)
 		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
 		dbData, storedRegion := storeUploadedImage(imageID, data, h.Config.Region)
 		var row interactionRow
