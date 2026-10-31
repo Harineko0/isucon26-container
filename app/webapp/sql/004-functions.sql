@@ -136,7 +136,7 @@ END $$;
 -- 関係の変更が users 行から読むのは status(active か)と account_type だけで、status を変えるのは退会だけなので、
 -- 利用者ごとの advisory lock を共有モードでとり、退会(isureal_delete_account)は同じ鍵を排他モードでとる。
 -- 関係の表(friend_requests / friendships / follows / block_relations)を書くのは、2 人組のロックを持つ
--- isureal_relationship と isureal_transition_friend_request だけ。
+-- isureal_relationship と isureal_transition_friend_request(_authorized、005)だけ。
 -- ロックの順序: 利用者ごと(id 順) → 2 人組 → 行。コメント・RealMoji は行 → 2 人組だが、利用者ごとのロックはとらない。
 CREATE OR REPLACE FUNCTION isureal_user_lock_key(p_user text) RETURNS bigint
 LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:user:' || p_user, 0) $$;

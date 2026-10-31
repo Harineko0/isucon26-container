@@ -1,7 +1,7 @@
 #!/bin/bash
 # 友達申請の送信・承認・拒否・取り下げの関数を、${BASE_REF:-origin/main} の版 (*_base に改名して入れる) と
 # このブランチの版で比べる (tests/friend_request_equiv.sql)。手元の Docker の PostgreSQL 16 だけを使う。
-# 使い方: app/webapp/sql/tests/friend_request_equiv.sh
+# 使い方: app/webapp/sql/tests/friend_request_equiv.sh (SEEDS="0.42 0.1" で乱数の種を変える)
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
 BASE_REF=${BASE_REF:-origin/main}
@@ -28,4 +28,6 @@ rename_base() {
 	git show "$BASE_REF:app/webapp/sql/005-roundtrips.sql" | sed -n \
 		-e '/^CREATE OR REPLACE FUNCTION isureal_transition_friend_request_authorized(/,/^END \$\$;/p'
 } | rename_base | "${PSQL[@]}"
-"${PSQL[@]}" < tests/friend_request_equiv.sql
+for seed in ${SEEDS:-0.42 0.1 -0.7}; do
+	sed "s/setseed(0.42)/setseed($seed)/" tests/friend_request_equiv.sql | "${PSQL[@]}"
+done

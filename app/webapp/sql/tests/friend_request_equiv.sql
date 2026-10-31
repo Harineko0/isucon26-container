@@ -55,6 +55,9 @@ DECLARE
   counts jsonb := '{}';
   key text;
 BEGIN
+  -- 使い捨ての DB なので、種を変えて流し直すときは前の回の行を消す
+  TRUNCATE friend_requests, friendships, follows, block_relations;
+  DELETE FROM users WHERE id LIKE 'eq%';
   PERFORM setseed(0.42);
   INSERT INTO users (id, username, secret_key_hash, display_name, region, account_type)
   SELECT u, u, 'h', u, 'asia', CASE WHEN u IN ('eq07','eq08') THEN 'certified_public' ELSE 'regular' END FROM unnest(users) u;
@@ -88,7 +91,9 @@ BEGIN
       IF random() < 0.08 THEN
         b := 'missing-' || i;
       ELSE
-        SELECT id INTO b FROM friend_requests ORDER BY (status = 'pending') DESC, random() LIMIT 1;
+        -- 7 割は pending、残りは処理済み (承認・拒否・取り下げ済みへの操作は 403) から選ぶ
+        SELECT id INTO b FROM friend_requests WHERE (status = 'pending') = (random() < 0.7) ORDER BY random() LIMIT 1;
+        IF b IS NULL THEN SELECT id INTO b FROM friend_requests ORDER BY random() LIMIT 1; END IF;
         IF random() < 0.5 THEN
           SELECT CASE WHEN arg = 'cancelled' THEN requester_id ELSE recipient_id END INTO a FROM friend_requests WHERE id = b;
         END IF;
