@@ -40,6 +40,8 @@ jobs:
     timeout-minutes: 180 # キュー待ちを含む
     env:
       COMMENT_TOKEN: ${{ github.token }}
+      # ci/bench/freeze.sh が見る（キュー待ち前の Freeze check と、run.sh のデプロイ直前）
+      FREEZE_AT: ${{ vars.BENCH_FREEZE_AT || '2026-10-31T17:30:00+09:00' }}
     steps:
       - name: Resolve target
         env:
@@ -95,9 +97,9 @@ jobs:
           ref: ${{ env.CONTAINER_SHA }}
           fetch-depth: 0 # bench-results を fetch するため
 
-      # 古い PR head の run.sh にも制限解除を適用するため、互換スクリプトは
-      # このワークフローと同じ commit（GITHUB_SHA）から取る。
-      - name: Prepare benchmark guards
+      # 作業ツリーは PR の head なので、判定スクリプトはこのワークフローと同じ commit（GITHUB_SHA）から取る
+      # （freeze.sh を持たない古い PR でも同じ判定になる）
+      - name: Freeze check
         run: |
           set -eu
           git cat-file -e "$GITHUB_SHA" 2>/dev/null || git fetch -q origin "$GITHUB_SHA"
@@ -118,7 +120,7 @@ jobs:
           "$BENCH_GATE"
           if [ ! -f "$STATE_DIR/exclusive" ]; then ci/bench/queue.sh; fi
           "$BENCH_GATE"
-          "$FREEZE_CHECK" # 古い PR head との互換呼び出し（常に許可）
+          "$FREEZE_CHECK" # 待ちの間に凍結時刻を過ぎていたら、ここで止める（#245）
           git fetch -q origin bench-results && git show FETCH_HEAD:results.jsonl >"$HISTORY" || : >"$HISTORY"
 
       - name: Set up SSH

@@ -20,12 +20,6 @@ PAST=2000-01-01T00:00:00+09:00
 FUTURE=2099-01-01T00:00:00+09:00
 fails=0
 
-# FREEZE_AT / LABEL を渡さない新しいワークフローでも許可する。
-if ! env -u FREEZE_AT -u LABEL "$FREEZE_CHECK"; then
-  echo "FAIL missing FREEZE_AT / LABEL"
-  fails=$((fails + 1))
-fi
-
 # check <name> <want_rc> <want_stage_glob> <FREEZE_AT> <LABEL>（stage が無いことを期待するときは glob に "" ）
 check() {
   local name=$1 want_rc=$2 want_stage=$3 rc stage
@@ -48,12 +42,12 @@ check() {
   fi
 }
 
-check "past + #12 -> allowed" 0 '' "$PAST" '#12'
+check "past + #12 -> rejected" 1 'rejected:*' "$PAST" '#12'
 check "past + main -> allowed" 0 '' "$PAST" main
 check "future + #12 -> allowed" 0 '' "$FUTURE" '#12'
 check "future + main -> allowed" 0 '' "$FUTURE" main
 
-# 古い PR head の run.sh と同じ呼び方でも、時刻にかかわらずデプロイ段階へ進める
+# run.sh と同じ呼び方: set -euo pipefail + ERR trap の下で `|| exit 1` しても stage は rejected:* のまま
 rm -f "$T/stage"
 FREEZE_AT=$PAST LABEL='#12' bash -c '
   set -euo pipefail
@@ -63,10 +57,10 @@ FREEZE_AT=$PAST LABEL='#12' bash -c '
 ' >/dev/null 2>&1
 rc=$?
 stage=$(cat "$T/stage" 2>/dev/null || true)
-if [ "$rc" = 0 ] && [ "$stage" = reached-deploy ]; then
-  echo "ok   run.sh-style || exit 1 reaches deploy (rc=$rc stage=$stage)"
+if [ "$rc" = 1 ] && [[ $stage == rejected:* ]]; then
+  echo "ok   run.sh-style || exit 1 keeps rejected (rc=$rc stage=$stage)"
 else
-  echo "FAIL run.sh-style || exit 1: rc=$rc (want 0) stage=${stage:-none} (want reached-deploy)"
+  echo "FAIL run.sh-style || exit 1: rc=$rc (want 1) stage=${stage:-none} (want rejected:*)"
   fails=$((fails + 1))
 fi
 
