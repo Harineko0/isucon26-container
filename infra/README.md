@@ -30,3 +30,5 @@ infra/pull.sh asia2 /etc/foo.conf    # 新しいファイルを管理対象に�
 通常の SQL は各リージョンから asia1 のプライベートアドレスの PgBouncer（6432）に入り、asia2 の PostgreSQL で実行される。プーラー側は 16 トランザクションを並行実行し、アプリ側は Asia 64、Europe・America 各 128 接続で往復を待てる。initialize の psql と投稿期間 watcher は元の接続先を使う。
 
 初回の CI デプロイで `pgbouncer/Dockerfile` から静的バイナリをビルドする。asia1 の再起動時は `isureal-go.service` がディスクのバイナリを使い、DB から SCRAM 検証子を専用のランタイムディレクトリに読み込む。直結版に戻す場合はその版を通常の CI で配ると unit の差し替えでプーラーも停止する。
+
+PgBouncer 専用の `/usr/local/lib/isureal` とそのバイナリは、CI デプロイごとに `0755` を保証する。通常の設定ファイルには `--no-perms` を使うため、以前配られた `root:root / 0700` のディレクトリは rsync だけでは直らない。CI は app の再起動前にも既存バイナリの権限を修復し、壊れた状態から再デプロイできるようにする。infra の権限だけを修正した場合もサービスを再起動する。`-n` は権限の差分を表示するだけで変更しない。
