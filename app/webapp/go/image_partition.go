@@ -48,15 +48,23 @@ var imagePartitionName = regexp.MustCompile(`^image_objects(_[0-9a-z_]+)?$`)
 // imagePartitions は画像 id → それを持つ葉の表名 (DB から教わったもの)。1 件 100 バイト程度。
 var imagePartitions = &boundedMap{limit: 2_000_000}
 
-// imageRelationFor は画像 id を引くべき表の名前を返す。手がかりが無ければ "" (親表を引く)。
-func imageRelationFor(imageID string) string {
+// imageRelationFor は画像 id を引くべき表の名前を返す。exact は DB から教わった葉 (imagePartitions) で、
+// そこに無ければ画像は消えている (created_at は不変で、id は使い回さない)。
+//
+// 手がかりが無い画像は、今のパーティションを先に引く (#153)。手がかりの無い画像は、ほかのサーバーが応答した後に
+// 差し替えられたプロフィール画像など、ベンチ中に作られたものがほとんど (初期データの投稿・RealMoji の画像は
+// 応答時に、プロフィール画像は起動時に手がかりを覚える。初期データの投稿 500 件・RealMoji 492 件の抜き取りで
+// 手がかりのパーティションはすべて一致)。親表は 43 の葉と索引で 1 回 100 前後の表ロックを取り、
+// fast-path (16) を超えた分が共有ロック表に行く。asia2 のベンチ中の待ちの 26% が LWLock:LockManager で、
+// その 24% が画像取得 (親表の文は 1 回の計測で 1,223 回、葉の文の 18 に対して 106 ロック)。
+func imageRelationFor(imageID string, now time.Time) (rel string, exact bool) {
 	if rel, ok := imagePartitions.Load(imageID); ok {
-		return rel.(string)
+		return rel.(string), true
 	}
 	if createdAt, ok := imageCreatedAt.Load(imageID); ok {
-		return imagePartitionFor(createdAt.(time.Time))
+		return imagePartitionFor(createdAt.(time.Time)), false
 	}
-	return ""
+	return imagePartitionFor(now), false
 }
 
 // rememberImagePartition は DB から教わった表名を覚える (葉でなければ無視する)。
