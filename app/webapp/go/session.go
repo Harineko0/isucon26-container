@@ -303,6 +303,10 @@ func verifyDeferredSession(c *echo.Context, h *HandlerContext, tokenHash string,
 	region := ""
 	if session != nil {
 		region = session.Region
+		if anyRegionDeferredRoutes[c.Request().Method+" "+c.RouteInfo().Path] {
+			// RegionMiddleware の無いルートなので、リージョンが違っても 403 にしない。
+			region = h.Config.Region
+		}
 	}
 	if err := rejectDeferredSession(c, h, tokenHash, session != nil, region); err != nil {
 		return err
