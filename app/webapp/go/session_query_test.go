@@ -123,3 +123,45 @@ func TestUserColumnsCoalesced(t *testing.T) {
 		t.Fatalf("%d columns, want %d", n, len(userColumns))
 	}
 }
+
+func TestPostWithAuthorColumnsCoalesced(t *testing.T) {
+	got := postWithAuthorColumnsCoalesced("r")
+	for _, want := range []string{
+		`COALESCE(r.id, '') AS id`,
+		`COALESCE(r.posted_at, 'epoch') AS posted_at`,
+		`COALESCE(r.on_time_deadline, 'epoch') AS on_time_deadline`,
+		`r.window_ended_at`,
+		`COALESCE(r."author.id", '') AS "author.id"`,
+		`r."author.profile_image_id" AS "author.profile_image_id"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in %s", want, got)
+		}
+	}
+}
+
+func TestFeedDeferredQueriesAndRoutes(t *testing.T) {
+	for _, route := range []string{
+		"GET /api/posts/me/current",
+		"GET /api/posts/:postId",
+		"PATCH /api/posts/:postId",
+		"DELETE /api/posts/:postId",
+		"GET /api/feeds/:feed",
+		"DELETE /api/comments/:commentId",
+		"DELETE /api/realmojis/:realMojiId",
+	} {
+		if !deferredSessionRoutes[route] {
+			t.Fatalf("route %s should be in deferredSessionRoutes", route)
+		}
+	}
+	for _, feed := range []string{"public", "following", "friends"} {
+		q := feedDeferredQueries[feed]
+		if !strings.Contains(q, "u.region = $4") || !strings.Contains(q, "s.token_hash = $5") {
+			t.Fatalf("feedDeferredQueries[%s] missing session parameters: %s", feed, q)
+		}
+	}
+	fof := feedDeferredQueries["friends-of-friends"]
+	if !strings.Contains(fof, "u.region = $5") || !strings.Contains(fof, "s.token_hash = $6") {
+		t.Fatalf("feedDeferredQueries[friends-of-friends] missing session parameters: %s", fof)
+	}
+}

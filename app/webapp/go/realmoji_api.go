@@ -183,11 +183,16 @@ func deleteRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		var result string
-		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_delete_realmoji($1, $2)`, actor, input.RealMojiID); err != nil {
+		var row struct {
+			SessRegion *string `db:"sess_region"`
+			Result     *string `db:"result"`
+		}
+		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `(SELECT isureal_delete_realmoji({user}, $1) AS result)`, input.RealMojiID); err != nil {
 			return err
+		}
+		result := ""
+		if row.Result != nil {
+			result = *row.Result
 		}
 		switch result {
 		case "ok":
