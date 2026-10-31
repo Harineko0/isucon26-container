@@ -106,21 +106,24 @@ type bits struct {
 }
 
 type decoder struct {
-	r    io.Reader
 	bits bits
 	// bytes is a byte buffer, similar to a bufio.Reader, except that it
 	// has to be able to unread more than 1 byte, due to byte stuffing.
 	// Byte stuffing is specified in section F.1.2.3.
 	bytes struct {
-		// buf[i:j] are the buffered bytes read from the underlying
-		// io.Reader that haven't yet been passed further on.
-		buf  [4096]byte
+		// buf[i:j] are the bytes that haven't yet been passed further
+		// on. Validate reads the whole input up front, so buf is the
+		// entire input and fill never produces more bytes.
+		buf  []byte
 		i, j int
 		// nUnreadable is the number of bytes to back up i after
 		// overshooting. It can be 0, 1 or 2.
 		nUnreadable int
 	}
 	width, height int
+
+	// seq is the fast bit reader for sequential scans (sequential.go).
+	seq seqReader
 
 	// sawSOS records that a scan was decoded, which is exactly when the
 	// standard decoder would have allocated its destination image.
@@ -149,29 +152,14 @@ type decoder struct {
 	tmp        [2 * blockSize]byte
 }
 
-// fill fills up the d.bytes.buf buffer from the underlying io.Reader. It
-// should only be called when there are no unread bytes in d.bytes.
+// fill would refill d.bytes.buf from the underlying io.Reader; since the
+// whole input is buffered up front, running out of bytes is always an
+// unexpected EOF (image/jpeg's fill turns io.EOF into io.ErrUnexpectedEOF).
 func (d *decoder) fill() error {
 	if d.bytes.i != d.bytes.j {
 		panic("jpeg: fill called when unread bytes exist")
 	}
-	// Move the last 2 bytes to the start of the buffer, in case we need
-	// to call unreadByteStuffedByte.
-	if d.bytes.j > 2 {
-		d.bytes.buf[0] = d.bytes.buf[d.bytes.j-2]
-		d.bytes.buf[1] = d.bytes.buf[d.bytes.j-1]
-		d.bytes.i, d.bytes.j = 2, 2
-	}
-	// Fill in the rest of the buffer.
-	n, err := d.r.Read(d.bytes.buf[d.bytes.j:])
-	d.bytes.j += n
-	if n > 0 {
-		return nil
-	}
-	if err == io.EOF {
-		err = io.ErrUnexpectedEOF
-	}
-	return err
+	return io.ErrUnexpectedEOF
 }
 
 // unreadByteStuffedByte undoes the most recent readByteStuffedByte call,
@@ -519,8 +507,9 @@ func (d *decoder) processApp14Marker(n int) error {
 }
 
 // decode reads a JPEG image from r and returns it as an image.Image.
-func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
-	d.r = r
+func (d *decoder) decode(data []byte, configOnly bool) (image.Image, error) {
+	d.bytes.buf = data
+	d.bytes.i, d.bytes.j = 0, len(data)
 
 	// Check for the Start Of Image marker.
 	if err := d.readFull(d.tmp[:2]); err != nil {
@@ -666,8 +655,26 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 // of which can fail. The returned error is nil if and only if
 // image/jpeg.Decode would return a nil error.
 func Validate(r io.Reader) (width, height int, err error) {
+	var data []byte
+	if l, ok := r.(interface{ Len() int }); ok {
+		// bytes.Reader and friends: one exact-size read.
+		data = make([]byte, l.Len())
+		if _, err := io.ReadFull(r, data); err != nil {
+			return 0, 0, err
+		}
+	} else {
+		data, err = io.ReadAll(r)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	return ValidateBytes(data)
+}
+
+// ValidateBytes is Validate for an in-memory JPEG.
+func ValidateBytes(data []byte) (width, height int, err error) {
 	var d decoder
-	if _, err := d.decode(r, false); err != nil {
+	if _, err := d.decode(data, false); err != nil {
 		return 0, 0, err
 	}
 	return d.width, d.height, nil
