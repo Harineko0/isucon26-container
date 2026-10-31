@@ -44,6 +44,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		go loadInitialDataBoundary(h.DB)
 		go loadProfileImageHints(h.DB)
 		go refreshSearchNorms(h.DB)
+		// ベンチで読む表と索引を DB のキャッシュに載せておく (prewarm.go)。応答は待たない。
+		go prewarmDB(h.DB, "initialize")
 
 		// Set language to the implementation language.
 		// Agents optimizing this app: set agent, harness, and model to the names used.

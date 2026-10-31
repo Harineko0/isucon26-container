@@ -69,6 +69,11 @@ func NewServer(config *Config) *echo.Echo {
 	go cleanSearchDirtyLoop(db)
 	go loadInitialDataBoundary(db)
 	go loadProfileImageHints(db)
+	// 再起動 (デプロイ・追試) 直後の DB のキャッシュを埋める。DB と同じリージョンの asia だけが行う
+	// (3 台が同時に読まない。initialize も asia1 に来る)。prewarm.go
+	if config.Region == "asia" {
+		go prewarmDB(db, "startup")
+	}
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
 	e.POST("/api/auth/register", registerHandler(handlerContext))
