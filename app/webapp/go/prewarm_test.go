@@ -24,8 +24,12 @@ func TestPrewarmPlan(t *testing.T) {
 		{OID: 7, Name: "image_objects_20261028_p1", Blocks: 3}, // 月パーティションではない
 		{OID: 8, Name: "notifications", Blocks: 1000},           // 候補にない
 		{OID: 9, Name: "realmojis", Blocks: 70},
+		{OID: 10, Name: "realmojis_post_id", Blocks: 22},
+		{OID: 11, Name: "realmojis_one_active", Blocks: 22},
+		{OID: 12, Name: "realmojis_pkey", Blocks: 50},
+		{OID: 13, Name: "comments_pkey", Blocks: 30},
 	}
-	buffer, read := prewarmPlan(rels, 125)
+	buffer, read := prewarmPlan(rels, 147)
 	names := func(list []prewarmRelation) []string {
 		out := make([]string, 0, len(list))
 		for _, r := range list {
@@ -33,8 +37,8 @@ func TestPrewarmPlan(t *testing.T) {
 		}
 		return out
 	}
-	wantBuffer := []string{"users", "posts_pkey", "posts", "image_objects_202605_pkey"}
-	wantRead := []string{"realmojis", "image_objects_202605"}
+	wantBuffer := []string{"users", "posts_pkey", "posts", "realmojis_post_id", "image_objects_202605_pkey"}
+	wantRead := []string{"realmojis_one_active", "realmojis", "image_objects_202605"}
 	if got := names(buffer); !equalStrings(got, wantBuffer) {
 		t.Errorf("buffer = %v, want %v", got, wantBuffer)
 	}
