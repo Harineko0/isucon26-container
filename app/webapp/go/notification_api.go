@@ -28,6 +28,7 @@ type getNotificationsResponse struct {
 // isureal_notification_id (004-functions.sql) で期間の開始処理が INSERT するものと同じ値になり、
 // created_at は期間の starts_at と同じ値になる。対象は「その期間が有効なときにこのリージョンにいる
 // active な利用者」で、開始時点でそうでなかった利用者 (退会・リージョン変更) は通知せずに切断する。
+// 期間のコミットを LISTEN で検知する。起動・再接続・定期的な再同期では有効期間を DB から読み直す。
 // 接続ごとの定期的な DB 照会はしない。退会・リージョン変更による切断は、接続中の利用者
 // 全員を 1 秒ごとに 1 文で確認する。
 //
@@ -43,9 +44,9 @@ type getNotificationsResponse struct {
 // 状態は DB で観測した有効な期間 id だけから決まるので、どのサーバで /api/initialize が
 // 実行されても期間 id の変化として検知される (プロセス内に初期化すべき状態は無い)。
 const (
-	notificationWindowPollInterval = 20 * time.Millisecond
-	notificationUserCheckInterval  = time.Second
-	notificationQueryTimeout       = 2 * time.Second
+	notificationWindowResyncInterval = time.Second
+	notificationUserCheckInterval    = time.Second
+	notificationQueryTimeout         = 2 * time.Second
 )
 
 type windowNotification struct {
@@ -111,8 +112,6 @@ type postingWindowWatcher struct {
 	region string
 
 	// DB へのアクセス (テストでは差し替える)。
-	activeWindow  func(ctx context.Context, region string) (string, error)
-	notifications func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error)
 	inactiveUsers func(ctx context.Context, userIDs []string, region string) ([]string, error)
 
 	mu   sync.Mutex
@@ -123,24 +122,6 @@ type postingWindowWatcher struct {
 
 func newPostingWindowWatcher(db *sqlx.DB, region string) *postingWindowWatcher {
 	w := newPostingWindowWatcherWith(region,
-		func(ctx context.Context, region string) (string, error) {
-			var id string
-			err := db.GetContext(ctx, &id, `SELECT id FROM posting_windows WHERE region = $1 AND ended_at IS NULL`, region)
-			if errors.Is(err, sql.ErrNoRows) {
-				return "", nil
-			}
-			return id, err
-		},
-		func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error) {
-			var rows []windowNotification
-			err := db.SelectContext(ctx, &rows, `
-    SELECT u.id AS user_id, isureal_notification_id(w.id, u.id, w.starts_at) AS id, w.starts_at AS created_at,
-           u.status = 'active' AS user_active, u.region AS user_region
-    FROM posting_windows w JOIN users u ON u.id = ANY($2::text[])
-    WHERE w.id = $1
-   `, windowID, userIDs)
-			return rows, err
-		},
 		func(ctx context.Context, userIDs []string, region string) ([]string, error) {
 			var ids []string
 			err := db.SelectContext(ctx, &ids, `
@@ -150,21 +131,17 @@ func newPostingWindowWatcher(db *sqlx.DB, region string) *postingWindowWatcher {
 			return ids, err
 		},
 	)
-	go w.runWindowLoop()
+	go w.runWindowLoop(context.Background(), db)
 	go w.runUserCheckLoop()
 	return w
 }
 
 func newPostingWindowWatcherWith(
 	region string,
-	activeWindow func(ctx context.Context, region string) (string, error),
-	notifications func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error),
 	inactiveUsers func(ctx context.Context, userIDs []string, region string) ([]string, error),
 ) *postingWindowWatcher {
 	return &postingWindowWatcher{
 		region:        region,
-		activeWindow:  activeWindow,
-		notifications: notifications,
 		inactiveUsers: inactiveUsers,
 		subs:          map[string]map[*notificationSubscriber]struct{}{},
 	}
@@ -208,23 +185,16 @@ func (w *postingWindowWatcher) snapshot() ([]string, map[string][]*notificationS
 	return userIDs, targets
 }
 
-func (w *postingWindowWatcher) runWindowLoop() {
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), notificationQueryTimeout)
-		if err := w.checkWindow(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			log.Printf("failed to deliver notifications: %v", err)
+// checkWindow はコミット済みの期間を接続中の利用者へ配る。hint は NOTIFY が知らせた id。
+// 再同期では先に有効期間を読み、その後で購読者を集める（接続時の照会との間に隙間を作らない）。
+func (w *postingWindowWatcher) checkWindow(ctx context.Context, db windowReader, hint string) error {
+	id := hint
+	if id == "" {
+		var err error
+		id, err = db.activeWindow(ctx, w.region)
+		if err != nil {
+			return err
 		}
-		cancel()
-		time.Sleep(notificationWindowPollInterval)
-	}
-}
-
-// checkWindow は有効な投稿期間を確認し、変わっていればその期間の通知を接続中の利用者に配る。
-// 失敗したときは last を進めず、次の周期でやり直す。
-func (w *postingWindowWatcher) checkWindow(ctx context.Context) error {
-	id, err := w.activeWindow(ctx, w.region)
-	if err != nil {
-		return err
 	}
 	w.mu.Lock()
 	unchanged := id == w.last
@@ -235,21 +205,27 @@ func (w *postingWindowWatcher) checkWindow(ctx context.Context) error {
 	if id != "" {
 		// 期間を見つけた後に購読者を集める (取りこぼしが無い理由は先頭のコメント)。
 		userIDs, targets := w.snapshot()
+		var rows []windowNotification
 		if len(userIDs) > 0 {
-			rows, err := w.notifications(ctx, id, userIDs)
+			var err error
+			rows, err = db.notifications(ctx, w.region, id, userIDs)
 			if err != nil {
 				return err
 			}
-			for _, row := range rows {
-				ev := notificationEvent{notification: getNotificationsResponse{
-					ID: row.ID, PostingWindowID: id, Region: w.region, CreatedAt: row.CreatedAt,
-				}}
-				if !row.UserActive || row.UserRegion != w.region {
-					ev = notificationEvent{kick: true}
-				}
-				for _, s := range targets[row.UserID] {
-					s.push(ev)
-				}
+		}
+		// ヒントだけでは last を進めない。終了済みや削除済みの期間の再送にも同じ条件を使う。
+		if hint != "" && len(rows) == 0 {
+			return nil
+		}
+		for _, row := range rows {
+			ev := notificationEvent{notification: getNotificationsResponse{
+				ID: row.ID, PostingWindowID: id, Region: w.region, CreatedAt: row.CreatedAt,
+			}}
+			if !row.UserActive || row.UserRegion != w.region {
+				ev = notificationEvent{kick: true}
+			}
+			for _, s := range targets[row.UserID] {
+				s.push(ev)
 			}
 		}
 	}
