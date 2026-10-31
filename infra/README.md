@@ -24,9 +24,3 @@ infra/pull.sh asia2 /etc/foo.conf    # 新しいファイルを管理対象に�
 - `isureal-go.service` を変えると isureal-go を再起動する。PostgreSQL の再起動が必要な設定（`shared_buffers` など）と PG の unit は表示が出るだけなので、ベンチが走っていないときに手で再起動する。
 - `isucon-register.service`、`isureal-guard.service`（主催者の BAN 処理）、envcheck 関連ファイルはここに置かない。
 - `fsync` / `synchronous_commit` など耐久性を下げる設定は入れない（追試で失格）。
-
-## アプリの DB 接続
-
-通常の SQL は各リージョンから asia1 のプライベートアドレスの PgBouncer（6432）に入り、asia2 の PostgreSQL で実行される。プーラー側は 16 トランザクションを並行実行し、アプリ側は Asia 64、Europe・America 各 128 接続で往復を待てる。initialize の psql と投稿期間 watcher は元の接続先を使う。
-
-初回の CI デプロイで `pgbouncer/Dockerfile` から静的バイナリをビルドする。asia1 の再起動時は `isureal-go.service` がディスクのバイナリを使い、DB から SCRAM 検証子を専用のランタイムディレクトリに読み込む。直結版に戻す場合はその版を通常の CI で配ると unit の差し替えでプーラーも停止する。
