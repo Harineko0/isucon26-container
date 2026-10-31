@@ -29,20 +29,25 @@ func TestImagePartitionFor(t *testing.T) {
 }
 
 func TestRememberImagePartition(t *testing.T) {
+	now := time.Date(2026, 10, 31, 6, 0, 0, 0, time.UTC)
 	rememberImagePartition("a", "image_objects_20261028_p3")
 	rememberImagePartition("b", "image_objects_20261028")
 	rememberImagePartition("c", "image_objects")
 	rememberImagePartition("d", "public.image_objects_202409")
-	if got := imageRelationFor("a"); got != "image_objects_20261028_p3" {
-		t.Errorf("a: %s", got)
+	if rel, exact := imageRelationFor("a", now); rel != "image_objects_20261028_p3" || !exact {
+		t.Errorf("a: %s %v", rel, exact)
 	}
+	// 手がかりが無ければ今のパーティションを推測する (外れたら親表で引き直す)。
 	for _, id := range []string{"b", "c", "d"} {
-		if got := imageRelationFor(id); got != "" {
-			t.Errorf("%s: %s", id, got)
+		if rel, exact := imageRelationFor(id, now); rel != "image_objects_20261028" || exact {
+			t.Errorf("%s: %s %v", id, rel, exact)
 		}
 	}
-	imageCreatedAt.Store("e", time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC))
-	if got := imageRelationFor("e"); got != "image_objects_20261028" {
-		t.Errorf("e: %s", got)
+	if rel, exact := imageRelationFor("b", time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)); rel != "image_objects_202611" || exact {
+		t.Errorf("b in November: %s %v", rel, exact)
+	}
+	imageCreatedAt.Store("e", time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC))
+	if rel, exact := imageRelationFor("e", now); rel != "image_objects_202610" || exact {
+		t.Errorf("e: %s %v", rel, exact)
 	}
 }
