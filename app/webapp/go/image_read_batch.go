@@ -159,6 +159,14 @@ func loadImageReadBatch(ctx context.Context, h *HandlerContext, rel string, requ
 	}
 	imageReadStats.Add("requests", int64(len(ids)))
 	imageReadStats.Add("queries", 1)
+	// Sparse traffic should reuse the original prepared statement and plan.
+	// Only a batch that actually combines requests needs the array query.
+	if len(ids) == 1 {
+		var object imageObject
+		err := conn.GetContext(ctx, &object, imageQueryFor(rel), ids[0], hasData[0])
+		results[indices[0]] = imageReadResult{object: object, err: err}
+		return results
+	}
 	var rows []struct {
 		Index int `db:"request_index"`
 		imageObject
