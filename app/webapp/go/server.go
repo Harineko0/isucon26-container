@@ -36,7 +36,7 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
 	}
-	go warmUpDBPool(db)
+	go warmUpDBPool(db, dbMaxConns(config.Region))
 
 	go func() {
 		// 接続プールの待ちを観測する (stderr → journal。guard は JSON の行しか読まない)。
@@ -56,6 +56,7 @@ func NewServer(config *Config) *echo.Echo {
 	}
 	e.Use(IPBanMiddleware(handlerContext))
 	go refreshSearchNorms(db)
+	go loadInitialDataBoundary(db)
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
 	e.POST("/api/auth/register", registerHandler(handlerContext))

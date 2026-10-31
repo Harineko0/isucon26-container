@@ -29,6 +29,9 @@ type replaceRealMojiResponse struct {
 }
 
 func newRealMojiResponse(reaction RealMoji, user User) replaceRealMojiResponse {
+	// RealMoji の画像は同じトランザクションで realmojis より先に INSERT されるので、
+	// realmojis.created_at が画像の created_at の上限になる (画像取得でパーティションを絞る手がかり)。
+	imageCreatedAt.Store(reaction.ImageID, reaction.CreatedAt)
 	return replaceRealMojiResponse{ID: reaction.ID, Reactor: newRelationshipUserResponse(user), ReactionType: reaction.ReactionType, ImageURL: signedImageURL(user, reaction.ImageID), CreatedAt: reaction.CreatedAt}
 }
 

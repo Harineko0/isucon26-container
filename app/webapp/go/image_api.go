@@ -50,7 +50,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			Allowed       bool      `db:"allowed"`
 			CreatedAt     time.Time `db:"created_at"`
 		}
-		// 画像の created_at は不変なので、分かっていれば (id, created_at) で引いてパーティションを絞る。
+		// 画像の created_at は不変なので、手がかり (imageCreatedAt) があれば created_at の範囲も付けてパーティションを絞る。
 		imageQuery := `
    SELECT u.secret_key_hash, i.media_type, i.created_at, CASE WHEN $2 THEN NULL ELSE i.data END AS data, COALESCE(
      u.profile_image_id = i.id
@@ -67,8 +67,14 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
    , false) AS allowed
    FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
    WHERE i.id = $1`
+		hinted := false
 		if createdAt, ok := imageCreatedAt.Load(input.ImageID); ok {
-			err = h.DB.GetContext(ctx, &object, imageQuery+` AND i.created_at = $3`, input.ImageID, hasData, createdAt.(time.Time))
+			// 範囲の両端は STABLE な式 (timestamptz ± interval) にして、プラン時ではなく実行開始時に刈り込ませる。
+			// 定数 (= $3) のままだとプラン時に 1 パーティションへ刈り込めるカスタムプランの方が安く見えて
+			// 汎用プランに切り替わらず、毎回プランニング (実測 ~1ms) が走る。この形なら 5 回目以降は汎用プラン
+			// (プランニング ~0.05ms、実行開始時に 35 パーティションを除外) になる。
+			err = h.DB.GetContext(ctx, &object, imageQuery+` AND i.created_at BETWEEN $3::timestamptz - interval '1 hour' AND $3::timestamptz + interval '0 seconds'`, input.ImageID, hasData, createdAt.(time.Time))
+			hinted = err == nil
 			if errors.Is(err, sql.ErrNoRows) {
 				// 手がかりが外れていた場合に備えて id だけで引き直す。
 				err = h.DB.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
@@ -76,7 +82,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		} else {
 			err = h.DB.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
 		}
-		if err == nil {
+		if err == nil && !hinted {
 			imageCreatedAt.Store(input.ImageID, object.CreatedAt)
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -100,6 +106,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			object.Data = cached
 		} else {
 			imageDataStore.put(input.ImageID, object.Data)
+			saveInitialImageToDisk(input.ImageID, object.CreatedAt, object.Data)
 		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")

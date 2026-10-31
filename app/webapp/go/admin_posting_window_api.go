@@ -76,11 +76,11 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
   `, windowID, region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
 			return err
 		}
+		// 通知の id は SSE (notification_api.go) が投稿期間と利用者から同じ関数で組み立てる。
 		if _, err := tx.ExecContext(ctx, `
    INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-   SELECT substr(ids.ts, 1, 8) || '-' || substr(ids.ts, 9, 4) || substr(gen_random_uuid()::text, 14), users.id, $2, $3
-   FROM users,
-        (SELECT lpad(to_hex((extract(epoch FROM $3::timestamptz) * 1000)::bigint), 12, '0') AS ts) ids
+   SELECT isureal_notification_id($2::text, users.id, $3::timestamptz), users.id, $2, $3
+   FROM users
    WHERE region = $1 AND status = 'active'
   `, region, windowID, startsAt); err != nil {
 			return err

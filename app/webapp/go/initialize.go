@@ -26,6 +26,7 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		imageDataStore.reset()
 		// login_sessions は作り直されるので、覚えていたセッションも捨てる (他のリージョンの分は DB の確認で外れる)。
 		knownSessions.Clear()
+		go loadInitialDataBoundary(h.DB)
 		go refreshSearchNorms(h.DB)
 
 		// Set language to the implementation language.

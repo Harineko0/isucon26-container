@@ -1,10 +1,16 @@
 package isureal
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jmoiron/sqlx"
 )
 
 // 初期データの画像は cmd/imgsync でローカルディスクに書き出してある (不変なので内容は DB と同じ)。
@@ -20,22 +26,42 @@ func imageDiskPath(id string) (string, bool) {
 }
 
 // WriteImageToDisk は画像を一時ファイル経由で書き出す (途中で止まっても壊れたファイルを残さない)。
+// 一時ファイルは書き手ごとに別名にし、fsync してから rename する
+// (同じ id を同時に書いても、強制停止のあとでも、空や途中までのファイルが見えることはない)。
 func WriteImageToDisk(id string, data []byte) error {
 	path, ok := imageDiskPath(id)
-	if !ok {
+	if !ok || len(data) == 0 {
 		return nil
 	}
-	if _, err := os.Stat(path); err == nil {
+	if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.CreateTemp(dir, id+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, 0o644)
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 func readImageFromDisk(id string) ([]byte, bool) {
@@ -44,13 +70,77 @@ func readImageFromDisk(id string) ([]byte, bool) {
 		return nil, false
 	}
 	data, err := os.ReadFile(path)
-	if err != nil {
+	if err != nil || len(data) == 0 {
+		// 長さ 0 は書きかけ (強制停止など) とみなして DB から取り直す。
 		return nil, false
 	}
 	return data, true
 }
 
+// initialDataBoundaryMicros は initial_data_boundary.created_at (UnixMicro)。0 なら未取得で、ディスクへは書き戻さない。
+var initialDataBoundaryMicros atomic.Int64
+
+// loadInitialDataBoundary は初期データの境界を読む (起動時と initialize 後。値は変わらないが念のため読み直す)。
+func loadInitialDataBoundary(db *sqlx.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var boundary time.Time
+	if err := db.GetContext(ctx, &boundary, `SELECT created_at FROM initial_data_boundary`); err != nil {
+		fmt.Fprintf(os.Stderr, "imgcache: failed to load initial_data_boundary: %v\n", err)
+		return
+	}
+	initialDataBoundaryMicros.Store(boundary.UnixMicro())
+}
+
+// DB から取った画像のうち初期データのもの (created_at <= 境界) は、ディスクにも書き戻す。
+// 初期データの画像は id ごとに不変で initialize でも消えないので、cmd/imgsync で埋めきれなかった分が
+// ベンチ中に埋まり、以後 (再起動後も) DB から運ばずに済む。ベンチ中に投稿された画像は書かない (ディスクが際限なく増えるため)。
+// 書き込みは別 goroutine で行い、キューが埋まっていれば諦める (リクエストを待たせない。次に DB から取ったときにまた試す)。
+// 閲覧可否はこれまでどおり毎回 DB で確認するので、ディスクにあるだけの画像を返すことはない。
+const imageDiskWriteQueue = 1024
+
+type imageDiskWrite struct {
+	id   string
+	data []byte
+}
+
+var (
+	imageDiskWrites  = make(chan imageDiskWrite, imageDiskWriteQueue)
+	imageDiskPending sync.Map // 書き込み待ち・書き込み中の id (同じ画像を重ねて積まない)
+	imageDiskWriters sync.Once
+)
+
+func saveInitialImageToDisk(id string, createdAt time.Time, data []byte) {
+	boundary := initialDataBoundaryMicros.Load()
+	if boundary == 0 || createdAt.IsZero() || createdAt.UnixMicro() > boundary || len(data) == 0 {
+		return
+	}
+	imageDiskWriters.Do(func() {
+		for range 2 {
+			go func() {
+				for w := range imageDiskWrites {
+					if err := WriteImageToDisk(w.id, w.data); err != nil {
+						fmt.Fprintf(os.Stderr, "imgcache: failed to write %s: %v\n", w.id, err)
+					}
+					imageDiskPending.Delete(w.id)
+				}
+			}()
+		}
+	})
+	if _, loaded := imageDiskPending.LoadOrStore(id, struct{}{}); loaded {
+		return
+	}
+	select {
+	case imageDiskWrites <- imageDiskWrite{id: id, data: data}:
+	default:
+		imageDiskPending.Delete(id)
+	}
+}
+
 // imageCreatedAt は画像 id → created_at (不変)。パーティションを絞るために使う。
+// 値は created_at の上限 (手がかり) で、画像の created_at は [値 - 1 時間, 値] に入る
+// (投稿画像と画像取得で得た値は created_at そのもの、RealMoji は realmojis.created_at:
+// 画像は同じトランザクションでそれより先に INSERT される)。外れていても id だけで引き直すので結果は変わらない。
 // 1 件 150 バイト程度。上限を超えて捨てても id だけの検索に戻るだけ。
 var imageCreatedAt = &boundedMap{limit: 2_000_000}
 

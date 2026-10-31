@@ -13,7 +13,7 @@ ISUREAL_DB_USER=${ISUREAL_DB_USER:-isureal}
 ISUREAL_DB_PASSWORD=${ISUREAL_DB_PASSWORD:-isureal}
 ISUREAL_DB_NAME=${ISUREAL_DB_NAME:-isureal}
 
-for file in 002-indexes.sql 004-functions.sql 005-roundtrips.sql 006-image-storage.sql reset.sql; do
+for file in 002-indexes.sql 004-functions.sql 005-roundtrips.sql 006-image-storage.sql 007-feed-indexes.sql 008-image-partitions.sql reset.sql; do
 PGPASSWORD="$ISUREAL_DB_PASSWORD" psql \
 	--no-psqlrc \
 	--no-password \
