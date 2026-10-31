@@ -15,62 +15,68 @@ import (
 )
 
 const loginSQL = `SELECT * FROM isureal_login($1, $2, $3, $4)`
-const maxPipelinedLogins = 8
+const maxPipelinedWrites = 8
 
-type loginCall struct {
+type writeCall[T any] struct {
 	ctx   context.Context
 	ip    string
 	args  [4]string
-	reply chan loginResult
+	reply chan writeResult[T]
 }
 
-type loginResult struct {
-	row sessionUserRow
+type writeResult[T any] struct {
+	row T
 	err error
 }
 
-type loginBatch struct {
-	calls  []*loginCall
+type writeBatch[T any] struct {
+	calls  []*writeCall[T]
 	live   int
 	cancel context.CancelFunc
 }
 
-type loginQueue struct {
-	h       *HandlerContext
+type writeQueue[T any] struct {
+	db      *sqlx.DB
+	bans    *IPBanList // Only login rechecks IP bans after acquiring its connection.
+	sql     string
 	mu      sync.Mutex
-	pending *loginBatch
+	pending *writeBatch[T]
 }
 
-func queryLogin(ctx context.Context, conn *sqlx.Conn, args [4]string) (sessionUserRow, error) {
-	var row sessionUserRow
-	err := conn.GetContext(ctx, &row, loginSQL, args[0], args[1], args[2], args[3])
+func (q *writeQueue[T]) query(ctx context.Context, conn *sqlx.Conn, args [4]string) (T, error) {
+	var row T
+	err := conn.GetContext(ctx, &row, q.sql, args[0], args[1], args[2], args[3])
 	return row, err
 }
 
 // Use the regular prepared query while the pool has headroom. Under pressure
 // only arrivals overlapping acquisition share a connection, without a timer.
-func (q *loginQueue) login(ctx context.Context, ip string, args [4]string) (sessionUserRow, error) {
-	stats := q.h.DB.Stats()
+func (q *writeQueue[T]) execute(ctx context.Context, ip string, args [4]string) (T, error) {
+	var zero T
+	stats := q.db.Stats()
 	if stats.Idle > 0 || stats.MaxOpenConnections == 0 || stats.OpenConnections < stats.MaxOpenConnections {
-		conn, err := q.h.IPBans.connUnlessBanned(ctx, q.h.DB, ip)
+		conn, err := q.db.Connx(ctx)
 		if err != nil {
-			return sessionUserRow{}, err
+			return zero, err
 		}
 		defer conn.Close()
-		return queryLogin(ctx, conn, args)
+		if q.bans != nil && q.bans.bannedCached(ip, time.Now()) {
+			return zero, NewAPIError(http.StatusForbidden, "ip_banned")
+		}
+		return q.query(ctx, conn, args)
 	}
-	call := &loginCall{ctx: ctx, ip: ip, args: args, reply: make(chan loginResult, 1)}
+	call := &writeCall[T]{ctx: ctx, ip: ip, args: args, reply: make(chan writeResult[T], 1)}
 	q.mu.Lock()
 	b := q.pending
 	if b == nil {
 		shared, cancel := context.WithCancel(context.WithoutCancel(ctx))
-		b = &loginBatch{cancel: cancel}
+		b = &writeBatch[T]{cancel: cancel}
 		q.pending = b
 		go q.run(shared, b)
 	}
 	b.calls = append(b.calls, call)
 	b.live++
-	if len(b.calls) == maxPipelinedLogins {
+	if len(b.calls) == maxPipelinedWrites {
 		q.pending = nil
 	}
 	q.mu.Unlock()
@@ -90,13 +96,13 @@ func (q *loginQueue) login(ctx context.Context, ip string, args [4]string) (sess
 	case result := <-call.reply:
 		return result.row, result.err
 	case <-ctx.Done():
-		return sessionUserRow{}, ctx.Err()
+		return zero, ctx.Err()
 	}
 }
 
-func (q *loginQueue) run(ctx context.Context, b *loginBatch) {
+func (q *writeQueue[T]) run(ctx context.Context, b *writeBatch[T]) {
 	defer b.cancel()
-	conn, err := q.h.DB.Connx(ctx)
+	conn, err := q.db.Connx(ctx)
 	q.mu.Lock()
 	if q.pending == b {
 		q.pending = nil
@@ -105,7 +111,7 @@ func (q *loginQueue) run(ctx context.Context, b *loginBatch) {
 	q.mu.Unlock()
 	if err != nil {
 		for _, c := range calls {
-			c.reply <- loginResult{err: err}
+			c.reply <- writeResult[T]{err: err}
 		}
 		return
 	}
@@ -116,9 +122,9 @@ func (q *loginQueue) run(ctx context.Context, b *loginBatch) {
 	for _, c := range calls {
 		switch {
 		case c.ctx.Err() != nil:
-			c.reply <- loginResult{err: c.ctx.Err()}
-		case q.h.IPBans.bannedCached(c.ip, time.Now()):
-			c.reply <- loginResult{err: NewAPIError(http.StatusForbidden, "ip_banned")}
+			c.reply <- writeResult[T]{err: c.ctx.Err()}
+		case q.bans != nil && q.bans.bannedCached(c.ip, time.Now()):
+			c.reply <- writeResult[T]{err: NewAPIError(http.StatusForbidden, "ip_banned")}
 		default:
 			ready = append(ready, c)
 		}
@@ -127,34 +133,34 @@ func (q *loginQueue) run(ctx context.Context, b *loginBatch) {
 	case 0:
 	case 1:
 		c := ready[0]
-		row, err := queryLogin(c.ctx, conn, c.args)
-		c.reply <- loginResult{row, err}
+		row, err := q.query(c.ctx, conn, c.args)
+		c.reply <- writeResult[T]{row, err}
 	default:
-		pipelineLogins(ctx, conn, ready)
+		q.pipeline(ctx, conn, ready)
 	}
 }
 
-func pipelineLogins(ctx context.Context, conn *sqlx.Conn, calls []*loginCall) {
+func (q *writeQueue[T]) pipeline(ctx context.Context, conn *sqlx.Conn, calls []*writeCall[T]) {
 	err := conn.Raw(func(raw any) error {
 		driverConn, ok := raw.(*stdlib.Conn)
 		if !ok {
-			return fmt.Errorf("login pipeline requires pgx, got %T", raw)
+			return fmt.Errorf("write pipeline requires pgx, got %T", raw)
 		}
 		pg := driverConn.Conn()
 		pipe := pg.PgConn().StartPipeline(ctx)
 		defer pipe.Close()
 		for _, c := range calls {
 			args := [][]byte{[]byte(c.args[0]), []byte(c.args[1]), []byte(c.args[2]), []byte(c.args[3])}
-			pipe.SendQueryParams(loginSQL, args, nil, nil, nil)
+			pipe.SendQueryParams(q.sql, args, nil, nil, nil)
 			// Sync ends each transaction, so locks and statement failures stay
-			// within one login. Flush the whole batch to cross the network once.
+			// within one request. Flush the whole batch to cross the network once.
 			pipe.SendPipelineSync()
 		}
 		if err := pipe.Flush(); err != nil {
 			return err
 		}
 		for len(calls) > 0 {
-			result, err := readLoginResult(pg, pipe)
+			result, err := readWriteResult[T](pg, pipe)
 			if err != nil {
 				return err
 			}
@@ -165,18 +171,18 @@ func pipelineLogins(ctx context.Context, conn *sqlx.Conn, calls []*loginCall) {
 	})
 	// A lost connection leaves the commit outcome unknown. Never replay writes.
 	for _, c := range calls {
-		c.reply <- loginResult{err: err}
+		c.reply <- writeResult[T]{err: err}
 	}
 }
 
-func readLoginResult(pg *pgx.Conn, pipe *pgconn.Pipeline) (loginResult, error) {
-	result := loginResult{err: pgx.ErrNoRows}
+func readWriteResult[T any](pg *pgx.Conn, pipe *pgconn.Pipeline) (writeResult[T], error) {
+	result := writeResult[T]{err: pgx.ErrNoRows}
 	for {
 		msg, err := pipe.GetResults()
 		if err != nil {
 			var statementError *pgconn.PgError
 			if !errors.As(err, &statementError) {
-				return loginResult{}, err
+				return writeResult[T]{}, err
 			}
 			result.err = err
 			continue // A statement or commit error is followed by ReadyForQuery.
@@ -184,11 +190,11 @@ func readLoginResult(pg *pgx.Conn, pipe *pgconn.Pipeline) (loginResult, error) {
 		switch msg := msg.(type) {
 		case *pgconn.ResultReader:
 			rows := pgx.RowsFromResultReader(pg.TypeMap(), msg)
-			result.row, result.err = pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[sessionUserRow])
+			result.row, result.err = pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[T])
 		case *pgconn.PipelineSync:
-			return result, nil // The server has committed or rolled back this login.
+			return result, nil // The server has committed or rolled back this request.
 		default:
-			return loginResult{}, fmt.Errorf("unexpected login pipeline response %T", msg)
+			return writeResult[T]{}, fmt.Errorf("unexpected write pipeline response %T", msg)
 		}
 	}
 }
