@@ -25,8 +25,7 @@ wait_portal_idle() {
 step=portal-idle
 wait_portal_idle
 
-# キュー待ち・ポータル待ちの間に凍結時刻を過ぎていたら、サーバに触らずに拒否する（#245）。
-# `||` で受けるので ERR trap（failed:*）は走らず、stage は freeze.sh が書いた rejected:* のまま
+# 古いワークフローとの互換呼び出し。時刻・ブランチによる制限は廃止。
 "${FREEZE_CHECK:-$B/freeze.sh}" || exit 1
 
 # CI の記録にない portal ジョブ = 誰かが手で投げたベンチ
