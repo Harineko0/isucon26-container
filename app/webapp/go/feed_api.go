@@ -190,6 +190,9 @@ var feedFollowingQuery = `
   )` + feedUnrankedTail
 
 // friends-of-friends: 著者は友達ではなく mutual に含まれる。この場合 friends 公開の投稿は見られない。
+// おすすめ度の「著者の mutual 数」と「著者の友達の mutual 数の和」は、以前は候補ごとの相関副問い合わせで
+// mutual（CTE、友達の多い閲覧者では千数百行）を毎回全件なめていた（候補 36 件で約 13ms）。
+// mutual は id で一意なので LEFT JOIN、著者の友達の和は候補の著者ごとに 1 回だけ集計して LEFT JOIN する（値は同じ）。
 var feedFriendsOfFriendsQuery = `
   WITH` + feedViewerCTE + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
   mutual AS (
@@ -203,6 +206,13 @@ var feedFriendsOfFriendsQuery = `
       AND p.author_id NOT IN (SELECT id FROM friends) AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
       AND p.visibility IN ('public', 'friends_of_friends')
   ),
+  author_fof AS (
+    SELECT a.author_id, sum(m.n) AS s
+    FROM (SELECT DISTINCT author_id FROM candidates) a
+    JOIN friendships fs ON fs.user_low_id = a.author_id OR fs.user_high_id = a.author_id
+    JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = a.author_id THEN fs.user_high_id ELSE fs.user_low_id END
+    GROUP BY a.author_id
+  ),
   scored AS (
     SELECT c.*, (
       10 * (SELECT count(*) FROM (
@@ -212,12 +222,12 @@ var feedFriendsOfFriendsQuery = `
               SELECT cm.author_id FROM comments cm JOIN users cu ON cu.id = cm.author_id AND cu.status = 'active'
               WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
             ) e WHERE e.user_id IN (SELECT id FROM friends))
-      + 3 * COALESCE((SELECT n FROM mutual WHERE id = c.author_id), 0)
-      + LEAST(COALESCE((SELECT sum(m.n) FROM friendships fs
-                        JOIN mutual m ON m.id = CASE WHEN fs.user_low_id = c.author_id THEN fs.user_high_id ELSE fs.user_low_id END
-                        WHERE fs.user_low_id = c.author_id OR fs.user_high_id = c.author_id), 0), 30)
+      + 3 * COALESCE(mm.n, 0)
+      + LEAST(COALESCE(af.s, 0), 30)
       )::bigint AS score
     FROM candidates c
+    LEFT JOIN mutual mm ON mm.id = c.author_id
+    LEFT JOIN author_fof af ON af.author_id = c.author_id
   )
   SELECT * FROM scored
   WHERE $4::bigint IS NULL OR (score, posted_at, id) < ($4, $2::timestamptz, $3)
