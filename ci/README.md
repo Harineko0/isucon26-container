@@ -15,12 +15,12 @@ PR は isucon26-container に作る。このリポジトリは monorepo なの�
 
 - 3 台とも `app/webapp` を配る。`app-europe` `app-america` は `app` への symlink で、配らない。
 - 結果は PR のコメント（キュー待ち → デプロイ中 → 実行中 → 結果、と 1 つのコメントが書き換わる）と、`bench-results` ブランチの `results.jsonl` に残る。
-- ベンチした commit には commit status `Benchmark` が付き、PR の status checks に出る（`/bench` での測り直しも、その時点の head に付く）。pending（キュー待ち・デプロイ中・実行中）→ success（`PASS 45500（前回比 +534 (+1.2%)）`）/ failure（ベンチ FAIL、17:30 以降の拒否）/ error（デプロイ等で失敗、またはベンチ中にサーバの状態が変わった）。Details から run に飛べる。
+- ベンチした commit には commit status `Benchmark` が付き、PR の status checks に出る（`/bench` での測り直しも、その時点の head に付く）。pending（キュー待ち・デプロイ中・実行中）→ success（`PASS 45500（前回比 +534 (+1.2%)）`）/ failure（ベンチ FAIL）/ error（デプロイ等で失敗、またはベンチ中にサーバの状態が変わった）。Details から run に飛べる。
   `git fetch origin bench-results && git show FETCH_HEAD:results.jsonl | jq -c '{job_id,score,passed,label,app_sha}'`
 - スコアの比較: PR の run は**同じ PR の前回の run** と比べる（`前回比`）。その PR の初回だけ main の直近の PASS と比べる（`main 比 …、この PR の初回`）。main の run は main の直近の PASS と比べる。表には比較元の job と commit が並ぶ。
 - コメントにはほかに FAIL の理由、リージョン別の人数推移、ベンチャーの stdout が載る。
 - PR をマージ・クローズすると、その PR の未完了の run（キュー待ち・実行中）は `.github/workflows/bench-cancel.yml` が自動でキャンセルする。実行中ならベンチの途中でも止まる（ポータルに投げ済みのジョブはポータル側で最後まで走り、次の run はその終了を待つ）。
-- `BENCH_FREEZE_AT`（既定 2026-10-31 17:30 JST）以降は main 以外を拒否する（キュー待ちの前・後と、ポータルの空き待ち後のデプロイ直前に判定する。`ci/bench/freeze.sh`）。最終スコア = 最後のベンチなので、終盤に PR のコードがサーバに残らないようにするため。
+- 時刻・ブランチによるベンチ制限はない。`BENCH_FREEZE_AT` は使用しない。古い PR head でも制限が復活しないよう、`ci/bench/freeze.sh` は常に許可する互換スクリプトとして残す。
 
 ## 1 run の流れ（`ci/bench/`）
 
@@ -99,7 +99,7 @@ gh secret set DEPLOY_SSH_KEY -R Harineko0/isucon26-container < ~/.ssh/id_ed25519
 gh secret set DEPLOY_SSH_PASSPHRASE -R Harineko0/isucon26-container
 ```
 
-Variables（任意）: `BENCH_FREEZE_AT`（ISO 8601）、`PORTAL_TARGET_ID`（既定 1707 = asia1。ポータルのジョブ詳細の target と同じ）。
+Variables（任意）: `PORTAL_TARGET_ID`（既定 1707 = asia1。ポータルのジョブ詳細の target と同じ）。
 
 ポータルの Cookie が切れると `portal.py` が `csrf: HTTP 302` などで落ちる。そのときは `PORTAL_COOKIE` を入れ直す。
 

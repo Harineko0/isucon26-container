@@ -26,7 +26,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 - CI が到着順に 1 本ずつ「デプロイ → initialize 確認 → ベンチ → 改変チェック」を行い、結果を PR コメント、PR の status check `Benchmark`（スコアと、同じ PR の前回との差が出る。初回は main との差）、`bench-results` ブランチの `results.jsonl` に残す。
 - 手元から `deploy.sh` / `infra/deploy.sh` / `smoke.sh` を実行しない、ポータルの Enqueue を押さない、サーバで再起動・設定変更・DB 書き込みをしない。他の人のベンチ中にサーバが変わると、どの変更でスコアが動いたか分からなくなる。スクリプトのガードと Claude Code の hook（`.claude/hooks/guard-bench.py`）が止める。
 - 読み取り（ssh での `journalctl` / `top` / `cat`、DB への `SELECT` / `EXPLAIN`、ルーターへの GET、`infra/deploy.sh -n`）は自由。ただし **asia2 の重い読み取りはベンチを汚す**（#84）: ポータルに PENDING / RUNNING のジョブがある間は、大きい表（realmojis・notifications・comments・posts・image_objects）の全件 `count(*)` / `GROUP BY` / `ORDER BY`、`EXPLAIN ANALYZE`、PostgreSQL ログ（`/var/log/postgresql/*.log`、数 GB）の `grep` / `less` をしない。件数は `pg_stat_user_tables.n_live_tup` か `pg_class.reltuples`、計画は `EXPLAIN`（ANALYZE なし）、ログは `tail -n` で見る。hook が全件 count / GROUP BY とログの全読みを止める。
-- 17:30 以降は main 以外のベンチを CI が拒否する。
+- ベンチの時刻・ブランチ制限はない（17:30 以降も PR のベンチを CI から実行できる）。
 - PR コメントの「計測」に、その run だけの pg_stat_statements・alp・vmstat・DB wait が載る（統計のリセットは CI がベンチ直前に行う。手元からリセットしない）。
 - 索引を足すときは、initialize の中で作らない。作るのに 1 秒を超える表（notifications・realmojis・posts・comments など）は、人が asia2 で先に `CREATE INDEX CONCURRENTLY` してから 002 に `IF NOT EXISTS` で書く（実測と理由は [ci/README.md](ci/README.md)「索引の追加と initialize の時間」）。
 - スコア = Σ(採点件数 × 配点 × リージョン倍率)。倍率は asia 1 / **europe 1.5 / america 1.5**。配点表は manual.md「スコアの計算」。
