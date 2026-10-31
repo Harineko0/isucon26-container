@@ -32,8 +32,25 @@ func dbMaxConns(region string) int {
 	return 40
 }
 
-func openDB(config *Config) (*sqlx.DB, error) {
+// dbPlanCacheMode は アプリの接続だけに設定する plan_cache_mode (#153)。pgx は既定
+// (QueryExecModeCacheStatement) で文を接続ごとに prepare するので、この設定が効く。
+// custom plan (auto で汎用プランの見積もりが高いと毎回選ばれる) は計画のたびに参照する表の全索引をロックし、
+// 頻出の文は 20〜38 リレーションになって fast-path の枠 (16) を超え LWLock:LockManager で待つ。
+// generic plan は実行時に使う索引だけをロックし、計画の CPU も 1 回で済む。
+// 起動パケットで送るので往復は増えない。psql など他の接続には影響しない。
+const dbPlanCacheMode = "force_generic_plan"
+
+func dbConnConfig(config *Config) (*pgx.ConnConfig, error) {
 	connConfig, err := pgx.ParseConfig(config.DatabaseDSN())
+	if err != nil {
+		return nil, err
+	}
+	connConfig.RuntimeParams["plan_cache_mode"] = dbPlanCacheMode
+	return connConfig, nil
+}
+
+func openDB(config *Config) (*sqlx.DB, error) {
+	connConfig, err := dbConnConfig(config)
 	if err != nil {
 		return nil, err
 	}
