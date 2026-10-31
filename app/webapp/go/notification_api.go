@@ -23,7 +23,11 @@ type getNotificationsResponse struct {
 }
 
 // 通知は投稿期間の開始時にだけ作られる。プロセスに 1 本の監視を置き、このリージョンの
-// 有効な投稿期間が変わったら、接続中の利用者の通知を 1 文でまとめて引いて各接続に配る。
+// 有効な投稿期間が変わったら、接続中の利用者の通知を 1 文でまとめて組み立てて各接続に配る。
+// 通知は notifications 表から読まず、投稿期間と利用者から組み立てる (#27)。id は
+// isureal_notification_id (004-functions.sql) で期間の開始処理が INSERT するものと同じ値になり、
+// created_at は期間の starts_at と同じ値になる。対象は「その期間が有効なときにこのリージョンにいる
+// active な利用者」で、開始時点でそうでなかった利用者 (退会・リージョン変更) は通知せずに切断する。
 // 接続ごとの定期的な DB 照会はしない。退会・リージョン変更による切断は、接続中の利用者
 // 全員を 1 秒ごとに 1 文で確認する。
 //
@@ -32,7 +36,7 @@ type getNotificationsResponse struct {
 // その SQL のスナップショットより後にコミットされたので、監視がその期間を見つけるのは登録の後であり、
 // 購読者を集めるときに必ず含まれる。
 // どの期間を配るか: 接続時に見えていなかった期間の通知だけを配る。通知の created_at はその期間の
-// starts_at と同じ値で (admin_posting_window_api.go)、期間の starts_at はリージョンごとに単調に増えるので、
+// starts_at と同じ値で、期間の starts_at はリージョンごとに単調に増えるので、
 // 「created_at > 接続時に有効だった期間の starts_at」で判定できる (有効な期間が無ければすべて配る)。
 // created_at > connectedAt で判定すると、開始処理のトランザクションの途中 (starts_at の後、コミットの前) に
 // 接続した利用者がその期間の通知を受け取れない (#42)。
@@ -130,9 +134,10 @@ func newPostingWindowWatcher(db *sqlx.DB, region string) *postingWindowWatcher {
 		func(ctx context.Context, windowID string, userIDs []string) ([]windowNotification, error) {
 			var rows []windowNotification
 			err := db.SelectContext(ctx, &rows, `
-    SELECT n.user_id, n.id, n.created_at, u.status = 'active' AS user_active, u.region AS user_region
-    FROM notifications n JOIN users u ON u.id = n.user_id
-    WHERE n.posting_window_id = $1 AND n.user_id = ANY($2::text[])
+    SELECT u.id AS user_id, isureal_notification_id(w.id, u.id, w.starts_at) AS id, w.starts_at AS created_at,
+           u.status = 'active' AS user_active, u.region AS user_region
+    FROM posting_windows w JOIN users u ON u.id = ANY($2::text[])
+    WHERE w.id = $1
    `, windowID, userIDs)
 			return rows, err
 		},
