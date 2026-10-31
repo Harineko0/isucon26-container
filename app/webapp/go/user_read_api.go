@@ -81,7 +81,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		items := make([]relationshipUserResponse, 0)
+		matchedUsers := make([]User, 0, 51)
 		var staleUsers []User
 		for _, row := range rows {
 			user := row.User
@@ -91,23 +91,32 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 					continue
 				}
 			}
-			if err := user.setImageKey(); err != nil {
-				return err
-			}
-			if user.AccountType != "certified_public" {
-				user.Bio = ""
-			}
-			items = append(items, newRelationshipUserResponse(user))
-			if len(items) == 51 {
+			matchedUsers = append(matchedUsers, user)
+			if len(matchedUsers) == 51 {
 				break
 			}
 		}
 		if len(staleUsers) > 0 {
 			saveSearchNormsOnce(h.DB, staleUsers)
 		}
-		hasMore := len(items) > 50
+		hasMore := len(matchedUsers) > 50
 		if hasMore {
-			items = items[:50]
+			matchedUsers = matchedUsers[:50]
+		}
+		plan := newSignaturePlan()
+		for i := range matchedUsers {
+			if err := matchedUsers[i].setImageKey(); err != nil {
+				return err
+			}
+			plan.addProfile(matchedUsers[i])
+		}
+		plan.run()
+		items := make([]relationshipUserResponse, 0, len(matchedUsers))
+		for _, user := range matchedUsers {
+			if user.AccountType != "certified_public" {
+				user.Bio = ""
+			}
+			items = append(items, newRelationshipUserResponse(user))
 		}
 		return c.JSON(http.StatusOK, searchUsersResponse{Items: items, HasMore: hasMore})
 	}

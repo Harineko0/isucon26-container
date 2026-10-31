@@ -109,11 +109,15 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 				continue
 			}
 			comment := row.CommentWithAuthor
+			if len(comments) == 50 {
+				break
+			}
 			if err := comment.Author.setImageKey(); err != nil {
 				return err
 			}
 			comments = append(comments, comment)
 		}
+		hasMore := len(rows) > 50
 		plan := newSignaturePlan()
 		for _, comment := range comments {
 			plan.addProfile(comment.Author)
@@ -122,10 +126,6 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 		items := make([]createCommentResponse, 0, len(comments))
 		for _, comment := range comments {
 			items = append(items, newCommentResponse(comment.Comment, comment.Author))
-		}
-		hasMore := len(items) > 50
-		if hasMore {
-			items = items[:50]
 		}
 		return c.JSON(http.StatusOK, getCommentsResponse{Items: items, HasMore: hasMore})
 	}

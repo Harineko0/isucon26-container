@@ -86,6 +86,10 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			posts = append(posts, row)
 		}
+		hasMore := len(posts) > 50
+		if hasMore {
+			posts = posts[:50]
+		}
 		plan := newSignaturePlan()
 		for i := range posts {
 			if err := posts[i].Author.setImageKey(); err != nil {
@@ -103,10 +107,6 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 				item.Score = &score
 			}
 			items = append(items, item)
-		}
-		hasMore := len(items) > 50
-		if hasMore {
-			items = items[:50]
 		}
 		return c.JSON(http.StatusOK, getFeedResponse{Items: items, HasMore: hasMore})
 	}
