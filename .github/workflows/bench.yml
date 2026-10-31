@@ -3,6 +3,7 @@
 # - PR を open（draft なら Ready for review）すると自動で 1 回走る
 # - PR に `/bench [メモ]` とコメント → その時点の PR の head でもう一度走る（push 後の再計測など）
 #   どちらも PR の head（infra/ 等）と、その commit が指す app サブモジュールをデプロイする
+# - main に app/・infra/・deploy.sh を変える commit が入る（PR のマージ）と自動で main を測る（基準値の更新）
 # - 手動: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...] [-f app_ref=...]
 #
 # run は到着順に 1 本ずつ進む（ci/bench/queue.sh）。結果は PR コメントと bench-results ブランチの
@@ -11,6 +12,7 @@ name: bench
 run-name: >-
   bench ${{ github.event_name == 'issue_comment' && format('#{0}', github.event.issue.number)
   || github.event_name == 'pull_request_target' && format('#{0}', github.event.pull_request.number)
+  || github.event_name == 'push' && 'main'
   || format('{0}{1}', inputs.container_ref, inputs.app_ref != '' && format(' app@{0}', inputs.app_ref) || '') }}
 
 on:
@@ -19,6 +21,10 @@ on:
     types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
+  # main の基準値を最新に保つ。スコアに関係しない変更（文書、ci/ のスクリプト等）では走らせない
+  push:
+    branches: [main]
+    paths: [app, infra/**, deploy.sh]
   workflow_dispatch:
     inputs:
       container_ref:
@@ -44,7 +50,7 @@ env:
 jobs:
   bench:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_dispatch' || github.event_name == 'push' ||
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/bench') &&
@@ -78,6 +84,8 @@ jobs:
             pr_number=$ISSUE_NUMBER
             container_ref=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .head.sha)
             note=$(head -n1 <<<"$COMMENT_BODY" | sed 's|^/bench *||')
+          elif [ "$EVENT" = push ]; then
+            container_ref=$GITHUB_SHA note="main 更新後の自動ベンチ（基準値）"
           elif [ "$EVENT" = pull_request_target ]; then
             pr_number=$PR_EVENT_NUMBER container_ref=$PR_EVENT_SHA note="PR open 時の自動ベンチ"
           else
@@ -92,7 +100,7 @@ jobs:
           fi
           if [ -n "$pr_number" ]; then
             label="#$pr_number"
-          elif [ "$container_ref" = main ] && [ -z "$app_ref" ]; then
+          elif { [ "$container_ref" = main ] || [ "$EVENT" = push ]; } && [ -z "$app_ref" ]; then
             label=main
           else
             label="container@${container_sha:0:7} app@${app_sha:0:7}"
