@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -34,7 +33,7 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		if !validUserText(input.Body, 1, 1000) {
 			return NewAPIError(http.StatusBadRequest, "invalid_interaction")
 		}
-		id := uuid.NewString()
+		id := newTimeID()
 		var row interactionRow
 		if err := callWithSession(c, h, &row, func() *string { return row.SessRegion }, `isureal_create_comment({user}, $1, $2, $3)`, input.PostID, id, input.Body); err != nil {
 			return err

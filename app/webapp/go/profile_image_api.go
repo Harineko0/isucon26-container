@@ -2,11 +2,9 @@ package isureal
 
 import (
 	"bytes"
-	"io"
 	"net/http"
 
 	"example.com/isureal-company/isureal/internal/jpegcheck"
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
 
@@ -15,7 +13,9 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if c.Request().Header.Get("Content-Type") != "image/jpeg" {
 			return NewAPIError(http.StatusUnsupportedMediaType, "unsupported_media_type")
 		}
-		data, err := io.ReadAll(c.Request().Body)
+		// nginx は本文をバッファして Content-Length 付きで渡す (上限 32m) ので、
+		// その長さを 1 回だけ確保して読む (#93)。
+		data, err := readUpload(c.Request().Body, c.Request().ContentLength)
 		if err != nil {
 			return err
 		}
@@ -31,7 +31,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
-		imageID := uuid.NewString()
+		imageID := newTimeID()
 		var result string
 		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_put_profile_image($1, $2, $3)`, GetSession(c).UserID, imageID, data); err != nil {
 			return err
