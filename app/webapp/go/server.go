@@ -42,7 +42,7 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	db, err := openRequestDB(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"))
+	db, control, err := openRequestDBs(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"))
 	if err != nil {
 		panic("failed to open application DB pool: " + err.Error())
 	}
@@ -125,7 +125,7 @@ func NewServer(config *Config) *echo.Echo {
 	e.POST("/api/admin/auth/logout", adminLogoutHandler(handlerContext), AdminSessionMiddleware(handlerContext, true))
 	e.PUT("/api/admin/users/:userId/certification", certifyUserHandler(handlerContext), AdminSessionMiddleware(handlerContext, true))
 	e.DELETE("/api/admin/users/:userId/certification", deleteUserCertificationHandler(handlerContext), AdminSessionMiddleware(handlerContext, true))
-	e.POST("/api/admin/posting-window", openPostingWindowHandler(handlerContext), AdminSessionMiddleware(handlerContext, true))
+	registerAdminPostingWindow(e, control, db)
 
 	return e
 }

@@ -27,11 +27,12 @@ func TestPgBouncerPlanCacheModeOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer primary.Close()
-	db, err := openRequestDB(config, primary, host+":"+port)
+	db, control, err := openRequestDBs(config, primary, host+":"+port)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	defer control.Close()
 	conns := make([]*sqlx.Conn, 4)
 	for i := range conns {
 		if conns[i], err = db.Connx(ctx); err != nil {
