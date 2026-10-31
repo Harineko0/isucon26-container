@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 )
@@ -54,11 +55,12 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		img, err := jpeg.Decode(bytes.NewReader(data))
-		if err != nil {
+		// Both checks give the same 400, so reject oversized images from the
+		// header before validating the whole entropy-coded stream.
+		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > 512 || cfg.Height > 512 {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
-		if img.Bounds().Dx() > 512 || img.Bounds().Dy() > 512 {
+		if _, _, err := jpegcheck.Validate(bytes.NewReader(data)); err != nil {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 

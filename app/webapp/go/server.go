@@ -8,8 +8,6 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type HandlerContext struct {
@@ -30,18 +28,15 @@ func NewServer(config *Config) *echo.Echo {
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
-	db, err := sqlx.Open("pgx", config.DatabaseDSN())
+	db, err := openDB(config)
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	// DB サーバ (メモリ 4GB) は 3 台 × 接続数ぶんのバックエンドを抱えるので、OOM にならない数に抑える。
-	db.SetMaxOpenConns(40)
-	db.SetMaxIdleConns(40)
-	db.SetConnMaxLifetime(10 * time.Minute)
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
 	}
+	go warmUpDBPool(db)
 
 	go func() {
 		// 接続プールの待ちを観測する (stderr → journal。guard は JSON の行しか読まない)。
