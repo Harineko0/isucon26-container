@@ -41,7 +41,22 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
-		cached, hasData := imageDataStore.get(input.ImageID)
+		// 所有者の署名鍵を覚えていれば、署名の確認は DB に問い合わせる前に済ませる (#95)。
+		// 鍵は不変なので判定は DB で確かめた場合と同じ。無効な署名は asia1 で 1 ベンチ 550 件あり、
+		// 満杯のプール (#68) で接続を待ってから 403 にしていた。
+		hint, hinted := loadImageHint(input.ImageID)
+		if hinted && hint.key != nil && !hmac.Equal(sig, imageSignature(hint.key, input.ImageID, exp)) {
+			c.Set("abuse", "invalid_signature")
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
+		// 本体はヒープ → ディスク (imgcache) の順に探す。ディスクにある画像はヒープに載せず、
+		// 閲覧可否を確かめたあと X-Accel-Redirect で nginx に返させる (#94)。
+		cached, inMemory := imageDataStore.getMemory(input.ImageID)
+		accelPath, onDisk := "", false
+		if !inMemory {
+			accelPath, onDisk = imageDiskAccelPath(input.ImageID)
+		}
+		hasData := inMemory || onDisk
 		// 署名鍵・閲覧可否・(未キャッシュなら)本体を 1 往復で取る。削除状態は毎回確認する。
 		var object struct {
 			SecretKeyHash string    `db:"secret_key_hash"`
@@ -71,14 +86,13 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		hinted := false
-		if createdAt, ok := imageCreatedAt.Load(input.ImageID); ok {
+		if hinted {
 			// 範囲の両端は STABLE な式 (timestamptz ± interval) にして、プラン時ではなく実行開始時に刈り込ませる。
 			// 定数 (= $3) のままだとプラン時に 1 パーティションへ刈り込めるカスタムプランの方が安く見えて
 			// 汎用プランに切り替わらず、毎回プランニング (実測 ~1ms) が走る。この形なら 5 回目以降は汎用プラン
 			// (プランニング ~0.05ms、実行開始時に 35 パーティションを除外) になる。
-			err = conn.GetContext(ctx, &object, imageQuery+` AND i.created_at BETWEEN $3::timestamptz - interval '1 hour' AND $3::timestamptz + interval '0 seconds'`, input.ImageID, hasData, createdAt.(time.Time))
-			hinted = err == nil
+			err = conn.GetContext(ctx, &object, imageQuery+` AND i.created_at BETWEEN $3::timestamptz - interval '1 hour' AND $3::timestamptz + interval '0 seconds'`, input.ImageID, hasData, hint.createdAt)
+			hinted = err == nil && hint.key != nil
 			if errors.Is(err, sql.ErrNoRows) {
 				// 手がかりが外れていた場合に備えて id だけで引き直す。
 				err = conn.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
@@ -87,9 +101,6 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			err = conn.GetContext(ctx, &object, imageQuery, input.ImageID, hasData)
 		}
 		conn.Close()
-		if err == nil && !hinted {
-			imageCreatedAt.Store(input.ImageID, object.CreatedAt)
-		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
@@ -100,6 +111,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		if !hinted {
+			rememberImage(input.ImageID, object.CreatedAt, key)
+		}
 		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
 			c.Set("abuse", "invalid_signature")
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
@@ -107,15 +121,21 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if !object.Allowed {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		if hasData {
-			object.Data = cached
-		} else {
-			imageDataStore.put(input.ImageID, object.Data)
-			saveInitialImageToDisk(input.ImageID, object.CreatedAt, object.Data)
-		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
+		if inMemory {
+			return c.Blob(http.StatusOK, object.MediaType, cached)
+		}
+		if onDisk {
+			// nginx は X-Accel-Redirect を受けると上流の本文と状態を捨て、internal location の実ファイルを
+			// sendfile で返す。Content-Type と Cache-Control (no-store、冒頭で設定済み) は上流の値が引き継がれる。
+			c.Response().Header().Set("Content-Type", object.MediaType)
+			c.Response().Header().Set("X-Accel-Redirect", accelPath)
+			return c.NoContent(http.StatusOK)
+		}
+		imageDataStore.put(input.ImageID, object.Data)
+		saveInitialImageToDisk(input.ImageID, object.CreatedAt, object.Data)
 		return c.Blob(http.StatusOK, object.MediaType, object.Data)
 	}
 }

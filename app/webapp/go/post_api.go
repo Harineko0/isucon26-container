@@ -187,7 +187,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 
 func newPostResponse(post Post, user User) createPostResponse {
 	// 投稿画像の created_at は投稿時刻と同じ(画像取得でパーティションを絞る手がかり)。
-	imageCreatedAt.Store(post.ImageID, post.PostedAt)
+	rememberImage(post.ImageID, post.PostedAt, user.ImageKey)
 	response := createPostResponse{
 		ID: post.ID,
 		Author: postAuthorResponse{

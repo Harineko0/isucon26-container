@@ -58,8 +58,8 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		//      投稿を受け付け、watcher (notification_api.go) が SSE を配り始める。
 		//   2. notifications 表への INSERT (リージョンの active な利用者 1 人 1 行、数千行・数百 ms)。
 		// SSE は notifications 表を読まず、期間と利用者から同じ id を組み立てる (#27) ので、
-		// 2 を待たせる必要がない。1 のトランザクションが短くなる分、直前の期間の行ロック
-		// (create_post の FOR SHARE と競合する) を持つ時間も短くなる。
+		// 2 を待たせる必要がない。1 のトランザクションが短くなる分、リージョンの排他ロック
+		// (create_post の共有 advisory lock と競合する) を持つ時間も短くなる。
 		tx, err := h.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
@@ -72,10 +72,18 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		if conflict {
 			return NewAPIError(http.StatusConflict, "posting_window_conflict")
 		}
-		// 直前の投稿期間の終了時刻は、投稿(create_post の FOR SHARE)が終わるのを待って行ロックを取った後に決める。
+		// 直前の投稿期間の終了時刻は、進行中の投稿 (create_post) が終わるのを待ってから決める。
 		// 待つ前の時刻で閉じると、待っている間に旧期間へ入った投稿の posted_at が ended_at より後になる。
-		// UPDATE ... SET ended_at = clock_timestamp() だけだと値はロック待ちの前に計算されるので、
-		// 先に FOR UPDATE で行ロックを取る CTE (MATERIALIZED: 本体に畳み込まれない) にしている。
+		// 投稿は isureal_create_post の中でリージョンごとの advisory lock を共有モードでとるので、
+		// ここで同じ鍵を排他モードでとれば、進行中の投稿が全部コミットするまで待ち、以後の投稿はこの
+		// トランザクションのコミットまで待つ (#79。以前は posting_windows の行の FOR SHARE / FOR UPDATE で
+		// 同じことをしていたが、同じ 1 行への共有ロックの重なりが MultiXact を作って投稿側が遅かった)。
+		// 排他ロックは別の文でとる (CTE に入れると評価順が保証されない)。asia1 → asia2 は同一リージョンなので往復 1 回分は小さい。
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(isureal_region_lock_key($1))`, region); err != nil {
+			return err
+		}
+		// ended_at の値 (clock_timestamp()) はロック取得後のこの文で計算される。開いている期間の行は FOR UPDATE で
+		// 取ったまま (MATERIALIZED: 本体に畳み込まれない) にして、同じリージョンの切替どうしも行で直列化する。
 		// 開いている期間が無ければその時点の時刻を使う。新しい期間の starts_at と通知の created_at も
 		// この時刻にそろえる。新しい期間の INSERT も同じ文で行い、往復を 1 回にする。
 		windowID := uuid.NewString()

@@ -64,6 +64,21 @@ func WriteImageToDisk(id string, data []byte) error {
 	return err
 }
 
+// imageDiskAccelPath は画像がディスクにあれば、nginx の internal location (/_imgcache/, infra の isureal.conf)
+// から見たパスを返す。本体は Go のヒープに載せず、X-Accel-Redirect で nginx に sendfile させる (#94)。
+// 長さ 0 は書きかけ (強制停止など) とみなして無いことにする。
+func imageDiskAccelPath(id string) (string, bool) {
+	path, ok := imageDiskPath(id)
+	if !ok {
+		return "", false
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return "", false
+	}
+	return "/_imgcache/" + id[:2] + "/" + id, true
+}
+
 func readImageFromDisk(id string) ([]byte, bool) {
 	path, ok := imageDiskPath(id)
 	if !ok {
@@ -137,12 +152,33 @@ func saveInitialImageToDisk(id string, createdAt time.Time, data []byte) {
 	}
 }
 
-// imageCreatedAt は画像 id → created_at (不変)。パーティションを絞るために使う。
-// 値は created_at の上限 (手がかり) で、画像の created_at は [値 - 1 時間, 値] に入る
-// (投稿画像と画像取得で得た値は created_at そのもの、RealMoji は realmojis.created_at:
-// 画像は同じトランザクションでそれより先に INSERT される)。外れていても id だけで引き直すので結果は変わらない。
-// 1 件 150 バイト程度。上限を超えて捨てても id だけの検索に戻るだけ。
-var imageCreatedAt = &boundedMap{limit: 2_000_000}
+// imageHint は画像 id ごとに覚える不変の手がかり。
+//   - createdAt: created_at の上限。パーティションを絞るために使う。画像の created_at は [値 - 1 時間, 値] に入る
+//     (投稿画像と画像取得で得た値は created_at そのもの、RealMoji は realmojis.created_at:
+//     画像は同じトランザクションでそれより先に INSERT される)。外れていても id だけで引き直すので結果は変わらない。
+//   - key: 所有者の署名鍵 (users.secret_key_hash を decode したもの)。image_objects.owner_user_id も
+//     secret_key_hash も UPDATE されない (git grep で確認) ので不変。署名が合わないリクエストを DB に
+//     問い合わせる前に 403 にするために使う (#95)。nil なら不明。
+//
+// 1 件 200 バイト程度。上限を超えて捨てても id だけの検索と DB での署名確認に戻るだけ。
+type imageHint struct {
+	createdAt time.Time
+	key       []byte
+}
+
+var imageHints = &boundedMap{limit: 2_000_000}
+
+func rememberImage(id string, createdAt time.Time, key []byte) {
+	imageHints.Store(id, imageHint{createdAt: createdAt, key: key})
+}
+
+func loadImageHint(id string) (imageHint, bool) {
+	v, ok := imageHints.Load(id)
+	if !ok {
+		return imageHint{}, false
+	}
+	return v.(imageHint), true
+}
 
 // 画像の本体は id ごとに不変なので、リージョンごとにメモリへ置いて DB からの転送を省く。
 // 閲覧可否は毎回 DB で確認するので、ここに残った削除済み画像が返ることはない。
@@ -165,14 +201,20 @@ func newImageDataCache() *imageDataCache {
 	return &imageDataCache{current: map[string][]byte{}, previous: map[string][]byte{}}
 }
 
-func (c *imageDataCache) get(id string) ([]byte, bool) {
+// getMemory はヒープにある画像だけを返す (ディスクは見ない)。
+func (c *imageDataCache) getMemory(id string) ([]byte, bool) {
 	c.mu.RLock()
 	data, ok := c.current[id]
 	if !ok {
 		data, ok = c.previous[id]
 	}
 	c.mu.RUnlock()
-	if ok && data != nil {
+	return data, ok && data != nil
+}
+
+// get はヒープに無ければディスクから読んでヒープに入れる (エクスポートのように本体が要る呼び出し向け)。
+func (c *imageDataCache) get(id string) ([]byte, bool) {
+	if data, ok := c.getMemory(id); ok {
 		return data, true
 	}
 	if data, ok := readImageFromDisk(id); ok {

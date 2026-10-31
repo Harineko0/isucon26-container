@@ -46,11 +46,15 @@ BEGIN
     IF NOT FOUND THEN
       v_fail := 'no_user'; RAISE SQLSTATE 'IR001';
     END IF;
-    -- FOR SHARE: 同じリージョンの投稿どうしは並行させ、投稿期間の終了(UPDATE)とだけ排他にする。
-    SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL FOR SHARE;
-    IF NOT FOUND THEN
-      SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL FOR SHARE;
-    END IF;
+    -- リージョンごとの advisory lock を共有モードでとる (#79)。同じリージョンの投稿どうしは並行させ、
+    -- 投稿期間の切替 (admin_posting_window_api.go が同じ鍵を排他モードでとる) とだけ排他にする。
+    -- 以前は posting_windows の行を FOR SHARE していたが、同じ 1 行に数十の共有ロックが重なるたびに
+    -- MultiXact が作られ (SLRU ヒット 70 万回)、文の平均が 29ms かかっていた。advisory lock は
+    -- 共有メモリのロックテーブルだけで済み、行には何も書かない。
+    -- ロックをとった後の文なので、待っている間にコミットされた切替 (新しい期間) が見える
+    -- (READ COMMITTED では VOLATILE な関数の文ごとに新しいスナップショットをとる)。
+    PERFORM pg_advisory_xact_lock_shared(isureal_region_lock_key(u.region));
+    SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL;
     IF NOT FOUND THEN
       v_fail := 'slot_unavailable'; RAISE SQLSTATE 'IR001';
     END IF;
@@ -62,7 +66,7 @@ BEGIN
       v_fail := 'slot_unavailable'; RAISE SQLSTATE 'IR001';
     END IF;
     -- 画像を入れてからロックを取るまでの間に投稿期間が切り替わった (旧期間の ended_at = 新期間の starts_at は
-    -- 切替側が FOR UPDATE を取った後に刻むので、v_posted_at がそれより前になる) 場合は、
+    -- 切替側が排他の advisory lock を取った後に刻むので、v_posted_at がそれより前になる) 場合は、
     -- 今ロックを取っている新期間の中の時刻として投稿時刻を取り直す。切替は(新期間の)ロック取得より前に
     -- コミット済みなので、ここで取る clock_timestamp() は必ず starts_at 以降になる。
     -- 以前はここで 409 (slot_unavailable) にしていたが、切替待ちの間に届いた投稿を落とすだけだった。
@@ -136,6 +140,11 @@ END $$;
 -- 関係の表(friend_requests / friendships / follows / block_relations)を書くのは、2 人組のロックを持つ
 -- isureal_relationship と isureal_transition_friend_request だけ。
 -- ロックの順序: 利用者ごと(id 順) → 2 人組 → 行。コメント・RealMoji は行 → 2 人組だが、利用者ごとのロックはとらない。
+-- 投稿期間の切替と投稿の直列化に使う、リージョンごとの advisory lock の鍵 (#79)。
+-- 投稿 (isureal_create_post) が共有モード、切替 (admin_posting_window_api.go) が排他モードでとる。
+CREATE OR REPLACE FUNCTION isureal_region_lock_key(p_region text) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:region:' || p_region, 0) $$;
+
 CREATE OR REPLACE FUNCTION isureal_user_lock_key(p_user text) RETURNS bigint
 LANGUAGE sql IMMUTABLE AS $$ SELECT hashtextextended('isureal:user:' || p_user, 0) $$;
 

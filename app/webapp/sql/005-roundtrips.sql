@@ -65,8 +65,10 @@ BEGIN
   RETURN 'ok';
 END $$;
 
--- updateMeHandler の UPDATE ... RETURNING と同じ (NULL の引数は変更しない)。status が active でなくても
--- 行は返す (従来どおり呼び出し側が 404 にする)。
+-- updateMeHandler の UPDATE ... RETURNING と同じ (NULL の引数は変更しない)。
+-- status = 'active' の行だけ書き換える (#83): 元のコードはトランザクションの中で UPDATE し、active でなければ
+-- ロールバックして 404 にしていた。自動コミットの 1 文になってからは、セッション確認と UPDATE の間に退会が
+-- 割り込むと削除済みの行を書き換えてから 404 を返していた。行が無ければ not_found を返し、呼び出し側が 404 にする。
 CREATE OR REPLACE FUNCTION isureal_update_me(p_user text, p_display_name text, p_bio text, p_region text)
 RETURNS TABLE (
   o_result text, o_id text, o_username text, o_secret_key_hash text, o_display_name text, o_bio text,
@@ -76,7 +78,7 @@ BEGIN
   RETURN QUERY
     UPDATE users SET display_name = COALESCE(p_display_name, display_name), bio = COALESCE(p_bio, bio),
                      region = COALESCE(p_region, region), updated_at = clock_timestamp()
-    WHERE id = p_user
+    WHERE id = p_user AND status = 'active'
     RETURNING 'ok'::text, id::text, username::text, secret_key_hash, display_name, bio,
               profile_image_id::text, region, account_type, status;
   IF NOT FOUND THEN o_result := 'not_found'; RETURN NEXT; END IF;
