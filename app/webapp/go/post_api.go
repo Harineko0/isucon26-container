@@ -205,8 +205,7 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		}
 		// The same committed SQL statement created the JPEG object and its post.
 		proofs.Store(imageID, postImageProof{postID: postID, ownerID: user.ID})
-		imageDataStore.put(imageID, imageData)
-		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
+		publishUploadedImage(imageID, imageData, storedRegion, h.Config.Region)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
 }
