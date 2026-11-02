@@ -51,6 +51,38 @@ FROM (VALUES ('profile','owner'), ('posted','owner'), ('real','owner'), ('replac
 	runBatch := func(rel string, requests []imageReadRequest) []imageReadResult {
 		return loadImageReadBatch(t.Context(), h, rel, func() []imageReadRequest { return requests })
 	}
+	t.Run("mixed months use the corresponding live rows", func(t *testing.T) {
+		db.MustExec(`CREATE TEMP TABLE image_objects_202602 PARTITION OF image_objects FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+INSERT INTO posts VALUES ('later-post', 'later', 'owner', NULL);
+INSERT INTO image_objects VALUES ('later','owner','image/png','2026-02-02','jpeg bytes',NULL)`)
+		reads := []imageReadRequest{
+			{rel: "image_objects_202602", id: "later", hasData: true},
+			{rel: "image_objects_202601", id: "deleted-image", hasData: true},
+			{rel: "image_objects_202601", id: "posted", hasData: true},
+			{rel: "image_objects_202602", id: "posted", hasData: true},
+			{rel: "image_objects_202602", id: "later", hasData: true},
+		}
+		check := func(allowed bool) {
+			t.Helper()
+			got := runBatch(diskImageBatchKey, reads)
+			for _, i := range []int{0, 4} {
+				if got[i].err != nil || got[i].object.Allowed != allowed || got[i].object.MediaType != "image/png" || len(got[i].object.Data) != 0 {
+					t.Fatalf("index %d: %+v", i, got[i])
+				}
+			}
+			if got[1].err != nil || got[1].object.Allowed || got[2].err != nil || !got[2].object.Allowed || !errors.Is(got[3].err, sql.ErrNoRows) {
+				t.Fatalf("mixed results: %+v", got)
+			}
+		}
+		check(true)
+		db.MustExec(`UPDATE posts SET deleted_at=now() WHERE id='later-post'`)
+		check(false)
+		reads[3].rel = "image_objects_190001"
+		got := runBatch(diskImageBatchKey, reads)
+		if got[3].err == nil || got[2].err != nil || !got[2].object.Allowed {
+			t.Fatalf("leaf error affected peer: %+v", got)
+		}
+	})
 	requests := []imageReadRequest{}
 	for _, id := range []string{"profile", "posted", "real", "replaced", "dead-real", "deleted-image", "deleted-owner", "missing"} {
 		for _, hasData := range []bool{false, true} {

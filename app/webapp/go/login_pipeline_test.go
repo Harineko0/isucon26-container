@@ -216,3 +216,37 @@ func TestGroupedLoginsCommitOnce(t *testing.T) {
 		t.Fatalf("txns=%d, active=%d, err=%v", txns, active, err)
 	}
 }
+
+func TestGroupedLoginsDeferredConstraint(t *testing.T) {
+	db := loginTestDB(t)
+	db.MustExec(`CREATE TABLE allowed_tokens(token text PRIMARY KEY);
+		INSERT INTO allowed_tokens VALUES ('accepted');
+		ALTER TABLE login_sessions ADD FOREIGN KEY(token_hash) REFERENCES allowed_tokens(token)
+			DEFERRABLE INITIALLY DEFERRED`)
+	q := writeQueue[sessionUserRow]{sql: loginSQL, accountBatchSQL: loginBatchSQL}
+	conn, err := db.Connx(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	key := strings.Repeat("0", 63) + "1"
+	var calls []*writeCall[sessionUserRow]
+	for _, token := range []string{"accepted", "rejected"} {
+		calls = append(calls, &writeCall[sessionUserRow]{ctx: t.Context(), args: []any{"user1", key, token, token}, reply: make(chan writeResult[sessionUserRow], 1)})
+	}
+	if q.batchAccounts(t.Context(), conn, calls) {
+		t.Fatal("returned results from a failed commit")
+	}
+	var committed int
+	if err := conn.GetContext(t.Context(), &committed, "SELECT count(*) FROM login_sessions WHERE id IN ('accepted','rejected')"); err != nil || committed != 0 {
+		t.Fatalf("committed before replay: %d, err=%v", committed, err)
+	}
+	q.pipeline(t.Context(), conn, calls)
+	if r := <-calls[0].reply; r.err != nil || r.row.Result != "ok" {
+		t.Fatalf("valid login: %+v", r)
+	}
+	var constraint *pgconn.PgError
+	if r := <-calls[1].reply; !errors.As(r.err, &constraint) || constraint.Code != "23503" {
+		t.Fatalf("invalid login: %+v", r)
+	}
+}
