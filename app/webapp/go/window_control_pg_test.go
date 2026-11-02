@@ -45,7 +45,7 @@ func TestOpenWindowWhileRequestPoolIsFull(t *testing.T) {
 		VALUES ('session','adm',encode(sha256('control-token'::bytea),'hex'))`)
 	e := echo.New()
 	e.HTTPErrorHandler = APIErrorHandler
-	registerAdminPostingWindow(e, control, shared)
+	registerAdminPostingWindow(e, control)
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
 	open := func() *httptest.ResponseRecorder {
@@ -75,26 +75,23 @@ func TestOpenWindowWhileRequestPoolIsFull(t *testing.T) {
 		t.Fatalf("revoked session: %d %s", rec.Code, rec.Body.String())
 	}
 
-	for shared.Stats().WaitCount == 0 {
-		if ctx.Err() != nil {
-			t.Fatal("notification writer did not queue on the shared pool")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	// Even with the shared pool held, the first independent read after 201 sees
+	// the durable notification. Changing the audience afterwards cannot move it.
 	var count int
-	if err := held.GetContext(ctx, &count, "SELECT count(*) FROM notifications WHERE posting_window_id=$1", opened.ID); err != nil || count != 0 {
-		t.Fatalf("notifications before releasing shared connection: %d %v", count, err)
-	}
-	if err := held.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for count == 0 {
-		err := control.GetContext(ctx, &count, "SELECT count(*) FROM notifications WHERE posting_window_id=$1 AND user_id='u1'", opened.ID)
-		if err != nil {
-			t.Fatal(err)
+	checkCount := func(query string, want int) {
+		t.Helper()
+		if err := held.GetContext(ctx, &count, query, opened.ID); err != nil || count != want {
+			t.Fatalf("count = %d, want %d (%v)", count, want, err)
 		}
-		if count == 0 {
-			time.Sleep(time.Millisecond)
-		}
+	}
+	checkCount("SELECT count(*) FROM notifications WHERE posting_window_id=$1", 0)
+	checkCount("SELECT count(*) FROM isureal_notifications WHERE posting_window_id=$1 AND user_id='u1'", 1)
+	control.MustExec(`UPDATE users SET region='europe' WHERE id='u1';
+	    INSERT INTO users(id,username,secret_key_hash,display_name,region) VALUES ('late','late',repeat('ab',32),'late','asia')`)
+	checkCount("SELECT count(*) FROM isureal_notifications WHERE posting_window_id=$1 AND user_id='u1'", 1)
+	checkCount("SELECT count(*) FROM isureal_notifications WHERE posting_window_id=$1 AND user_id='late'", 0)
+	events, err := (windowDB{control}).notifications(ctx, "asia", opened.ID, []string{"late", "u1", "u2"})
+	if err != nil || len(events) != 2 || events[0].UserID != "u1" || !events[0].kick || events[1].UserID != "u2" || events[1].kick {
+		t.Fatalf("window audience after move and registration: %+v (%v)", events, err)
 	}
 }

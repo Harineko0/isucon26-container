@@ -52,7 +52,8 @@ BEGIN
     -- ロックをとった後の文なので、待っている間にコミットされた切替 (新しい期間) が見える
     -- (READ COMMITTED では VOLATILE な関数の文ごとに新しいスナップショットをとる)。
     PERFORM pg_advisory_xact_lock_shared(isureal_region_lock_key(u.region));
-    SELECT * INTO w FROM posting_windows WHERE region = u.region AND ended_at IS NULL;
+    SELECT id, local_date, starts_at, on_time_deadline INTO w.id, w.local_date, w.starts_at, w.on_time_deadline
+    FROM posting_windows WHERE region = u.region AND ended_at IS NULL;
     IF NOT FOUND THEN
       v_fail := 'slot_unavailable'; RAISE SQLSTATE 'IR001';
     END IF;
@@ -601,3 +602,13 @@ BEGIN
   RETURN substr(ts, 1, 8) || '-' || substr(ts, 9, 4) || '-4' || substr(h, 1, 3) || '-'
          || substr('89ab', (get_byte(decode(h, 'hex'), 2) & 3) + 1, 1) || substr(h, 5, 3) || '-' || substr(h, 8, 12);
 END $$;
+
+-- NULL identifies windows written by earlier versions. New windows persist the
+-- audience with their start time, including an empty array for an empty region.
+ALTER TABLE posting_windows ADD COLUMN IF NOT EXISTS notification_recipients text[];
+CREATE OR REPLACE VIEW isureal_notifications AS
+    SELECT id, user_id, posting_window_id, created_at FROM notifications
+    UNION ALL
+    SELECT isureal_notification_id(w.id, recipient.id, w.starts_at)::varchar(36),
+           recipient.id::varchar(36), w.id, w.starts_at
+    FROM posting_windows w CROSS JOIN LATERAL unnest(w.notification_recipients) AS recipient(id);

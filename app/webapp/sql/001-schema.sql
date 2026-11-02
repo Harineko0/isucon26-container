@@ -1,3 +1,4 @@
+DROP VIEW IF EXISTS isureal_notifications;
 DROP TABLE IF EXISTS
   ip_bans,
   notifications,

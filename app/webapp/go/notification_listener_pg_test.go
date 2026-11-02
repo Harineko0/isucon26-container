@@ -92,7 +92,7 @@ func TestRoundTripHandlersOnPostgresWindowNotifications(t *testing.T) {
 
 	h := &HandlerContext{DB: db, Config: &Config{Region: "europe"}, Windows: w}
 	e := echo.New()
-	e.POST("/api/admin/posting-window", openPostingWindowHandler(h.DB, h.DB))
+	e.POST("/api/admin/posting-window", openPostingWindowHandler(h.DB))
 	e.GET("/api/notifications", getNotificationsHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	server := httptest.NewServer(e)
 	defer server.Close()
@@ -212,7 +212,7 @@ func TestRoundTripHandlersOnPostgresWindowAudience(t *testing.T) {
 	defer tx.Rollback()
 	tx.MustExec(`
 		CREATE TEMP TABLE users (id text PRIMARY KEY, status text NOT NULL, region text NOT NULL);
-		CREATE TEMP TABLE posting_windows (id text PRIMARY KEY, region text, starts_at timestamptz, ended_at timestamptz);
+		CREATE TEMP TABLE posting_windows (id text PRIMARY KEY, region text, starts_at timestamptz, ended_at timestamptz, notification_recipients text[]);
 		INSERT INTO posting_windows VALUES ('期間', 'europe', now(), NULL);
 		INSERT INTO users SELECT 'u:' || i, 'active', 'europe' FROM generate_series(1,32) AS i;
 		INSERT INTO users VALUES ('退会', 'deleted', 'europe'), ('moved', 'active', 'asia');

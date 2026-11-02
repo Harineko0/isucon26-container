@@ -42,13 +42,18 @@ func (db windowDB) notifications(ctx context.Context, region, windowID string, u
 	var prefix string
 	var exceptions []byte
 	err := db.QueryRowxContext(ctx, `
+    WITH win AS MATERIALIZED (
+        SELECT id, region, starts_at, notification_recipients FROM posting_windows
+        WHERE id = $1 AND region = $3 AND ended_at IS NULL
+    )
     SELECT w.starts_at, left(isureal_notification_id(w.id, '', w.starts_at), 13),
-           (SELECT json_object_agg(ids.id, u.id IS NOT NULL)
+           (SELECT json_object_agg(ids.id, u.id IS NOT NULL AND (u.status <> 'active' OR u.region <> w.region))
             FROM unnest($2::text[]) ids(id)
             LEFT JOIN users u ON u.id = ids.id
-            WHERE u.id IS NULL OR u.status <> 'active' OR u.region <> w.region)
-    FROM posting_windows w
-    WHERE w.id = $1 AND w.region = $3 AND w.ended_at IS NULL
+            WHERE u.id IS NULL OR u.status <> 'active' OR u.region <> w.region
+               OR (w.notification_recipients IS NOT NULL AND ids.id NOT IN (
+                   SELECT unnest(notification_recipients) FROM win)))
+    FROM win w
    `, windowID, userIDs, region).Scan(&startsAt, &prefix, &exceptions)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -56,8 +61,8 @@ func (db windowDB) notifications(ctx context.Context, region, windowID string, u
 	if err != nil {
 		return nil, err
 	}
-	// An existing but inactive/moved user is disconnected. A missing user
-	// produced no row in the original join and is handled by checkUsers.
+	// Disconnect inactive or moved users. Skip missing users and users who
+	// arrived in the region after this window opened.
 	var excluded map[string]bool
 	if len(exceptions) != 0 {
 		if err := json.Unmarshal(exceptions, &excluded); err != nil {
