@@ -1,0 +1,14 @@
+# isureal-bench / isureal-datagen / isureal-router。ビルドコンテキストはリポジトリのルート。
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY bench/go.mod bench/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY bench/ ./
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /out/ ./cmd/...
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /usr/local/bin/
+COPY app/webapp/sql /schema
+WORKDIR /work
