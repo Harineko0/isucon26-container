@@ -31,6 +31,11 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 - 索引を足すときは、initialize の中で作らない。作るのに 1 秒を超える表（notifications・realmojis・posts・comments など）は、人が asia2 で先に `CREATE INDEX CONCURRENTLY` してから 002 に `IF NOT EXISTS` で書く（実測と理由は [ci/README.md](ci/README.md)「索引の追加と initialize の時間」）。
 - スコア = Σ(採点件数 × 配点 × リージョン倍率)。倍率は asia 1 / **europe 1.5 / america 1.5**。配点表は manual.md「スコアの計算」。
 
+## 手元のベンチ（[bench/README.md](bench/README.md)）
+
+- `bench/` に公式ベンチマーカーを再現した `isureal-bench`、初期データ生成 `isureal-datagen`、ルーター再現 `isureal-router` と、docker compose でアプリ 3 台 + DB + ルーターを立てる `bench/local/` がある。`bench/local/run.sh` で 1 本、`bench/local/parallel.sh REF...` で複数の版を同時に測れる。
+- 手元のスコアは本番と比べられない（同じマシンで同時に測った版同士の差を見る）。本番の計測は従来どおり CI の `/bench`。
+
 ## 環境（CloudFormation スタック `isucon-prod-2`、ap-northeast-1）
 
 | 名前 | CFn Output | Public IP | Private IP | 種別 | 役割 |

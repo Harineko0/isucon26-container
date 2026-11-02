@@ -1,0 +1,191 @@
+# ISUReal を手元で本番と同じ形 (nginx+app ×3 リージョン、共有 PostgreSQL、ルーター) で動かす。
+# 複数スタックを並べるため、プロジェクト名・ポート・サブネットは環境変数で変える (run.sh が設定する)。
+#   NET_PREFIX      例 192.168 (asia1=…1.10, europe1=…2.10, america1=…3.10, DB=…4.10。本番と同じ) / 10.201
+#   SUBNET          例 192.168.0.0/20 / 10.201.0.0/20
+#   ROUTER_PORT     ホストに出すルーターのポート
+#   DB_PORT         ホストに出す PostgreSQL のポート (datagen 用)
+#   NETEM_DELAY     europe/america の egress 遅延 (既定 100ms = 本番の往復相当。0 で無効)
+#   ROUTER_LATENCY  ルーターで足す片道遅延 (既定なし)
+#   WORK_DIR        manifest.json / result.json を置く場所
+#   APP_CONTEXT     アプリのビルドコンテキスト (別の commit を測るとき run.sh が git archive した木)
+#   NGINX_CONF / PUBLIC_DIR  nginx の設定と静的ファイル (同上)
+name: ${COMPOSE_PROJECT_NAME:-isureal}
+
+x-app-env: &app-env
+  ISUREAL_DB_HOST: ${NET_PREFIX:-192.168}.4.10
+  ISUREAL_DB_PORT: "5432"
+  ISUREAL_DB_USER: isureal
+  ISUREAL_DB_PASSWORD: isureal
+  ISUREAL_DB_NAME: isureal
+  ISUREAL_LOG_LEVEL: ${ISUREAL_LOG_LEVEL:-info}
+  ISUREAL_LISTEN_HOST: 127.0.0.1
+  ISUREAL_PEER_HOSTS: asia=${NET_PREFIX:-192.168}.1.10,europe=${NET_PREFIX:-192.168}.2.10,america=${NET_PREFIX:-192.168}.3.10
+  GOMEMLIMIT: ${GOMEMLIMIT:-2GiB}
+  # 画像の置き場。initialize が imgstore を rename して作り直すので、マウントポイントの 1 つ下に置く
+  ISUREAL_IMAGE_STORE_DIR: /home/isucon/img/imgstore
+  ISUREAL_IMAGE_CACHE_DIR: /home/isucon/img/imgcache
+
+x-app: &app
+  image: ${APP_IMAGE:-isureal-app:local}
+  build:
+    context: ${APP_CONTEXT:-../..}
+    dockerfile: ${APP_DOCKERFILE:-bench/local/Dockerfile.app}
+    additional_contexts:
+      entrypoint: .
+  cap_add: [NET_ADMIN]
+  depends_on:
+    db:
+      condition: service_healthy
+  ulimits:
+    nofile: 65536
+
+x-nginx-volumes: &nginx-volumes
+  - ${NGINX_CONF:-../../infra/app/etc/nginx/sites-available/isureal.conf}:/site.conf:ro
+  - ./nginx-entrypoint.sh:/nginx-entrypoint.sh:ro
+  - ${PUBLIC_DIR:-../../app/webapp/public}:/home/isucon/webapp/public:ro
+
+x-nginx: &nginx
+  image: nginx:1.26-alpine
+  environment:
+    NET_PREFIX: ${NET_PREFIX:-192.168}
+  entrypoint: ["/bin/sh", "/nginx-entrypoint.sh"]
+
+services:
+  db:
+    image: postgres:16
+    command: >
+      postgres -c max_connections=400 -c shared_buffers=${PG_SHARED_BUFFERS:-768MB} -c work_mem=4MB
+      -c maintenance_work_mem=128MB -c jit=off -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all -c log_min_duration_statement=${PG_LOG_MIN_DURATION:--1}
+    environment:
+      POSTGRES_USER: isureal
+      POSTGRES_PASSWORD: isureal
+      POSTGRES_DB: isureal
+    ports:
+      - "127.0.0.1:${DB_PORT:-15432}:5432"
+    networks:
+      isureal:
+        ipv4_address: ${NET_PREFIX:-192.168}.4.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U isureal -d isureal"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 512m
+
+  asia:
+    <<: *app
+    environment:
+      <<: *app-env
+      ISUREAL_REGION: asia
+    volumes:
+      - img-asia:/home/isucon/img
+    networks:
+      isureal:
+        ipv4_address: ${NET_PREFIX:-192.168}.1.10
+  asia-nginx:
+    <<: *nginx
+    network_mode: "service:asia"
+    volumes:
+      - ${NGINX_CONF:-../../infra/app/etc/nginx/sites-available/isureal.conf}:/site.conf:ro
+      - ./nginx-entrypoint.sh:/nginx-entrypoint.sh:ro
+      - ${PUBLIC_DIR:-../../app/webapp/public}:/home/isucon/webapp/public:ro
+      - img-asia:/home/isucon/img
+    depends_on: [asia]
+
+  europe:
+    <<: *app
+    environment:
+      <<: *app-env
+      ISUREAL_REGION: europe
+      ISUREAL_NETEM_DELAY: ${NETEM_DELAY:-100ms}
+      ISUREAL_NETEM_RATE: ${NETEM_RATE:-}
+    volumes:
+      - img-europe:/home/isucon/img
+    networks:
+      isureal:
+        ipv4_address: ${NET_PREFIX:-192.168}.2.10
+  europe-nginx:
+    <<: *nginx
+    network_mode: "service:europe"
+    volumes:
+      - ${NGINX_CONF:-../../infra/app/etc/nginx/sites-available/isureal.conf}:/site.conf:ro
+      - ./nginx-entrypoint.sh:/nginx-entrypoint.sh:ro
+      - ${PUBLIC_DIR:-../../app/webapp/public}:/home/isucon/webapp/public:ro
+      - img-europe:/home/isucon/img
+    depends_on: [europe]
+
+  america:
+    <<: *app
+    environment:
+      <<: *app-env
+      ISUREAL_REGION: america
+      ISUREAL_NETEM_DELAY: ${NETEM_DELAY:-100ms}
+      ISUREAL_NETEM_RATE: ${NETEM_RATE:-}
+    volumes:
+      - img-america:/home/isucon/img
+    networks:
+      isureal:
+        ipv4_address: ${NET_PREFIX:-192.168}.3.10
+  america-nginx:
+    <<: *nginx
+    network_mode: "service:america"
+    volumes:
+      - ${NGINX_CONF:-../../infra/app/etc/nginx/sites-available/isureal.conf}:/site.conf:ro
+      - ./nginx-entrypoint.sh:/nginx-entrypoint.sh:ro
+      - ${PUBLIC_DIR:-../../app/webapp/public}:/home/isucon/webapp/public:ro
+      - img-america:/home/isucon/img
+    depends_on: [america]
+
+  router:
+    image: ${TOOLS_IMAGE:-isureal-bench-tools:local}
+    build:
+      context: ../..
+      dockerfile: bench/local/Dockerfile.tools
+    command: >
+      isureal-router -listen :8080
+      -asia http://${NET_PREFIX:-192.168}.1.10 -europe http://${NET_PREFIX:-192.168}.2.10 -america http://${NET_PREFIX:-192.168}.3.10
+      -latency "${ROUTER_LATENCY:-europe=0ms,america=0ms}"
+    ports:
+      - "127.0.0.1:${ROUTER_PORT:-18080}:8080"
+    networks:
+      isureal:
+        ipv4_address: ${NET_PREFIX:-192.168}.10.10
+    depends_on: [asia, europe, america]
+
+  # 道具。`docker compose run --rm datagen` / `docker compose run --rm bench` で使う (run.sh が呼ぶ)
+  datagen:
+    image: ${TOOLS_IMAGE:-isureal-bench-tools:local}
+    profiles: [tools]
+    command: >
+      isureal-datagen -dsn postgres://isureal:isureal@${NET_PREFIX:-192.168}.4.10:5432/isureal?sslmode=disable
+      -schema /schema -manifest /work/manifest.json ${DATAGEN_FLAGS:-}
+    volumes:
+      - ${WORK_DIR:-./work}:/work
+    networks: [isureal]
+    depends_on:
+      db:
+        condition: service_healthy
+  bench:
+    image: ${TOOLS_IMAGE:-isureal-bench-tools:local}
+    profiles: [tools]
+    command: isureal-bench -target http://${NET_PREFIX:-192.168}.10.10:8080 -manifest /work/manifest.json -out /work/result.json ${BENCH_FLAGS:-}
+    volumes:
+      - ${WORK_DIR:-./work}:/work
+    networks: [isureal]
+    depends_on: [router]
+
+networks:
+  isureal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${SUBNET:-192.168.0.0/20}
+
+volumes:
+  pgdata:
+  img-asia:
+  img-europe:
+  img-america:
