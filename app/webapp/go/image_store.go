@@ -151,28 +151,15 @@ func (body peerImageBody) Read(p []byte) (int, error) {
 
 func writeImageFileDurableFrom(path string, src io.Reader) error {
 	dir := filepath.Dir(path)
-	tmp, err := stageImageFile(dir, src, true)
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return syncDir(dir)
-}
-
-// With syncFile=false the caller must make the staging file durable before renaming it.
-func stageImageFile(dir string, src io.Reader, syncFile bool) (string, error) {
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if errors.Is(err, os.ErrNotExist) {
 		if err := ensureImageStoreDirs(); err != nil {
-			return "", err
+			return err
 		}
 		tmp, err = os.CreateTemp(dir, ".tmp-*")
 	}
 	if err != nil {
-		return "", err
+		return err
 	}
 	tmpName := tmp.Name()
 	if err = tmp.Chmod(0o644); err == nil {
@@ -182,17 +169,20 @@ func stageImageFile(dir string, src io.Reader, syncFile bool) (string, error) {
 			err = errInvalidImageBody
 		}
 	}
-	if err == nil && syncFile {
+	if err == nil {
 		err = tmp.Sync()
 	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
+	if err == nil {
+		err = os.Rename(tmpName, path)
+	}
 	if err != nil {
 		os.Remove(tmpName)
-		return "", err
+		return err
 	}
-	return tmpName, nil
+	return syncDir(dir)
 }
 
 func readImageFromStore(id string) ([]byte, bool) {
@@ -214,11 +204,7 @@ func storeUploadedImage(id string, data []byte, region string) ([]byte, *string)
 	if !ok {
 		return data, nil
 	}
-	// Finish writes admitted to this store before initialize renames it.
-	uploadStoreMu.RLock()
-	err := writeUploadedImage(path, data)
-	uploadStoreMu.RUnlock()
-	if err != nil {
+	if err := writeImageFileDurable(path, data); err != nil {
 		fmt.Fprintf(os.Stderr, "imgstore: write %s failed, storing in DB: %v\n", id, err)
 		return data, nil
 	}
@@ -235,13 +221,9 @@ func discardUploadedImage(id string, storedRegion *string) {
 	}
 }
 
-var uploadStoreMu sync.RWMutex
-
 // resetImageStore は initialize で、ベンチが投稿した画像のファイルを捨てる (初期データの imageDiskDir は残す)。
 // ディレクトリごと退避してから作り直すので、すぐに返る。消すのは裏で行う。
 func resetImageStore() error {
-	uploadStoreMu.Lock()
-	defer uploadStoreMu.Unlock()
 	resetCommittedPostImages()
 	imageDataStore.reset()
 	trash := fmt.Sprintf("%s.trash-%d", imageStoreDir, time.Now().UnixNano())
