@@ -1,11 +1,11 @@
 package isureal
 
 import (
-	"database/sql"
-	"errors"
+	"context"
 	"net/http"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
 
@@ -24,18 +24,8 @@ type getCurrentPostingWindowResponse struct {
 	DeletionCount int                           `json:"deletionCount"`
 }
 
-// 有効な投稿期間と、同じ日付の期間への自分の投稿数 (削除済みを含む)。u は利用者の行。
-const currentPostingWindowFrom = `
-   LEFT JOIN posting_windows w ON w.region = u.region AND w.ended_at IS NULL
-   LEFT JOIN posting_windows posted_window ON posted_window.local_date = w.local_date
-   LEFT JOIN posts p ON p.author_id = u.id AND p.posting_window_id = posted_window.id`
-
-const currentPostingWindowColumns = `
-   w.id, w.region, w.local_date, w.starts_at, w.on_time_deadline,
-   count(p.id) FILTER (WHERE p.deleted_at IS NULL) AS active,
-   count(p.id) FILTER (WHERE p.deleted_at IS NOT NULL) AS deleted`
-
 type currentPostingWindowState struct {
+	TokenHash      string     `db:"token_hash"`
 	SessRegion     string     `db:"sess_region"`
 	ID             *string    `db:"id"`
 	Region         *string    `db:"region"`
@@ -46,35 +36,53 @@ type currentPostingWindowState struct {
 	Deleted        int        `db:"deleted"`
 }
 
+// 同じリクエスト群で開いている期間と日付を一度だけ読み、各利用者の投稿を
+// posts(author_id, posting_window_id) で引く。同日なら他リージョンに投稿した分も数える。
+func loadCurrentWindows(ctx context.Context, db sqlx.QueryerContext, region string, tokens []string) (map[string]currentPostingWindowState, error) {
+	var rows []currentPostingWindowState
+	err := sqlx.SelectContext(ctx, db, &rows, `
+   WITH current_window AS MATERIALIZED (
+     SELECT id, region, local_date, starts_at, on_time_deadline FROM posting_windows
+     WHERE region = $2 AND ended_at IS NULL
+   ), day_windows AS MATERIALIZED (
+     SELECT w.id FROM posting_windows w JOIN current_window c ON c.local_date = w.local_date
+   )
+   SELECT s.token_hash, u.region AS sess_region, w.id, w.region, w.local_date, w.starts_at, w.on_time_deadline,
+          n.active, n.deleted
+   FROM login_sessions s JOIN users u ON u.id = s.user_id AND u.status = 'active'
+   LEFT JOIN current_window w ON w.region = u.region
+   CROSS JOIN LATERAL (
+     SELECT count(*) FILTER (WHERE p.deleted_at IS NULL) AS active,
+            count(*) FILTER (WHERE p.deleted_at IS NOT NULL) AS deleted
+     FROM day_windows d CROSS JOIN LATERAL (
+       SELECT p.deleted_at FROM posts p
+       WHERE p.author_id = u.id AND p.posting_window_id = d.id OFFSET 0
+     ) p WHERE u.region = $2
+   ) n
+   WHERE s.active AND s.token_hash = ANY($1::text[])
+ `, tokens, region)
+	if err != nil {
+		return nil, err
+	}
+	states := make(map[string]currentPostingWindowState, len(rows))
+	for _, row := range rows {
+		states[row.TokenHash] = row
+	}
+	return states, nil
+}
+
 func getCurrentPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
+	reader := &windowReads{load: func(ctx context.Context, tokens []string) (map[string]currentPostingWindowState, error) {
+		return loadCurrentWindows(ctx, h.DB, h.Config.Region, tokens)
+	}}
 	return func(c *echo.Context) error {
-		ctx := c.Request().Context()
-		var state currentPostingWindowState
-		if tokenHash, deferred := deferredSession(c); deferred {
-			// セッションの確認 (401 → 403) と期間の取得を 1 文で行う。
-			err := h.DB.GetContext(ctx, &state, `
-   SELECT u.region AS sess_region,`+currentPostingWindowColumns+`
-   FROM login_sessions s JOIN users u ON u.id = s.user_id`+currentPostingWindowFrom+`
-   WHERE s.token_hash = $1 AND s.active = true AND u.status = 'active'
-   GROUP BY u.id, w.id
-  `, tokenHash)
-			found := err == nil
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			if err := rejectDeferredSession(c, h, tokenHash, found, state.SessRegion); err != nil {
-				return err
-			}
-		} else {
-			err := h.DB.GetContext(ctx, &state, `
-   SELECT u.region AS sess_region,`+currentPostingWindowColumns+`
-   FROM users u`+currentPostingWindowFrom+`
-   WHERE u.id = $1
-   GROUP BY u.id, w.id
-  `, GetSession(c).UserID)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
+		token := GetSession(c).TokenHash
+		state, found, err := reader.get(c.Request().Context(), token)
+		if err != nil {
+			return err
+		}
+		if err := rejectDeferredSession(c, h, token, found, state.SessRegion); err != nil {
+			return err
 		}
 		if state.ID == nil {
 			return c.JSON(http.StatusOK, getCurrentPostingWindowResponse{})
