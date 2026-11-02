@@ -60,7 +60,7 @@ const dbPlanCacheMode = "force_generic_plan"
 
 // dbConnConfig は接続の設定。PostgreSQL に直接つなぐときは plan_cache_mode を起動パケットで送る (往復は増えない)。
 // PgBouncer は知らない起動パラメータを送るクライアントを拒むので、PgBouncer 宛てには送らず、
-// PgBouncer がサーバー接続を張るときの connect_query で設定する (infra/hosts/asia2/etc/isureal/pgbouncer.ini)。
+// PgBouncer がサーバー接続を張るときの connect_query で設定する (infra/hosts/asia1/etc/isureal/pgbouncer.ini)。
 func dbConnConfig(config *Config, direct bool) (*pgx.ConnConfig, error) {
 	connConfig, err := pgx.ParseConfig(config.DatabaseDSN())
 	if err != nil {
@@ -99,54 +99,36 @@ func openPostgresDB(config *Config, direct bool) (*sqlx.DB, error) {
 // When a transaction pool is configured, bulk requests share its backends.
 // Split the existing four direct connections between window transitions and
 // the watcher (one LISTEN connection and one subscriber check).
-func openRequestDBs(config *Config, primary *sqlx.DB, address, readName string) (write, read, control *sqlx.DB, err error) {
+func openRequestDBs(config *Config, primary *sqlx.DB, address string) (request, control *sqlx.DB, err error) {
 	if address == "" {
-		return primary, primary, primary, nil
+		return primary, primary, nil
 	}
 	pooled := *config
 	pooled.DBHost, pooled.DBPort, err = net.SplitHostPort(address)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("invalid application DB pool address: %w", err)
+		return nil, nil, fmt.Errorf("invalid application DB pool address: %w", err)
 	}
-	write, err = openPostgresDB(&pooled, false)
+	db, err := openPostgresDB(&pooled, false)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
+	}
+	if config.Region != "asia" {
+		// These are client sockets to PgBouncer. Most of their time is
+		// spent in flight across the WAN, outside a database transaction.
+		db.SetMaxOpenConns(128)
+		db.SetMaxIdleConns(128)
 	}
 	control, err = openDB(config)
 	if err != nil {
-		write.Close()
-		return nil, nil, nil, err
+		db.Close()
+		return nil, nil, err
 	}
-	clients := 64
-	if config.Region != "asia" {
-		clients = 128
-	}
-	read = write
-	if readName != "" {
-		pooled.DBName = readName // PgBouncer alias for the same primary database.
-		read, err = openPostgresDB(&pooled, false)
-		if err != nil {
-			write.Close()
-			control.Close()
-			return nil, nil, nil, err
-		}
-		// Keep enough WAN connections in flight, and fit all three regions
-		// within max_client_conn even when both workloads peak together.
-		readClients := 64
-		clients = 48
-		if config.Region != "asia" {
-			readClients = 80
-		}
-		read.SetMaxOpenConns(readClients)
-		read.SetMaxIdleConns(readClients)
-	}
-	write.SetMaxOpenConns(clients)
-	write.SetMaxIdleConns(clients)
+	const maxWindowConns = 2
 	for _, pool := range []*sqlx.DB{primary, control} {
-		pool.SetMaxOpenConns(2)
-		pool.SetMaxIdleConns(2)
+		pool.SetMaxOpenConns(maxWindowConns)
+		pool.SetMaxIdleConns(maxWindowConns)
 	}
-	return write, read, control, nil
+	return db, control, nil
 }
 
 // warmUpDBPool はプールの全接続を起動時に張っておき、ベンチ開始直後のリクエストが

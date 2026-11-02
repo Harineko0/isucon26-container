@@ -12,10 +12,9 @@ EnvironmentFile=/home/isucon/env.sh
 # Above the observed peak (Sys 1.68 GB); see infra/notes/go-memlimit.md
 Environment=GOMEMLIMIT=2GiB
 Environment=ISUREAL_LISTEN_HOST=127.0.0.1
-Environment=ISUREAL_APP_DB_POOL=192.168.4.10:6432
-Environment=ISUREAL_ASIA_JPEG_WORKER=http://192.168.4.10:6433
-Environment=ISUREAL_APP_DB_READ_NAME=isureal_reads
-ExecStart=/home/isucon/webapp/go/isureal
+RuntimeDirectory=isureal-db-pool
+RuntimeDirectoryMode=0700
+ExecStart=/bin/bash /usr/local/libexec/isureal-with-pool
 Restart=on-failure
 RestartSec=5
 

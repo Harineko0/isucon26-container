@@ -17,17 +17,17 @@ func TestRequestPoolKeepsSessionConnectionsOnPrimary(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer primary.Close()
-			direct, reads, control, err := openRequestDBs(cfg, primary, "", "")
-			if err != nil || direct != primary || reads != primary || control != primary || direct.Stats().MaxOpenConnections != dbMaxConns(region) {
+			direct, control, err := openRequestDBs(cfg, primary, "")
+			if err != nil || direct != primary || control != primary || direct.Stats().MaxOpenConnections != dbMaxConns(region) {
 				t.Fatalf("direct pool changed: %v", err)
 			}
-			pooled, reads, control, err := openRequestDBs(cfg, primary, "127.0.0.2:6432", "")
+			pooled, control, err := openRequestDBs(cfg, primary, "127.0.0.2:6432")
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer pooled.Close()
 			defer control.Close()
-			if pooled == primary || reads != pooled || control == primary || control == pooled || pooled.Stats().MaxOpenConnections != want || primary.Stats().MaxOpenConnections != 2 || control.Stats().MaxOpenConnections != 2 {
+			if pooled == primary || control == primary || control == pooled || pooled.Stats().MaxOpenConnections != want || primary.Stats().MaxOpenConnections != 2 || control.Stats().MaxOpenConnections != 2 {
 				t.Fatalf("unexpected limits: app %d, watcher %d, control %d", pooled.Stats().MaxOpenConnections, primary.Stats().MaxOpenConnections, control.Stats().MaxOpenConnections)
 			}
 			if cfg.DBHost != "127.0.0.1" || cfg.DBPort != "5432" {
@@ -63,7 +63,7 @@ func TestDBConnConfigPlanCacheMode(t *testing.T) {
 
 // pgbouncer.ini が PgBouncer のサーバー接続に plan_cache_mode を設定すること (#153)。
 func TestPgBouncerSetsPlanCacheMode(t *testing.T) {
-	ini, err := os.ReadFile("../../../infra/hosts/asia2/etc/isureal/pgbouncer.ini")
+	ini, err := os.ReadFile("../../../infra/hosts/asia1/etc/isureal/pgbouncer.ini")
 	if err != nil {
 		t.Fatal(err)
 	}

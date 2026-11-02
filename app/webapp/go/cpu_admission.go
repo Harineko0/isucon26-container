@@ -4,8 +4,6 @@ import (
 	"context"
 	"runtime"
 
-	"example.com/isureal-company/isureal/internal/jpegworker"
-
 	"example.com/isureal-company/isureal/internal/jpegcheck"
 )
 
@@ -41,27 +39,6 @@ var validateJPEGFunc = jpegcheck.ValidateBytes
 // (呼び出し側は ctx.Err() != nil で見分け、不正な JPEG の 400 や abuse の記録と区別する)。
 // それ以外の誤りは jpegcheck のもので、JPEG が不正。
 func validateJPEGBytes(ctx context.Context, data []byte) (width, height int, err error) {
-	// Short images cost less to validate locally than a network round trip.
-	if jpegWorkerURL != "" && jpegWorkerCredential != "" && len(data) >= 64<<10 && len(data) <= jpegworker.MaxSize && len(jpegValidation) == cap(jpegValidation) {
-		if err := ctx.Err(); err != nil {
-			return 0, 0, err
-		}
-		select {
-		case <-ctx.Done():
-			return 0, 0, ctx.Err()
-		case jpegValidation <- struct{}{}:
-			defer jpegValidation.release()
-			return validateJPEGFunc(data)
-		case jpegWorkerSlots <- struct{}{}:
-			w, h, err, ok := validateJPEGOnWorker(ctx, data)
-			<-jpegWorkerSlots
-			if ok {
-				jpegWorkerStats.Add("completed", 1)
-				return w, h, err
-			}
-			jpegWorkerStats.Add("fallback", 1)
-		}
-	}
 	if err := jpegValidation.acquire(ctx); err != nil {
 		return 0, 0, err
 	}

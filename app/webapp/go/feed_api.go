@@ -303,8 +303,6 @@ func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 // ランキングは投稿 ID・著者 ID・投稿時刻だけで進める。スコアは著者の有効性とは独立なので、
 // 順位順に有効な著者を 51 件まで取り、そのページの投稿本文と期間だけを主キーで引く。
 //
-// 2 ホップ先の候補著者が 64 人以下なら、各著者と開いている期間の組で posts_author_window を引く。
-// 候補著者が多い場合だけ、期間内の投稿を一度走査する。
 // author_fof は著者ごとの 3 ホップの経路数を jsonb にまとめ、順位とカーソルが同じ集計を使えるよう実体化する。
 // 友達関係の両方向はそれぞれ複合索引で引く。以前の OR 結合は自己辺を 1 行として数えるので、
 // author_fof の 2 本目の枝だけで自己辺を除く。反応とコメントは有効な友達によるものだけを数える。
@@ -321,30 +319,18 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
       SELECT fs.user_low_id AS id FROM friendships fs JOIN friends f ON fs.user_high_id = f.id
     ) x WHERE id <> $1 GROUP BY id
   ),
-  candidate_authors AS MATERIALIZED (
-    SELECT m.id, m.n FROM mutual m
-    WHERE (SELECT has_posted_today FROM viewer)
-      AND m.id NOT IN (SELECT id FROM blocked)
-      AND m.id NOT IN (SELECT id FROM friends)
-  ),
-  many_authors AS (SELECT EXISTS(SELECT 1 FROM candidate_authors OFFSET 64) AS use_window_scan),
   open_posts AS MATERIALIZED (
     SELECT p.id, p.author_id, p.posted_at
     FROM posting_windows w JOIN posts p ON p.posting_window_id = w.id
-    WHERE w.ended_at IS NULL AND p.deleted_at IS NULL
+    WHERE w.ended_at IS NULL AND p.deleted_at IS NULL AND p.author_id <> $1
       AND p.visibility IN ('public', 'friends_of_friends')
-      AND (SELECT use_window_scan FROM many_authors)
+      AND (SELECT has_posted_today FROM viewer)
   ),
   candidates AS (
-    SELECT p.*, a.n FROM candidate_authors a CROSS JOIN posting_windows w
-    CROSS JOIN LATERAL (
-      SELECT p.id, p.author_id, p.posted_at FROM posts p
-      WHERE p.posting_window_id = w.id AND p.author_id = a.id AND p.deleted_at IS NULL
-        AND p.visibility IN ('public', 'friends_of_friends') OFFSET 0
-    ) p
-    WHERE w.ended_at IS NULL AND NOT (SELECT use_window_scan FROM many_authors)
-    UNION ALL
-    SELECT p.*, a.n FROM open_posts p JOIN candidate_authors a ON a.id = p.author_id
+    SELECT p.* FROM open_posts p
+    WHERE p.author_id NOT IN (SELECT id FROM blocked)
+      AND p.author_id NOT IN (SELECT id FROM friends)
+      AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
   ),
   author_fof AS MATERIALIZED (
     SELECT jsonb_object_agg(t.author_id, t.s) AS by_author FROM (
@@ -368,10 +354,11 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
               SELECT cm.author_id FROM comments cm
               WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
             ) e WHERE (e.user_id IN (SELECT id FROM active_friends)) IS TRUE)
-      + 3 * c.n
+      + 3 * COALESCE(mm.n, 0)
       + LEAST(COALESCE(((SELECT by_author FROM author_fof) ->> c.author_id)::numeric, 0), 30)
       )::bigint AS score
     FROM candidates c
+    LEFT JOIN mutual mm ON mm.id = c.author_id
   ),
   page AS (
     SELECT ranked.id AS page_id, ranked.score, u.*
