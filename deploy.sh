@@ -4,12 +4,14 @@
 # 成功した台は最後に "<hostname> deployed" を出す（ci/bench/run.sh が 3 行あるか数える）。
 set -eu
 . "$(dirname "$0")/ci/guard.sh"
+# 配る先のスタック（STACK、既定 isucon-prod-2）。複製スタックなら STACK=<name>（ci/stacks/lib.sh）
+. "$(dirname "$0")/ci/stacks/lib.sh"
 cd "$(dirname "$0")/app/webapp"
 # 配った commit（このリポジトリの commit）を ~/webapp/DEPLOYED_SHA に残す（fingerprint.sh が読む）。
 # サーバの /home/isucon は git 管理しない（コードはこのリポジトリだけにある）。昔の ~/.git が残っていれば消す。
 SHA=$(git rev-parse HEAD)$(git diff --quiet HEAD -- . || echo -dirty)
 KEY=~/.ssh/id_ed25519_github
-HOSTS="${HOSTS:-13.159.52.104 52.199.206.161 52.197.40.86}"
+HOSTS="${HOSTS:-$APP_IPS}"
 
 # サーバ側: ビルド → 差し替え → 再起動のあと、新しいプロセスが :8080 を listen するまで待つ（最大 30 秒）。
 # 起動直後に落ちる版を、ルーターが振り分けない europe1 / america1 でも検出するため。
@@ -66,4 +68,4 @@ if [ -n "$failed" ]; then
   echo "deploy.sh: FAILED on:$failed（app@$SHA は全台には入っていない。ベンチしないこと）" >&2
   exit 1
 fi
-echo "deploy.sh: OK on all hosts: app@$SHA"
+echo "deploy.sh: OK on all hosts of $STACK_NAME: app@$SHA"

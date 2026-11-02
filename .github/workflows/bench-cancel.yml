@@ -1,5 +1,6 @@
 # PR をマージ・クローズしたら、その PR の未完了の bench run（キュー待ち・実行中）をキャンセルする。
-# 対象は run-name が `bench #<PR 番号>` の bench.yml の run（bench.yml の run-name を参照）。
+# 対象は run-name が `bench #<PR 番号>`（公式）か `bench #<PR 番号> replica`（複製スタックの自作ベンチ）の bench.yml の run
+# （bench.yml の run-name を参照）。
 # キャンセルされた run も finalize.sh（if: always()）がコメントと status を最終版にする。
 name: bench-cancel
 
@@ -21,7 +22,7 @@ jobs:
         run: |
           set -eu
           ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/bench.yml/runs?per_page=100" \
-            --jq ".workflow_runs[] | select(.status != \"completed\" and .display_title == \"bench #$PR_NUMBER\") | .id")
+            --jq ".workflow_runs[] | select(.status != \"completed\" and (.display_title == \"bench #$PR_NUMBER\" or .display_title == \"bench #$PR_NUMBER replica\")) | .id")
           for id in $ids; do
             echo "cancel run $id"
             gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" >/dev/null || echo "warn: cancel $id failed"

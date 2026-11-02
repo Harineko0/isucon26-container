@@ -411,8 +411,10 @@ type regionState struct {
 	users         []*User
 	current       *Window // 開いている (ベンチが開いた) 投稿期間
 	lastLocalDate time.Time
-	certified     []*User
-	day           int
+	// manifest も -start-date も無いとき true。今の投稿期間から翌日を決め、409 なら先の日付を探す (runDay)
+	autoDate  bool
+	certified []*User
+	day       int
 }
 
 type World struct {

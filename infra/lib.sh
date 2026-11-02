@@ -7,13 +7,16 @@ INFRA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_KEY=~/.ssh/id_ed25519_github
 SSH="ssh -i $SSH_KEY -o ConnectTimeout=10"
 ALL_HOSTS="asia1 europe1 america1 asia2"
+# どのスタック（本番 isucon-prod-2 か、PR ベンチ用の複製）に配るかは STACK で選ぶ（ci/stacks/lib.sh）。
+# shellcheck disable=SC1091
+. "$INFRA_DIR/../ci/stacks/lib.sh"
 
 host_addr() {
   case "$1" in
-    asia1) echo isucon@13.159.52.104 ;;
-    europe1) echo isucon@52.199.206.161 ;;
-    america1) echo isucon@52.197.40.86 ;;
-    asia2) echo isucon@3.115.193.33 ;;
+    asia1) echo "isucon@$ASIA1_IP" ;;
+    europe1) echo "isucon@$EUROPE1_IP" ;;
+    america1) echo "isucon@$AMERICA1_IP" ;;
+    asia2) echo "isucon@$ASIA2_IP" ;;
     *) echo "unknown host: $1" >&2; return 1 ;;
   esac
 }

@@ -1,15 +1,22 @@
 # ベンチマークは必ずここから回す（ポータルの Enqueue と手元からのデプロイはしない）。
 #
-# - PR に `/bench [メモ]` とコメント → その時点の PR の head（app/ も infra/ も同じ commit）をデプロイして走る
-#   PR の open では走らない（測る価値のある状態になってから `/bench` する）
-# - 手動（main の基準値の更新など）: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...]
+# - PR に `/bench [メモ]` とコメント → その時点の PR の head（app/ も infra/ も同じ commit）を**複製スタック**にデプロイし、
+#   東京の EC2 から**自作ベンチ**（bench/cmd/isureal-bench、load-only）を走らせる。複製スタックが複数あれば並列に走る。
+#   PR の open では走らない（測る価値のある状態になってから `/bench` する）。
+#   `/bench --official [メモ]` なら本番 + 公式ベンチ（較正や最終候補の確認に。1 本ずつ）。
+#   複製スタックが無い（BENCH_REPLICA_STACKS が空）ときは、従来どおり本番 + 公式ベンチで測る。
+# - 手動（main の基準値の更新など）: gh workflow run bench.yml -R Harineko0/isucon26-container [-f container_ref=...] [-f bench=replica]
+#   既定は本番 + 公式ベンチ。-f bench=replica で同じ commit を複製スタック + 自作ベンチでも測ると、較正（公式/自作 の比）が出る。
 #
-# run は到着順に 1 本ずつ進む（ci/bench/queue.sh）。結果は PR コメントと bench-results ブランチの
-# results.jsonl に残る。詳細は ci/README.md。
+# 公式ベンチの run は到着順に 1 本ずつ進む（ci/bench/queue.sh）。自作ベンチの run は空いている複製スタックを取って進む
+# （ci/bench/stacklock.sh）。結果は PR コメントと bench-results ブランチの results.jsonl に残る。詳細は ci/README.md。
+#
+# run-name の末尾 " replica" が自作ベンチの run の印（queue.sh と bench-cancel.yml が見る）。下の Resolve target と同じ条件。
 name: bench
 run-name: >-
   bench ${{ github.event_name == 'issue_comment' && format('#{0}', github.event.issue.number)
-  || inputs.container_ref }}
+  || inputs.container_ref }}${{ ((github.event_name == 'issue_comment' && !contains(github.event.comment.body, '--official') && vars.BENCH_REPLICA_STACKS != '')
+  || (github.event_name == 'workflow_dispatch' && inputs.bench == 'replica')) && ' replica' || '' }}
 
 on:
   issue_comment:
@@ -22,13 +29,22 @@ on:
       note:
         description: メモ（コメントに載る）
         default: ""
+      bench:
+        description: official = 本番スタック + ポータルの公式ベンチ / replica = 複製スタック + 自作ベンチ
+        type: choice
+        options: [official, replica]
+        default: official
+      stack:
+        description: replica のとき、使う複製スタック名（空なら BENCH_REPLICA_STACKS から空いているもの）
+        default: ""
 
 permissions:
-  contents: write # bench-results ブランチへの記録
+  contents: write # bench-results / bench-locks ブランチへの記録
   issues: write
   pull-requests: write
   statuses: write # PR の status checks に「Benchmark」を出す
-  actions: read # queue.sh が run 一覧を読む
+  actions: read # queue.sh / stacklock.sh が run 一覧を読む
+  id-token: write # （任意）AWS の OIDC。ci/stacks/<name>.env が無い複製スタックの IP を CloudFormation から解決する
 
 jobs:
   bench:
@@ -42,6 +58,14 @@ jobs:
       COMMENT_TOKEN: ${{ github.token }}
       # ci/bench/freeze.sh が見る（キュー待ち前の Freeze check と、run.sh のデプロイ直前）
       FREEZE_AT: ${{ vars.BENCH_FREEZE_AT || '2026-10-31T17:30:00+09:00' }}
+      # これ以降は複製スタックを使わない（消して 16:30 の再起動リハーサルに入る。docs/final-runbook.md §0）。競技日の朝に設定する
+      REPLICA_UNTIL: ${{ vars.BENCH_REPLICA_UNTIL || '2099-12-31T23:59:59+09:00' }}
+      # 複製スタック（空白区切り。ci/stacks/<name>.env があるもの）。空なら PR も本番 + 公式ベンチ
+      BENCH_REPLICA_STACKS: ${{ vars.BENCH_REPLICA_STACKS }}
+      # 自作ベンチの実行元（東京リージョンの EC2、user@host。DEPLOY_SSH_KEY で入れること）。空なら GitHub の runner で走る（往復 150 ms が乗る）
+      BENCH_RUNNER: ${{ vars.BENCH_RUNNER }}
+      BENCH_FLAGS: ${{ vars.BENCH_FLAGS }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
     steps:
       - name: Resolve target
         env:
@@ -52,19 +76,33 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           IN_CONTAINER_REF: ${{ inputs.container_ref }}
           IN_NOTE: ${{ inputs.note }}
+          IN_BENCH: ${{ inputs.bench }}
+          IN_STACK: ${{ inputs.stack }}
           ACTOR: ${{ github.actor }}
         run: |
           set -eu
           STATE_DIR=$RUNNER_TEMP/bench
           mkdir -p "$STATE_DIR"
-          pr_number=
+          pr_number= kind=official fallback=
           if [ "$EVENT" = issue_comment ]; then
             gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null || true
             pr_number=$ISSUE_NUMBER
             container_ref=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .head.sha)
-            note=$(head -n1 <<<"$COMMENT_BODY" | sed 's|^/bench *||')
+            first=$(head -n1 <<<"$COMMENT_BODY")
+            # PR は複製スタック + 自作ベンチ。`/bench --official` で本番 + 公式ベンチ（run-name の条件と同じ）
+            if grep -q -- '--official' <<<"$first"; then
+              kind=official
+            elif [ -n "$BENCH_REPLICA_STACKS" ]; then
+              kind=replica
+            else
+              kind=official
+              fallback="複製スタックが設定されていない（BENCH_REPLICA_STACKS が空）ので、本番スタック + 公式ベンチで測りました。"
+            fi
+            note=$(sed -e 's|^/bench *||' -e 's|--official *||' <<<"$first")
           else
             container_ref=${IN_CONTAINER_REF:-main} note=$IN_NOTE
+            [ "$IN_BENCH" = replica ] && kind=replica
+            if [ "$kind" = replica ] && [ -n "$IN_STACK" ]; then BENCH_REPLICA_STACKS=$IN_STACK; fi
           fi
           container_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$container_ref" --jq .sha)
           # monorepo なので app/ もこの commit。サーバの DEPLOYED_SHA との照合と記録の app_sha に使う
@@ -76,11 +114,13 @@ jobs:
           else
             label="container@${container_sha:0:7}"
           fi
+          bench_name=official
+          [ "$kind" = official ] || bench_name=isureal-bench
           jq -n --arg label "$label" --arg pr_repo "$GITHUB_REPOSITORY" --arg pr_number "$pr_number" \
             --arg app_repo "$GITHUB_REPOSITORY" --arg app_sha "$app_sha" \
             --arg container_repo "$GITHUB_REPOSITORY" --arg container_sha "$container_sha" \
             --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --arg note "$note" --arg actor "$ACTOR" '$ARGS.named' >"$STATE_DIR/meta.json"
+            --arg note "$note" --arg actor "$ACTOR" --arg bench "$bench_name" --arg fallback "$fallback" '$ARGS.named' >"$STATE_DIR/meta.json"
           cat "$STATE_DIR/meta.json"
           {
             echo "STATE_DIR=$STATE_DIR"
@@ -90,6 +130,8 @@ jobs:
             echo "APP_SHA=$app_sha"
             echo "CONTAINER_SHA=$container_sha"
             echo "LABEL=$label"
+            echo "BENCH_KIND=$kind"
+            echo "BENCH_REPLICA_STACKS=$BENCH_REPLICA_STACKS"
           } >>"$GITHUB_ENV"
 
       - uses: actions/checkout@v4
@@ -111,6 +153,8 @@ jobs:
           chmod +x "$RUNNER_TEMP/gate.sh"
           echo "BENCH_GATE=$RUNNER_TEMP/gate.sh" >>"$GITHUB_ENV"
 
+      # 公式: 自分より前の公式ベンチの run が終わるまで待つ（本番は 1 本ずつ）。
+      # 自作: 空いている複製スタックを取る（bench-locks ブランチ）。取れたスタック名が STACK
       - name: Wait for my turn
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,7 +162,13 @@ jobs:
         run: |
           ci/bench/stage.sh queued
           "$BENCH_GATE"
-          if [ ! -f "$STATE_DIR/exclusive" ]; then ci/bench/queue.sh; fi
+          if [ "$BENCH_KIND" = official ]; then
+            if [ ! -f "$STATE_DIR/exclusive" ]; then ci/bench/queue.sh; fi
+          else
+            STACK=$(ci/bench/stacklock.sh claim)
+            echo "STACK=$STACK" >>"$GITHUB_ENV"
+            echo "claimed replica stack: $STACK"
+          fi
           "$BENCH_GATE"
           "$FREEZE_CHECK" # 待ちの間に凍結時刻を過ぎていたら、ここで止める（#245）
           git fetch -q origin bench-results && git show FETCH_HEAD:results.jsonl >"$HISTORY" || : >"$HISTORY"
@@ -135,6 +185,21 @@ jobs:
           [ -z "$PASSPHRASE" ] || ssh-keygen -q -p -P "$PASSPHRASE" -N "" -f ~/.ssh/id_ed25519_github
           printf 'Host *\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\n' >~/.ssh/config
 
+      # 自作ベンチのビルド用（静的バイナリを EC2 に送る。EC2 に Go は要らない）
+      - uses: actions/setup-go@v5
+        if: env.BENCH_KIND == 'replica'
+        with:
+          go-version-file: bench/go.mod
+          cache-dependency-path: bench/go.sum
+
+      # （任意）ci/stacks/<name>.env が無い複製スタックの IP を CloudFormation から解決するための資格情報。
+      # env ファイルを commit してあれば不要
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: env.BENCH_KIND == 'replica' && env.AWS_ROLE_ARN != ''
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-1
+
       - name: Deploy and benchmark
         env:
           PORTAL_COOKIE: ${{ secrets.PORTAL_COOKIE }}
@@ -148,4 +213,5 @@ jobs:
         if: always()
         env:
           PORTAL_COOKIE: ${{ secrets.PORTAL_COOKIE }}
+          GH_TOKEN: ${{ github.token }}
         run: ci/bench/finalize.sh

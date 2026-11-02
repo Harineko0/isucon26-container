@@ -2,8 +2,9 @@
 # ルーター経由で主要 API を一通り叩く簡易スモークテスト。最後に initialize で元に戻す。
 set -u
 . "$(dirname "$0")/ci/guard.sh"
+. "$(dirname "$0")/ci/stacks/lib.sh" # STACK=<name> で複製スタックのルーターに向ける
 IMG=${IMG:-$(dirname "$0")/ci/bench/test.jpg}
-R=http://35.73.68.236:8080
+R=$ROUTER_URL
 S=$$
 j() { curl -s -H 'Content-Type: application/json' "$@"; }
 code() { curl -s -o /dev/null -w "%{http_code}" "$@"; }

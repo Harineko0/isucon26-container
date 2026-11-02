@@ -5,12 +5,33 @@
 スキーマ変更、ルーター経由の書き込み API、ポータルからのベンチ投入。デプロイとベンチは CI だけが行う。
 通すもの: ssh での読み取り（journalctl, ps, cat, top 等）、psql の SELECT / EXPLAIN、infra/deploy.sh -n。
 """
+import glob
 import json
+import os
 import re
 import sys
 
-SERVERS = r"13\.159\.52\.104|52\.199\.206\.161|52\.197\.40\.86|3\.115\.193\.33|192\.168\.[1-4]\.10|isucon26-(asia|europe|america)"
-ROUTER = r"35\.73\.68\.236"
+
+def stack_ips(keys):
+    """ci/stacks/*.env（本番と複製スタック）の IP。複製スタックも CI がベンチに使うので、同じく守る。"""
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ips = []
+    for path in glob.glob(os.path.join(root, "ci", "stacks", "*.env")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k in keys and re.fullmatch(r"[0-9.]+", v):
+                        ips.append(re.escape(v))
+        except OSError:
+            pass
+    return ips
+
+
+SERVERS = "|".join([r"13\.159\.52\.104", r"52\.199\.206\.161", r"52\.197\.40\.86", r"3\.115\.193\.33",
+                    r"192\.168\.[1-4]\.10", "isucon26-(asia|europe|america)"]
+                   + stack_ips({"ASIA1_IP", "EUROPE1_IP", "AMERICA1_IP", "ASIA2_IP"}))
+ROUTER = "|".join([r"35\.73\.68\.236"] + stack_ips({"ROUTER_IP"}))
 # psql を実際に起動しているとき（文書中の「psql」という語には反応しない）
 PSQL = r"\bpsql\b[^\n]*\s-[cfhdU]\b|\bpsql\b[^\n]*<|\|\s*psql\b|PGPASSWORD"
 CMD_START = r"(^|[;&|(]\s*|(?<![\w./-])(bash|sh|zsh|exec|time|nohup)\s+)([A-Z_]+=\S*\s+)*"
@@ -28,6 +49,8 @@ RULES = [
      "大きい表の全件 count / GROUP BY / ORDER BY はベンチ中の asia2 を汚す (#84)。件数は pg_stat_user_tables.n_live_tup か "
      "pg_class.reltuples、計画は EXPLAIN (ANALYZE なし) で見る。WHERE で絞るか、ベンチが走っていないときに人が流す"),
     (None, r"ALLOW_LOCAL_DEPLOY", "ALLOW_LOCAL_DEPLOY は人間が緊急時に使うもの"),
+    (None, r"ALLOW_STACK_CHANGE|cloudformation\s+(create|delete|update)-stack|ci/stacks/(create|delete)\.sh",
+     "CloudFormation スタックの作成・削除は人が行う（お金がかかり、ポータルのサーバリストに登録される。ci/README.md「複製スタック」）"),
     (None, CMD_START + r"\S*(?<![\w-])(deploy|smoke)\.sh(?!\s+-n\b)",
      "deploy.sh / smoke.sh は CI から実行する（infra/deploy.sh -n の差分表示は可）"),
     (None, r"portal\.py\s+enqueue", "ポータルへのベンチ投入"),

@@ -2,6 +2,7 @@ package scenario
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -9,8 +10,43 @@ import (
 	"time"
 
 	"isureal-bench/internal/api"
+	"isureal-bench/internal/client"
 	"isureal-bench/internal/score"
 )
+
+// isConflict は POST /api/admin/posting-window の 409 (posting_window_conflict) か。
+func isConflict(err error) bool {
+	var ce *client.Error
+	return errors.As(err, &ce) && ce.Got == http.StatusConflict
+}
+
+// openWindowAuto は投稿期間を開く。manifest も -start-date も無い (rs.autoDate) 1 日目に 409 なら、初期データが
+// もっと先の日付の投稿期間を持っているので、1, 2, 4, … 日ずつ先に進めて開ける日付を探す
+// (409 は「その日以降の投稿期間がある」なので、通れば以後の日も通る)。開いた localDate を返す。
+func (w *World) openWindowAuto(ctx context.Context, rs *regionState, region string, day int, localDate string) (*api.OpenPostingWindowResponse, string, error) {
+	res, err := w.openWindow(ctx, region, localDate)
+	if err == nil || day != 1 || !rs.autoDate || !isConflict(err) {
+		return res, localDate, err
+	}
+	base, perr := time.Parse("2006-01-02", localDate)
+	if perr != nil {
+		return res, localDate, err
+	}
+	step := 1
+	for try := 0; try < 12 && isConflict(err) && ctx.Err() == nil; try++ {
+		base = base.AddDate(0, 0, step)
+		localDate = base.Format("2006-01-02")
+		rs.mu.Lock()
+		rs.lastLocalDate = base // 以後の日はここから 1 日ずつ進む
+		rs.mu.Unlock()
+		step *= 2
+		res, err = w.openWindow(ctx, region, localDate)
+	}
+	if err == nil {
+		w.log.Info("投稿期間の開始日を先に進めました", "region", region, "first", localDate)
+	}
+	return res, localDate, err
+}
 
 // runRegion は 1 リージョンの投稿期間を順に開く。firstOpen は 1 日目の開始時刻。
 // grandPrixAt が非ゼロなら、通常の日のあとその時刻に最終日を開く。
@@ -67,7 +103,8 @@ func (w *World) runDay(ctx context.Context, rs *regionState, region string, day 
 	rs.current = win
 	rs.day = day
 	rs.mu.Unlock()
-	res, err := w.openWindow(ctx, region, localDate)
+	res, localDate, err := w.openWindowAuto(ctx, rs, region, day, localDate)
+	win.LocalDate = localDate
 	if err != nil {
 		win.failed.Store(true)
 		close(win.ready)

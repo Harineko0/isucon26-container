@@ -4,7 +4,8 @@
 set -u
 KEY=~/.ssh/id_ed25519_github
 WANT=1826950
-HOSTS="${HOSTS:-13.159.52.104 52.199.206.161 52.197.40.86}"
+. "$(dirname "$0")/ci/stacks/lib.sh" # STACK=<name> で複製スタック
+HOSTS="${HOSTS:-$APP_IPS}"
 for ip in $HOSTS; do
   (
     n=$(ssh -i $KEY isucon@$ip 'find ~/imgcache -type f ! -name "*.tmp" 2>/dev/null | wc -l')
