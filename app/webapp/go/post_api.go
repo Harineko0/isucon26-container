@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -147,7 +146,10 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if _, _, err := jpegcheck.ValidateBytes(imageData); err != nil {
+		if _, _, err := validateJPEGBytes(c.Request().Context(), imageData); err != nil {
+			if c.Request().Context().Err() != nil {
+				return err
+			}
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
