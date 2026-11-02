@@ -12,6 +12,7 @@ DROP TABLE IF EXISTS
   block_relations,
   follows,
   friendships,
+  fof_vertices,
   administrator_sessions,
   login_sessions,
   administrators,

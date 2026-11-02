@@ -303,21 +303,26 @@ func buildFeedFollowingQuery(regionParam, tokenParam int) string {
 // ランキングは投稿 ID・著者 ID・投稿時刻だけで進める。スコアは著者の有効性とは独立なので、
 // 順位順に有効な著者を 51 件まで取り、そのページの投稿本文と期間だけを主キーで引く。
 //
-// author_fof は著者ごとの 3 ホップの経路数を jsonb にまとめ、順位とカーソルが同じ集計を使えるよう実体化する。
-// 友達関係の両方向はそれぞれ複合索引で引く。以前の OR 結合は自己辺を 1 行として数えるので、
-// author_fof の 2 本目の枝だけで自己辺を除く。反応とコメントは有効な友達によるものだけを数える。
+// Friendships are projected to integer adjacency lists in the write transaction.
+// Count two-hop paths once. A self-edge has two orientations on the second hop
+// in the original ranking, but only one on the first and third hops.
 func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
 	return `
-  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedFriendsCTE + `,` + feedBlockedCTE + `,
-  active_friends AS MATERIALIZED (
-    SELECT f.id FROM friends f JOIN users u ON u.id = f.id WHERE u.status = 'active'
+  WITH` + feedViewerSessionCTE(regionParam, tokenParam) + `,` + feedBlockedCTE + `,
+  me AS MATERIALIZED (
+    SELECT slot, neighbors FROM fof_vertices WHERE user_id = $1 AND (SELECT has_posted_today FROM viewer)
   ),
-  mutual AS (
-    SELECT id, count(*) AS n FROM (
-      SELECT fs.user_high_id AS id FROM friendships fs JOIN friends f ON fs.user_low_id = f.id
-      UNION ALL
-      SELECT fs.user_low_id AS id FROM friendships fs JOIN friends f ON fs.user_high_id = f.id
-    ) x WHERE id <> $1 GROUP BY id
+  friends AS MATERIALIZED (
+    SELECT f.* FROM me CROSS JOIN unnest(me.neighbors) peer(slot)
+    JOIN fof_vertices f ON f.slot = peer.slot
+  ),
+  active_friends AS MATERIALIZED (
+    SELECT f.user_id AS id FROM friends f JOIN users u ON u.id = f.user_id WHERE u.status = 'active'
+  ),
+  mutual AS MATERIALIZED (
+    SELECT peer.slot, min(peer.id) AS id, sum(CASE WHEN peer.slot = f.slot THEN 2 ELSE 1 END) AS n
+    FROM friends f CROSS JOIN unnest(f.neighbors, f.neighbor_ids) peer(slot,id)
+    WHERE peer.slot <> (SELECT slot FROM me) GROUP BY peer.slot
   ),
   open_posts AS MATERIALIZED (
     SELECT p.id, p.author_id, p.posted_at
@@ -327,38 +332,32 @@ func buildFeedFriendsOfFriendsQuery(regionParam, tokenParam int) string {
       AND (SELECT has_posted_today FROM viewer)
   ),
   candidates AS (
-    SELECT p.* FROM open_posts p
+    SELECT p.*, m.slot, m.n FROM open_posts p
+    JOIN mutual m ON m.id = p.author_id
     WHERE p.author_id NOT IN (SELECT id FROM blocked)
-      AND p.author_id NOT IN (SELECT id FROM friends)
-      AND (p.author_id IN (SELECT id FROM mutual)) IS TRUE
+      AND m.slot NOT IN (SELECT slot FROM friends)
   ),
-  author_fof AS MATERIALIZED (
-    SELECT jsonb_object_agg(t.author_id, t.s) AS by_author FROM (
-      SELECT a.author_id, sum(m.n) AS s
-      FROM (SELECT DISTINCT author_id FROM candidates) a
-      CROSS JOIN LATERAL (
-        SELECT fs.user_high_id AS id FROM friendships fs WHERE fs.user_low_id = a.author_id
-        UNION ALL
-        SELECT fs.user_low_id FROM friendships fs WHERE fs.user_high_id = a.author_id AND fs.user_low_id <> a.author_id
-      ) f
-      JOIN mutual m ON m.id = f.id
-      GROUP BY a.author_id
-    ) t
+  connections AS (
+    SELECT g.slot, sum(m.n)::bigint AS n FROM (SELECT DISTINCT slot FROM candidates) a
+    JOIN fof_vertices g ON g.slot = a.slot CROSS JOIN unnest(g.neighbors) peer(slot)
+    JOIN mutual m ON m.slot = peer.slot GROUP BY g.slot
   ),
-  scored AS (
-    SELECT c.*, (
-      10 * (SELECT count(*) FROM (
-              SELECT r.reactor_id AS user_id FROM realmojis r
-              WHERE r.post_id = c.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
-              UNION
-              SELECT cm.author_id FROM comments cm
-              WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
-            ) e WHERE (e.user_id IN (SELECT id FROM active_friends)) IS TRUE)
-      + 3 * COALESCE(mm.n, 0)
-      + LEAST(COALESCE(((SELECT by_author FROM author_fof) ->> c.author_id)::numeric, 0), 30)
-      )::bigint AS score
+  engaged AS (
+    SELECT e.id, count(*) AS n FROM (
+      SELECT c.id, r.reactor_id FROM candidates c
+      JOIN realmojis r ON r.post_id = c.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
+      WHERE r.reactor_id IN (SELECT id FROM active_friends)
+      UNION
+      SELECT c.id, cm.author_id FROM candidates c
+      JOIN comments cm ON cm.post_id = c.id AND cm.deleted_at IS NULL
+      WHERE cm.author_id IN (SELECT id FROM active_friends)
+    ) e GROUP BY e.id
+  ),
+  scored AS MATERIALIZED (
+    SELECT c.*, (10 * COALESCE(e.n, 0) + 3 * c.n + LEAST(COALESCE(path.n, 0), 30))::bigint AS score
     FROM candidates c
-    LEFT JOIN mutual mm ON mm.id = c.author_id
+    LEFT JOIN connections path ON path.slot = c.slot
+    LEFT JOIN engaged e ON e.id = c.id
   ),
   page AS (
     SELECT ranked.id AS page_id, ranked.score, u.*
