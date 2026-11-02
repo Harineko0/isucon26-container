@@ -14,6 +14,7 @@ DROP TABLE IF EXISTS
   follows,
   friendships,
   fof_vertices,
+  fof_graph_active,
   administrator_sessions,
   login_sessions,
   administrators,

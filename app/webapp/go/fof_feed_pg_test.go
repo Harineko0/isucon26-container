@@ -214,10 +214,21 @@ func TestFriendGraphTransactionsOnPostgres(t *testing.T) {
 	    ROLLBACK`)
 	check()
 	db.MustExec(`BEGIN; SET LOCAL session_replication_role = replica; TRUNCATE friendships;
+	    INSERT INTO fof_graph_active VALUES (true);
 	    INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('x','u5','u6'),('y','u6','u7'); COMMIT`)
 	check()
 	var count int
 	if err := db.Get(&count, "SELECT count(*) FROM fof_vertices"); err != nil || count != 3 {
 		t.Fatalf("vertices after reset = %d (%v)", count, err)
 	}
+	// An older reset truncates and restores friendships under replica mode but
+	// does not opt in. Its subsequent normal writers must not maintain our index.
+	db.MustExec(`BEGIN; SET LOCAL session_replication_role = replica; TRUNCATE friendships;
+	    INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('old','u1','u2'); COMMIT;
+	    INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('live','u2','u3')`)
+	if err := db.Get(&count, "SELECT count(*) FROM fof_vertices"); err != nil || count != 0 {
+		t.Fatalf("inactive graph received legacy writes: %d (%v)", count, err)
+	}
+	installTestFriendGraph(t, db)
+	check()
 }

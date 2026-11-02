@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS fof_vertices (
     neighbor_ids varchar(36)[] NOT NULL DEFAULT '{}'
 );
 
+-- replica-mode TRUNCATE is shared with older reset.sql versions. Only the
+-- graph-aware reset opts back in before restoring edges.
+CREATE TABLE IF NOT EXISTS fof_graph_active (active boolean PRIMARY KEY CHECK (active));
+
 CREATE OR REPLACE FUNCTION isureal_refresh_friend_vertices(ids varchar[]) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -44,8 +48,14 @@ CREATE OR REPLACE FUNCTION isureal_sync_friend_vertices() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE ids varchar[];
 BEGIN
+    IF NOT EXISTS (SELECT FROM fof_graph_active) THEN
+        RETURN NULL;
+    END IF;
     IF TG_OP = 'TRUNCATE' THEN
         TRUNCATE fof_vertices RESTART IDENTITY;
+        IF current_setting('session_replication_role') = 'replica' THEN
+            DELETE FROM fof_graph_active;
+        END IF;
         RETURN NULL;
     ELSIF TG_OP = 'UPDATE' THEN
         SELECT ARRAY(SELECT user_low_id FROM old_edges UNION SELECT user_high_id FROM old_edges
@@ -64,7 +74,9 @@ END $$;
 -- exposing the projection. Later initializes rebuild in the same transaction as
 -- the TRUNCATE + bulk restore in reset.sql, even with replication_role=replica.
 DO $$ BEGIN
-    IF NOT EXISTS (SELECT FROM pg_trigger WHERE tgrelid = 'friendships'::regclass AND tgname = 'fof_edges_insert') THEN
+    IF NOT EXISTS (SELECT FROM fof_graph_active) OR
+       NOT EXISTS (SELECT FROM pg_trigger WHERE tgrelid = 'friendships'::regclass AND tgname = 'fof_edges_insert') THEN
+        INSERT INTO fof_graph_active VALUES (true) ON CONFLICT DO NOTHING;
         TRUNCATE fof_vertices RESTART IDENTITY;
         PERFORM isureal_refresh_friend_vertices(ARRAY(
             SELECT user_low_id FROM friendships UNION SELECT user_high_id FROM friendships));

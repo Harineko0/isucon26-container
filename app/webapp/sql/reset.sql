@@ -57,6 +57,7 @@ ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name;
 
 INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
 SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM initial_friend_requests;
+INSERT INTO fof_graph_active VALUES (true) ON CONFLICT DO NOTHING;
 INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id, created_at, updated_at)
 SELECT id, user_low_id, user_high_id, source_request_id, created_at, updated_at FROM initial_friendships;
 INSERT INTO follows (id, follower_id, followee_id, created_at, updated_at)
