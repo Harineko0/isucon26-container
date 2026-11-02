@@ -75,12 +75,22 @@ INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at,re
 			}
 		}
 	}
-	for _, deferred := range []bool{false, true} {
-		page := read(deferred, nil)
-		checkPage(page, want[:51])
-		checkPage(read(deferred, &page[0]), want[1:52])
-		checkPage(read(deferred, &page[49]), want[50:])
+	checkBothPages := func() {
+		t.Helper()
+		for _, deferred := range []bool{false, true} {
+			page := read(deferred, nil)
+			checkPage(page, want[:51])
+			checkPage(read(deferred, &page[0]), want[1:52])
+			checkPage(read(deferred, &page[49]), want[50:])
+		}
 	}
+	checkBothPages() // 64 candidate authors after removing blocks.
+	// A 65th author with no post switches to the window scan without
+	// changing any ranking, tie-break, or page boundary.
+	db.MustExec(`INSERT INTO users(id,username,secret_key_hash,display_name,region)
+		VALUES ('z71','user71',repeat('a',64),'User 71','asia');
+		INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('bridge-71','u2','z71')`)
+	checkBothPages()
 
 	// Losing three friendships removes their posts from both pages. Deactivating
 	// u3 removes 10 engagement points, but the path through u3 to u6 still counts.
