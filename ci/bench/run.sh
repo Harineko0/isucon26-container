@@ -56,13 +56,6 @@ step=deploy-infra
 infra/deploy.sh 2>&1 | tee "$STATE_DIR/deploy-infra.log"
 if grep -E '\] ERROR|"passed": false' "$STATE_DIR/deploy-infra.log"; then false; fi
 
-# Migration from the postgame trial. All app units now use the asia1 pool.
-step=retire-trial-units
-ssh -i ~/.ssh/id_ed25519_github isucon@3.115.193.33 'set -eu
-  for unit in isureal-db-pool.service isureal-jpeg-worker.service; do
-    if [ -f "/etc/systemd/system/$unit" ]; then sudo systemctl disable --now "$unit"; fi
-  done'
-
 step=initialize
 for i in 1 2 3 4 5 6; do
   out=$(curl -s -o "$STATE_DIR/init.json" -w '%{http_code} %{time_total}' -m 60 -XPOST "$ROUTER/api/initialize" || true)

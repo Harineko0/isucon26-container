@@ -106,7 +106,7 @@ func newGetMeResponse(user User) getMeResponse {
 const registerSQL = `SELECT * FROM isureal_register($1, $2, $3, $4, $5)`
 
 func registerHandler(h *HandlerContext) echo.HandlerFunc {
-	writes := &writeQueue[sessionUserRow]{db: h.DB, sql: registerSQL}
+	writes := &writeQueue[sessionUserRow]{db: h.DB, sql: registerSQL, accountBatchSQL: registerBatchSQL}
 	return registerHandlerWithQueue(writes, func(user User) { saveSearchNormsAsync(h.DB, user) })
 }
 
@@ -137,7 +137,7 @@ func registerHandlerWithQueue(writes *writeQueue[sessionUserRow], indexUser func
 }
 
 func loginHandler(h *HandlerContext) echo.HandlerFunc {
-	logins := &writeQueue[sessionUserRow]{db: h.DB, bans: h.IPBans, sql: loginSQL}
+	logins := &writeQueue[sessionUserRow]{db: h.DB, bans: h.IPBans, sql: loginSQL, accountBatchSQL: loginBatchSQL}
 	return func(c *echo.Context) error {
 		var input loginRequest
 		if err := c.Bind(&input); err != nil {

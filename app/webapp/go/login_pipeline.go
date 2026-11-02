@@ -38,11 +38,12 @@ type writeBatch[T any] struct {
 }
 
 type writeQueue[T any] struct {
-	db      *sqlx.DB
-	bans    *IPBanList // Only login rechecks IP bans after acquiring its connection.
-	sql     string
-	mu      sync.Mutex
-	pending *writeBatch[T]
+	db              *sqlx.DB
+	bans            *IPBanList // Only login rechecks IP bans after acquiring its connection.
+	sql             string
+	accountBatchSQL string
+	mu              sync.Mutex
+	pending         *writeBatch[T]
 }
 
 func (q *writeQueue[T]) query(ctx context.Context, conn *sqlx.Conn, args []any) (T, error) {
@@ -149,7 +150,9 @@ func (q *writeQueue[T]) run(ctx context.Context, b *writeBatch[T]) {
 		row, err := q.query(c.ctx, conn, c.args)
 		c.reply <- writeResult[T]{row, err}
 	default:
-		q.pipeline(ctx, conn, ready)
+		if !q.batchAccounts(ctx, conn, ready) {
+			q.pipeline(ctx, conn, ready)
+		}
 	}
 }
 
@@ -165,6 +168,14 @@ func (q *writeQueue[T]) pipeline(ctx context.Context, conn *sqlx.Conn, calls []*
 		var params pgx.ExtendedQueryBuilder
 		sent := make([]*writeCall[T], 0, len(calls))
 		for _, c := range calls {
+			if c.ctx != nil && c.ctx.Err() != nil {
+				c.reply <- writeResult[T]{err: c.ctx.Err()}
+				continue
+			}
+			if q.bans != nil && q.bans.bannedCached(c.ip, time.Now()) {
+				c.reply <- writeResult[T]{err: NewAPIError(http.StatusForbidden, "ip_banned")}
+				continue
+			}
 			// Use pgx's text encoders, including SQL NULLs for optional fields.
 			if err := params.Build(pg.TypeMap(), nil, c.args); err != nil {
 				c.reply <- writeResult[T]{err: err}

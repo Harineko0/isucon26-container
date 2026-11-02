@@ -186,3 +186,33 @@ func TestConcurrentLoginTokens(t *testing.T) {
 		t.Fatalf("issued %d distinct tokens, %d active, err=%v", len(tokens), len(active), err)
 	}
 }
+
+func TestGroupedLoginsCommitOnce(t *testing.T) {
+	db := loginTestDB(t)
+	key1, key2 := strings.Repeat("0", 63)+"1", strings.Repeat("0", 63)+"2"
+	queue := &writeQueue[sessionUserRow]{sql: loginSQL, accountBatchSQL: loginBatchSQL}
+	conn, err := db.Connx(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	calls := make([]*writeCall[sessionUserRow], 0, 3)
+	for _, args := range [][]any{
+		{"user2", key2, "first", "t1"}, {"user1", key1, "second", "t2"}, {"user2", key2, "third", "t3"},
+	} {
+		calls = append(calls, &writeCall[sessionUserRow]{ctx: t.Context(), args: args, reply: make(chan writeResult[sessionUserRow], 1)})
+	}
+	if !queue.batchAccounts(t.Context(), conn, calls) {
+		t.Fatal("valid login batch fell back")
+	}
+	for i, call := range calls {
+		r := <-call.reply
+		if r.err != nil || r.row.Username == nil || *r.row.Username != call.args[0] {
+			t.Fatalf("login %d: %+v", i, r)
+		}
+	}
+	var txns, active int
+	if err := db.QueryRow("SELECT COUNT(DISTINCT xmin::text), count(*) FILTER (WHERE active AND id IN ('second','third')) FROM login_sessions WHERE id IN ('first','second','third')").Scan(&txns, &active); err != nil || txns != 1 || active != 2 {
+		t.Fatalf("txns=%d, active=%d, err=%v", txns, active, err)
+	}
+}
