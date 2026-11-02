@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+# Read the existing SCRAM verifier over the normal primary connection. It must
+# be identical for PgBouncer to authenticate to PostgreSQL on the client's behalf.
+# systemd creates the private runtime directory and removes it when the unit stops.
+install -m 600 /dev/null "$RUNTIME_DIRECTORY/users.txt"
+PGPASSWORD="$ISUREAL_DB_PASSWORD" PGCONNECT_TIMEOUT=3 psql -XAtqw -v ON_ERROR_STOP=1 \
+  -h 127.0.0.1 -p "$ISUREAL_DB_PORT" -U "$ISUREAL_DB_USER" -d "$ISUREAL_DB_NAME" \
+  > "$RUNTIME_DIRECTORY/users.txt" <<'SQL'
+SELECT '"' || replace(rolname, '"', '""') || '" "' || rolpassword || '"'
+FROM pg_catalog.pg_authid
+WHERE rolname = current_user AND rolpassword LIKE 'SCRAM-SHA-256$%';
+SQL
+test -s "$RUNTIME_DIRECTORY/users.txt"
+exec /usr/local/lib/isureal/pgbouncer-1.26.1 /etc/isureal/pgbouncer.ini

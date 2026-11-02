@@ -63,7 +63,7 @@ func TestDBConnConfigPlanCacheMode(t *testing.T) {
 
 // pgbouncer.ini が PgBouncer のサーバー接続に plan_cache_mode を設定すること (#153)。
 func TestPgBouncerSetsPlanCacheMode(t *testing.T) {
-	ini, err := os.ReadFile("../../../infra/hosts/asia1/etc/isureal/pgbouncer.ini")
+	ini, err := os.ReadFile("../../../infra/hosts/asia2/etc/isureal/pgbouncer.ini")
 	if err != nil {
 		t.Fatal(err)
 	}

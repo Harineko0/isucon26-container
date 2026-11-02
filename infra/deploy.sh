@@ -7,7 +7,7 @@
 # 中身の差分は infra/pull.sh -n で見る。上書き前のファイルは
 # サーバの /var/tmp/infra-backup/<時刻>/ に残る。
 # PostgreSQL の再起動が必要な設定は reload しても効かないので、表示に従って手で再起動する。
-set -eu
+set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 DRY=
@@ -16,11 +16,12 @@ if [ "${1:-}" = -n ]; then DRY=1; shift; fi
 HOSTS="${*:-$ALL_HOSTS}"
 TS=$(date +%Y%m%d-%H%M%S)
 
-# The versioned binary is self-contained. Only the asia1 service runs it.
-if [ -z "$DRY" ] && [[ " $HOSTS " == *" asia1 "* ]] &&
-    ! $SSH "$(host_addr asia1)" 'test -x /usr/local/lib/isureal/pgbouncer-1.26.1'; then
+# The pool runs alongside PostgreSQL. Keep the inter-region hop on the
+# client side, where it does not occupy a server connection.
+if [ -z "$DRY" ] && [[ " $HOSTS " == *" asia2 "* ]] &&
+    ! $SSH "$(host_addr asia2)" 'sudo test -f /usr/local/lib/isureal/pgbouncer-1.26.1'; then
   docker buildx build --platform linux/amd64 \
-    --output "type=local,dest=$INFRA_DIR/hosts/asia1/usr/local/lib/isureal" "$INFRA_DIR/pgbouncer"
+    --output "type=local,dest=$INFRA_DIR/hosts/asia2/usr/local/lib/isureal" "$INFRA_DIR/pgbouncer"
 fi
 
 # -a は使わない（/ や /etc の所有者・権限が手元のものに置き換わる）。
@@ -36,12 +37,12 @@ deploy_host() {
     [ -d "$d" ] || continue
     changed+=$(rsync "${RSYNC_OPTS[@]}" ${DRY:+--dry-run} \
       --backup --backup-dir="/var/tmp/infra-backup/$TS" \
-      -e "$SSH" "$d/" "$addr:/" | grep -v '/$' || true)$'\n'
+      -e "$SSH" "$d/" "$addr:/")$'\n'
   done
   # --no-perms preserves existing modes, including a root-owned 0700 directory
   # from a previous Docker export. Repair only the dedicated pool paths, and
   # treat a permission-only repair as a change so the failed service restarts.
-  if [ "$host" = asia1 ]; then
+  if [ "$host" = asia2 ]; then
     local pool_changed
     pool_changed=$($SSH "$addr" "bash -s -- ${DRY:-0}" \
       <"$INFRA_DIR/pgbouncer/permissions.sh") || {
@@ -50,13 +51,15 @@ deploy_host() {
     }
     changed+="$pool_changed"$'\n'
   fi
-  changed=$(echo "$changed" | sed '/^$/d' | sort -u)
+  changed=$(echo "$changed" | sed '/^$/d; /\/$/d' | sort -u)
 
   if [ -z "$changed" ]; then
     echo "[$host] no changes"
-    return
+    # A retry must also repair a unit that was copied but failed to start.
+    [ "$host" = asia2 ] || return 0
+  else
+    echo "$changed" | sed "s|^|[$host] /|"
   fi
-  echo "$changed" | sed "s|^|[$host] /|"
   [ -z "$DRY" ] || return 0
 
   local cmds=()
@@ -65,8 +68,18 @@ deploy_host() {
     grep -q '^etc/systemd/system/postgresql' <<<"$changed" &&
       cmds+=("echo 'NOTE: PostgreSQL の unit を変えた。効かせるには sudo systemctl restart postgresql@16-main'")
   fi
-  if grep -Eq '^(etc/systemd/system/isureal-go.service$|etc/isureal/pgbouncer.ini$|usr/local/libexec/isureal-with-pool$|usr/local/lib/isureal/pgbouncer-)' <<<"$changed"; then
+  if grep -qx 'etc/systemd/system/isureal-go.service' <<<"$changed"; then
     cmds+=("sudo systemctl restart isureal-go && timeout 30 bash -c 'until systemctl is-active --quiet isureal-go && ss -Hltn \"sport = :8080\" | grep -q .; do sleep 1; done' || echo 'ERROR: isureal-go did not start'")
+  fi
+  if [ "$host" = asia2 ]; then
+    cmds+=("sudo systemctl enable isureal-db-pool.service")
+    if grep -Eq '^(etc/systemd/system/isureal-db-pool.service$|etc/isureal/pgbouncer.ini$|usr/local/libexec/isureal-db-pool$|usr/local/lib/isureal/pgbouncer-)' <<<"$changed"; then
+      cmds+=("sudo systemctl restart isureal-db-pool.service")
+    else
+      cmds+=("sudo systemctl start isureal-db-pool.service")
+    fi
+    cmds+=('. /home/isucon/env.sh' 'export PGPASSWORD="$ISUREAL_DB_PASSWORD" PGCONNECT_TIMEOUT=2'
+      'for i in {1..15}; do if psql -XAtqw -v ON_ERROR_STOP=1 -h 192.168.4.10 -p 6432 -U "$ISUREAL_DB_USER" -d "$ISUREAL_DB_NAME" -c "SELECT 1" >/dev/null; then break; fi; if [ "$i" = 15 ]; then echo "ERROR: DB pool did not accept a query"; exit 1; fi; sleep 1; done')
   fi
   grep -q '^etc/nginx/' <<<"$changed" &&
     cmds+=("sudo nginx -t -q && sudo systemctl reload nginx || echo 'ERROR: nginx -t failed; 旧設定のまま動作中。/var/tmp/infra-backup/$TS から戻す'")
@@ -82,11 +95,19 @@ deploy_host() {
   cmds+=("sudo /usr/local/bin/envcheck | grep -E '^  \"(passed|message)\"'")
 
   local script
-  script=$(printf '%s\n' "${cmds[@]}")
+  script=$(printf '%s\n' 'set -eu' "${cmds[@]}")
   $SSH "$addr" "$script" 2>&1 | sed "s|^|[$host] |"
 }
 
+if [[ " $HOSTS " == *" asia2 "* ]]; then
+  deploy_host asia2
+fi
+pids=()
 for host in $HOSTS; do
+  [ "$host" = asia2 ] && continue
   deploy_host "$host" &
+  pids+=("$!")
 done
-wait
+failed=0
+for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+exit "$failed"

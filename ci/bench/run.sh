@@ -46,6 +46,12 @@ ssh -i ~/.ssh/id_ed25519_github isucon@13.159.52.104 \
   'if sudo test -f /usr/local/lib/isureal/pgbouncer-1.26.1; then bash -s -- 0; fi' \
   <"$ROOT/infra/pgbouncer/permissions.sh"
 
+# A previous run may already have pointed the app units at asia2. Check
+# the pool (including an authenticated SELECT) before restarting any app.
+step=deploy-db
+infra/deploy.sh asia2 2>&1 | tee "$STATE_DIR/deploy-db.log"
+if grep -E '\] ERROR|"passed": false' "$STATE_DIR/deploy-db.log"; then false; fi
+
 step=deploy-app
 "$B/stage.sh" deploying
 ./deploy.sh 2>&1 | tee "$STATE_DIR/deploy-app.log"
@@ -53,7 +59,7 @@ n=$(grep -c ' deployed$' "$STATE_DIR/deploy-app.log" || true)
 [ "$n" = 3 ] || { echo "deploy.sh: $n/3 hosts deployed"; false; }
 
 step=deploy-infra
-infra/deploy.sh 2>&1 | tee "$STATE_DIR/deploy-infra.log"
+infra/deploy.sh asia1 europe1 america1 2>&1 | tee "$STATE_DIR/deploy-infra.log"
 if grep -E '\] ERROR|"passed": false' "$STATE_DIR/deploy-infra.log"; then false; fi
 
 step=initialize

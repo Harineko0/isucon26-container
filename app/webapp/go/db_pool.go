@@ -60,7 +60,7 @@ const dbPlanCacheMode = "force_generic_plan"
 
 // dbConnConfig は接続の設定。PostgreSQL に直接つなぐときは plan_cache_mode を起動パケットで送る (往復は増えない)。
 // PgBouncer は知らない起動パラメータを送るクライアントを拒むので、PgBouncer 宛てには送らず、
-// PgBouncer がサーバー接続を張るときの connect_query で設定する (infra/hosts/asia1/etc/isureal/pgbouncer.ini)。
+// PgBouncer がサーバー接続を張るときの connect_query で設定する (infra/hosts/asia2/etc/isureal/pgbouncer.ini)。
 func dbConnConfig(config *Config, direct bool) (*pgx.ConnConfig, error) {
 	connConfig, err := pgx.ParseConfig(config.DatabaseDSN())
 	if err != nil {
