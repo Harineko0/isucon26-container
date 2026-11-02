@@ -57,6 +57,7 @@ ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name;
 
 INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
 SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM initial_friend_requests;
+INSERT INTO fof_graph_active VALUES (true) ON CONFLICT DO NOTHING;
 INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id, created_at, updated_at)
 SELECT id, user_low_id, user_high_id, source_request_id, created_at, updated_at FROM initial_friendships;
 INSERT INTO follows (id, follower_id, followee_id, created_at, updated_at)
@@ -76,4 +77,4 @@ VACUUM (SKIP_LOCKED) user_search_norms;
 -- 空で統計も古い。autovacuum が回るまで（実測でベンチ開始から約55秒）Index Only Scan でも heap を読み、
 -- プランナーも古い統計で計画する（friendships_high_low を入れた #122 の後、friends-of-friends のフィードが読む
 -- ページが 269 → 482 に増えた）。合計約6.5万行の小さい表なので、ここで VACUUM (ANALYZE) しておく。
-VACUUM (ANALYZE, SKIP_LOCKED) friendships, friend_requests, follows, block_relations;
+VACUUM (ANALYZE, SKIP_LOCKED) friendships, friend_requests, follows, block_relations, fof_vertices;

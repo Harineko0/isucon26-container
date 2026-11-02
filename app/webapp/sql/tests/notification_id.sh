@@ -1,6 +1,6 @@
 #!/bin/bash
 # #27 の isureal_notification_id を、手元の Docker の PostgreSQL 16 で確かめる。
-#   - 投稿期間の開始処理の INSERT (admin_posting_window_api.go) と、SSE が投稿期間と利用者から組み立てる文
+#   - 投稿期間と一緒に保存した宛先を展開するビューと、SSE が投稿期間と利用者から組み立てる文
 #     (notification_api.go) が、同じ利用者に同じ id・created_at を返すこと。対象は開始時点でその
 #     リージョンにいる active な利用者だけであること
 #   - id が 36 文字の UUID 形式 (version 4、variant 8〜b) で、先頭 13 文字が以前と同じ開始時刻 (ミリ秒) の
@@ -26,17 +26,10 @@ INSERT INTO users(id, username, secret_key_hash, display_name, region, status)
 SELECT gen_random_uuid()::text, 'user' || i, 'x', 'U', (ARRAY['asia','europe','america'])[1 + i % 3],
        CASE WHEN i % 10 = 0 THEN 'deleted' ELSE 'active' END
 FROM generate_series(1, 3000) i;
-INSERT INTO posting_windows(id, region, local_date, starts_at, on_time_deadline)
+INSERT INTO posting_windows(id, region, local_date, starts_at, on_time_deadline, notification_recipients)
 VALUES ('6f1c1a8e-0d6b-4b8a-9a43-2f3b0d6e1f00', 'asia', '2026-11-01',
-        '2026-10-31 12:34:56.789123+09', '2026-11-01 12:34:56.789123+09');
-
--- 開始処理の INSERT (アプリと同じ文)
-PREPARE ins(text, text, timestamptz) AS
-   INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-   SELECT isureal_notification_id($2::text, users.id, $3::timestamptz), users.id, $2, $3
-   FROM users
-   WHERE region = $1 AND status = 'active';
-EXECUTE ins('asia', '6f1c1a8e-0d6b-4b8a-9a43-2f3b0d6e1f00', '2026-10-31 12:34:56.789123+09');
+        '2026-10-31 12:34:56.789123+09', '2026-11-01 12:34:56.789123+09',
+        ARRAY(SELECT id::text FROM users WHERE region='asia' AND status='active'));
 
 -- SSE の文 (アプリと同じ文)。接続中の利用者として全員を渡す
 PREPARE sse(text, text[]) AS
@@ -62,28 +55,37 @@ FROM (VALUES
 ) AS fixture(w, u, started, expected)
 WHERE isureal_notification_id(w, u, started::timestamptz) IS DISTINCT FROM expected;
 INSERT INTO failures
-SELECT 'no notifications inserted' WHERE NOT EXISTS (SELECT 1 FROM notifications);
+SELECT 'no notifications inserted' WHERE NOT EXISTS (SELECT 1 FROM isureal_notifications);
 INSERT INTO failures
-SELECT 'bad format: ' || id FROM notifications
+SELECT 'bad format: ' || id FROM isureal_notifications
 WHERE id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 INSERT INTO failures
-SELECT 'duplicate ids' WHERE (SELECT count(DISTINCT id) FROM notifications) <> (SELECT count(*) FROM notifications);
+SELECT 'duplicate ids' WHERE (SELECT count(DISTINCT id) FROM isureal_notifications) <> (SELECT count(*) FROM isureal_notifications);
 INSERT INTO failures
 SELECT 'variant ' || v || ' never used' FROM unnest(ARRAY['8','9','a','b']) v
-WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE substr(id, 20, 1) = v);
+WHERE NOT EXISTS (SELECT 1 FROM isureal_notifications WHERE substr(id, 20, 1) = v);
 -- 以前の式の先頭 13 文字 (開始時刻のミリ秒)
 INSERT INTO failures
-SELECT 'time prefix differs: ' || n.id FROM notifications n,
+SELECT 'time prefix differs: ' || n.id FROM isureal_notifications n,
   (SELECT lpad(to_hex((extract(epoch FROM '2026-10-31 12:34:56.789123+09'::timestamptz) * 1000)::bigint), 12, '0') AS ts) old
 WHERE substr(n.id, 1, 13) <> substr(old.ts, 1, 8) || '-' || substr(old.ts, 9, 4);
 INSERT INTO failures
 SELECT 'sse/insert mismatch for ' || coalesce(g.user_id, n.user_id)
-FROM got g FULL JOIN notifications n ON n.user_id = g.user_id
+FROM got g FULL JOIN isureal_notifications n ON n.user_id = g.user_id
 WHERE (g.user_active AND g.user_region = 'asia') IS DISTINCT FROM (n.id IS NOT NULL)
    OR (n.id IS NOT NULL AND (n.id <> g.id OR n.created_at <> g.created_at));
 
 SELECT 'notifications: ' || count(*) || ', sse rows: ' || (SELECT count(*) FROM got) || ', sample id: ' || min(id)
-FROM notifications;
+FROM isureal_notifications;
+-- Legacy notification IDs may have been random. Preserve them verbatim, even
+-- when the same user belongs to a newer window or an empty audience is stored.
+INSERT INTO posting_windows(id,region,local_date,starts_at,on_time_deadline,notification_recipients)
+VALUES ('legacy','europe','2026-10-01',now(),now(),NULL), ('empty','america','2026-10-01',now(),now(),'{}');
+INSERT INTO notifications(id,user_id,posting_window_id,created_at)
+SELECT 'legacy-id', min(id), 'legacy', now() FROM users;
+INSERT INTO failures SELECT 'legacy ID or empty region changed'
+WHERE (SELECT count(*) FROM isureal_notifications WHERE posting_window_id='legacy' AND id='legacy-id') <> 1
+   OR EXISTS (SELECT FROM isureal_notifications WHERE posting_window_id='empty');
 SELECT 'FAIL ' || what FROM failures LIMIT 20;
 SELECT CASE WHEN EXISTS (SELECT 1 FROM failures) THEN 'FAILED' ELSE 'OK' END;
 SQL

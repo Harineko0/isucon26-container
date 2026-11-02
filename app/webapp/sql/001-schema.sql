@@ -1,3 +1,4 @@
+DROP VIEW IF EXISTS isureal_notifications;
 DROP TABLE IF EXISTS
   ip_bans,
   notifications,
@@ -12,6 +13,8 @@ DROP TABLE IF EXISTS
   block_relations,
   follows,
   friendships,
+  fof_vertices,
+  fof_graph_active,
   administrator_sessions,
   login_sessions,
   administrators,

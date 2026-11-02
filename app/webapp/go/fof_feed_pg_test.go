@@ -1,13 +1,27 @@
 package isureal
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/jmoiron/sqlx"
 )
+
+func installTestFriendGraph(t *testing.T, db *sqlx.DB) {
+	t.Helper()
+	graphDDL, err := os.ReadFile("../sql/009-friend-graph.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.MustExec(string(graphDDL))
+}
 
 func TestFriendsOfFriendsFeedOnPostgres(t *testing.T) {
 	db := memoryTestDB(t)
+	installTestFriendGraph(t, db)
 	db.MustExec(`
 INSERT INTO login_sessions(id,user_id,token_hash) VALUES ('session','u1','token');
 INSERT INTO posting_windows(id,region,local_date,starts_at,on_time_deadline,ended_at) VALUES
@@ -120,4 +134,101 @@ UPDATE posts SET caption='edited' WHERE id='fof-06';`)
 	if rows := read(true, nil); len(rows) != 0 {
 		t.Fatal("revoked session returned a row")
 	}
+}
+
+func TestFriendGraphTransactionsOnPostgres(t *testing.T) {
+	db := memoryTestDB(t)
+	db.MustExec(`INSERT INTO friendships(id,user_low_id,user_high_id) VALUES
+	    ('ab','u1','u2'), ('ba','u2','u1'), ('loop','u2','u2')`)
+	installTestFriendGraph(t, db)
+	installTestFriendGraph(t, db)
+	check := func() {
+		t.Helper()
+		var different bool
+		err := db.Get(&different, `WITH expected AS (
+		    SELECT user_low_id AS id,user_high_id AS peer FROM friendships
+		    UNION ALL SELECT user_high_id,user_low_id FROM friendships WHERE user_high_id<>user_low_id
+		), actual AS (
+		    SELECT v.user_id AS id, n.name AS peer, p.user_id AS decoded
+		    FROM fof_vertices v CROSS JOIN unnest(v.neighbors,v.neighbor_ids) n(slot,name)
+		    LEFT JOIN fof_vertices p ON p.slot=n.slot
+		) SELECT EXISTS (SELECT * FROM expected EXCEPT ALL SELECT id,peer FROM actual)
+		      OR EXISTS (SELECT id,peer FROM actual EXCEPT ALL SELECT * FROM expected)
+		      OR EXISTS (SELECT FROM actual WHERE peer IS DISTINCT FROM decoded)`)
+		if err != nil || different {
+			t.Fatalf("projection differs from committed edges (%v)", err)
+		}
+	}
+	check()
+	// Different pairs contend on a shared endpoint. The second statement starts
+	// before the first commits, so rebuilding from its original snapshot would
+	// lose the first writer's edge. An independent reader still sees the old graph.
+	first := db.MustBegin()
+	defer first.Rollback()
+	first.MustExec(`INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('ac','u1','u3')`)
+	second := db.MustBegin()
+	defer second.Rollback()
+	var pid int
+	if err := second.Get(&pid, "SELECT pg_backend_pid()"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := second.ExecContext(ctx, `INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('ad','u1','u4')`)
+		done <- err
+	}()
+	for {
+		var waiting bool
+		if err := db.GetContext(ctx, &waiting, "SELECT cardinality(pg_blocking_pids($1)) > 0", pid); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("second writer did not wait for the common endpoint (%v)", err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	check()
+	if err := first.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check()
+	db.MustExec(`UPDATE friendships SET user_high_id='u4' WHERE id='loop';
+	    DELETE FROM friendships WHERE id IN ('ab','ac')`)
+	check()
+	// reset.sql restores the edges in bulk while ordinary triggers are disabled.
+	// A failed reset must restore both the old projection and its slot allocator.
+	db.MustExec(`BEGIN; SET LOCAL session_replication_role = replica;
+	    TRUNCATE friendships; INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('temp','u5','u6');
+	    ROLLBACK`)
+	check()
+	db.MustExec(`BEGIN; SET LOCAL session_replication_role = replica; TRUNCATE friendships;
+	    INSERT INTO fof_graph_active VALUES (true);
+	    INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('x','u5','u6'),('y','u6','u7'); COMMIT`)
+	check()
+	var count int
+	if err := db.Get(&count, "SELECT count(*) FROM fof_vertices"); err != nil || count != 3 {
+		t.Fatalf("vertices after reset = %d (%v)", count, err)
+	}
+	// An older reset truncates and restores friendships under replica mode but
+	// does not opt in. Its subsequent normal writers must not maintain our index.
+	db.MustExec(`BEGIN; SET LOCAL session_replication_role = replica; TRUNCATE friendships;
+	    INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('old','u1','u2'); COMMIT;
+	    INSERT INTO friendships(id,user_low_id,user_high_id) VALUES ('live','u2','u3')`)
+	if err := db.Get(&count, "SELECT count(*) FROM fof_vertices"); err != nil || count != 0 {
+		t.Fatalf("inactive graph received legacy writes: %d (%v)", count, err)
+	}
+	installTestFriendGraph(t, db)
+	check()
 }

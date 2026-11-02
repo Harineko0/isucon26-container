@@ -132,5 +132,5 @@ func registerRoutes(e *echo.Echo, h *HandlerContext, control *sqlx.DB) {
 	e.POST("/api/admin/auth/logout", adminLogoutHandler(h), AdminSessionMiddleware(h, true))
 	e.PUT("/api/admin/users/:userId/certification", certifyUserHandler(h), AdminSessionMiddleware(h, true))
 	e.DELETE("/api/admin/users/:userId/certification", deleteUserCertificationHandler(h), AdminSessionMiddleware(h, true))
-	registerAdminPostingWindow(e, control, h.DB)
+	registerAdminPostingWindow(e, control)
 }
