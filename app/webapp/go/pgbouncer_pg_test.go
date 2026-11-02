@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/jmoiron/sqlx"
@@ -27,12 +28,36 @@ func TestPgBouncerPlanCacheModeOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer primary.Close()
-	db, control, err := openRequestDBs(config, primary, host+":"+port)
+	db, reads, control, err := openRequestDBs(config, primary, host+":"+port, "isureal_reads")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	defer reads.Close()
 	defer control.Close()
+	// A write acknowledged on the regular alias must be visible on the read alias.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE pool_witness (id int PRIMARY KEY); INSERT INTO pool_witness VALUES (42)"); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("DROP TABLE pool_witness")
+	t.Run("read after commit while every write backend is occupied", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		for range 16 {
+			tx, err := db.BeginTxx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			if _, err := tx.ExecContext(ctx, "SELECT 1"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var id int
+		if err := reads.GetContext(ctx, &id, "SELECT id FROM pool_witness"); err != nil || id != 42 {
+			t.Fatalf("read after commit: id=%d err=%v", id, err)
+		}
+	})
 	conns := make([]*sqlx.Conn, 4)
 	for i := range conns {
 		if conns[i], err = db.Connx(ctx); err != nil {

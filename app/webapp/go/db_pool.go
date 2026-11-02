@@ -99,36 +99,54 @@ func openPostgresDB(config *Config, direct bool) (*sqlx.DB, error) {
 // When a transaction pool is configured, bulk requests share its backends.
 // Split the existing four direct connections between window transitions and
 // the watcher (one LISTEN connection and one subscriber check).
-func openRequestDBs(config *Config, primary *sqlx.DB, address string) (request, control *sqlx.DB, err error) {
+func openRequestDBs(config *Config, primary *sqlx.DB, address, readName string) (write, read, control *sqlx.DB, err error) {
 	if address == "" {
-		return primary, primary, nil
+		return primary, primary, primary, nil
 	}
 	pooled := *config
 	pooled.DBHost, pooled.DBPort, err = net.SplitHostPort(address)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid application DB pool address: %w", err)
+		return nil, nil, nil, fmt.Errorf("invalid application DB pool address: %w", err)
 	}
-	db, err := openPostgresDB(&pooled, false)
+	write, err = openPostgresDB(&pooled, false)
 	if err != nil {
-		return nil, nil, err
-	}
-	if config.Region != "asia" {
-		// These are client sockets to PgBouncer. Most of their time is
-		// spent in flight across the WAN, outside a database transaction.
-		db.SetMaxOpenConns(128)
-		db.SetMaxIdleConns(128)
+		return nil, nil, nil, err
 	}
 	control, err = openDB(config)
 	if err != nil {
-		db.Close()
-		return nil, nil, err
+		write.Close()
+		return nil, nil, nil, err
 	}
-	const maxWindowConns = 2
+	clients := 64
+	if config.Region != "asia" {
+		clients = 128
+	}
+	read = write
+	if readName != "" {
+		pooled.DBName = readName // PgBouncer alias for the same primary database.
+		read, err = openPostgresDB(&pooled, false)
+		if err != nil {
+			write.Close()
+			control.Close()
+			return nil, nil, nil, err
+		}
+		// Keep enough WAN connections in flight, and fit all three regions
+		// within max_client_conn even when both workloads peak together.
+		readClients := 64
+		clients = 48
+		if config.Region != "asia" {
+			readClients = 80
+		}
+		read.SetMaxOpenConns(readClients)
+		read.SetMaxIdleConns(readClients)
+	}
+	write.SetMaxOpenConns(clients)
+	write.SetMaxIdleConns(clients)
 	for _, pool := range []*sqlx.DB{primary, control} {
-		pool.SetMaxOpenConns(maxWindowConns)
-		pool.SetMaxIdleConns(maxWindowConns)
+		pool.SetMaxOpenConns(2)
+		pool.SetMaxIdleConns(2)
 	}
-	return db, control, nil
+	return write, read, control, nil
 }
 
 // warmUpDBPool はプールの全接続を起動時に張っておき、ベンチ開始直後のリクエストが

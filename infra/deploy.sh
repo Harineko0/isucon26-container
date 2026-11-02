@@ -79,7 +79,13 @@ deploy_host() {
       cmds+=("sudo systemctl start isureal-db-pool.service")
     fi
     cmds+=('. /home/isucon/env.sh' 'export PGPASSWORD="$ISUREAL_DB_PASSWORD" PGCONNECT_TIMEOUT=2'
-      'for i in {1..15}; do if psql -XAtqw -v ON_ERROR_STOP=1 -h 192.168.4.10 -p 6432 -U "$ISUREAL_DB_USER" -d "$ISUREAL_DB_NAME" -c "SELECT 1" >/dev/null; then break; fi; if [ "$i" = 15 ]; then echo "ERROR: DB pool did not accept a query"; exit 1; fi; sleep 1; done')
+      'for db in "$ISUREAL_DB_NAME" isureal_reads; do
+         for i in {1..15}; do
+           if psql -XAtqw -v ON_ERROR_STOP=1 -h 192.168.4.10 -p 6432 -U "$ISUREAL_DB_USER" -d "$db" -c "SELECT 1" >/dev/null; then break; fi
+           if [ "$i" = 15 ]; then echo "ERROR: pool $db did not accept a query"; exit 1; fi
+           sleep 1
+         done
+       done')
   fi
   grep -q '^etc/nginx/' <<<"$changed" &&
     cmds+=("sudo nginx -t -q && sudo systemctl reload nginx || echo 'ERROR: nginx -t failed; 旧設定のまま動作中。/var/tmp/infra-backup/$TS から戻す'")

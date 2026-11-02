@@ -27,7 +27,7 @@ infra/pull.sh asia2 /etc/foo.conf    # 新しいファイルを管理対象に�
 
 ## アプリの DB 接続
 
-各アプリはリージョン間のルーターを通る通常の経路で、asia2 のプライベートアドレスの PgBouncer（192.168.4.10:6432）に接続する。PgBouncer から PostgreSQL までは同じホストの loopback を使う。プーラー側は 16 トランザクションを並行実行し、アプリ側は Asia 64、Europe・America 各 128 接続で往復を待てる。initialize の psql と投稿期間 watcher は元の接続先を使う。
+各アプリはリージョン間のルーターを通る通常の経路で、asia2 のプライベートアドレスの PgBouncer（192.168.4.10:6432）に接続する。PgBouncer から PostgreSQL までは同じホストの loopback を使う。フィード・画像などの読み取りは同じ DB の別名 `isureal_reads` に接続し、専用の 8 バックエンドを使う。書き込み、検索用データの更新を伴うユーザー検索、その他の処理は 16 バックエンドを使う。アプリ側の接続上限は通常処理が各 48、読み取りが Asia 64、Europe・America 各 80 で、合計は 368。initialize の psql と投稿期間 watcher は元の接続先を使う。
 
 CI は先に asia2 にプーラーを配り、アプリと同じ資格情報で SELECT が通ってから 3 台のアプリを更新する。初回は `pgbouncer/Dockerfile` から静的バイナリをビルドする。`isureal-db-pool.service` は起動のたびに PostgreSQL から SCRAM 検証子を専用のランタイムディレクトリへ読み込む。サービスは OS の起動時にも立ち上がり、DB の準備に失敗した場合は systemd が再試行する。
 

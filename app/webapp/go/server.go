@@ -42,25 +42,14 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	db, control, err := openRequestDBs(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"))
+	db, reads, control, err := openRequestDBs(config, primary, os.Getenv("ISUREAL_APP_DB_POOL"), os.Getenv("ISUREAL_APP_DB_READ_NAME"))
 	if err != nil {
 		panic("failed to open application DB pool: " + err.Error())
 	}
-	err = db.Ping()
-	if err != nil {
-		panic("failed to ping database: " + err.Error())
+	startRequestPool(db, "requests")
+	if reads != db {
+		startRequestPool(reads, "reads")
 	}
-	go warmUpDBPool(db, db.Stats().MaxOpenConnections)
-
-	go func() {
-		// 接続プールの待ちを観測する (stderr → journal。guard は JSON の行しか読まない)。
-		for range time.Tick(5 * time.Second) {
-			st := db.Stats()
-			if st.WaitCount > 0 || st.InUse > 0 {
-				fmt.Fprintf(os.Stderr, "dbstats open=%d inuse=%d idle=%d wait=%d waitdur=%s\n", st.OpenConnections, st.InUse, st.Idle, st.WaitCount, st.WaitDuration)
-			}
-		}
-	}()
 
 	handlerContext := &HandlerContext{
 		DB:      db,
@@ -68,8 +57,10 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans:  ipBans,
 		Windows: newPostingWindowWatcher(primary, config.Region),
 	}
-	handlerContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
-		return loadImageReadBatch(ctx, handlerContext, rel, takeRequests)
+	readContext := *handlerContext
+	readContext.DB = reads
+	readContext.imageReads = &imageReads{load: func(ctx context.Context, rel string, takeRequests func() []imageReadRequest) []imageReadResult {
+		return loadImageReadBatch(ctx, &readContext, rel, takeRequests)
 	}}
 	e.Pre(InternalMiddleware(handlerContext))
 	go ipBans.abuse.writeLoop(db)
@@ -84,45 +75,60 @@ func NewServer(config *Config) *echo.Echo {
 		go prewarmDB(db, "startup")
 	}
 
-	registerRoutes(e, handlerContext, control)
+	registerRoutes(e, handlerContext, &readContext, control)
 
 	return e
 }
 
+func startRequestPool(db *sqlx.DB, name string) {
+	if err := db.Ping(); err != nil {
+		panic("failed to ping " + name + " pool: " + err.Error())
+	}
+	go warmUpDBPool(db, db.Stats().MaxOpenConnections)
+	go func() {
+		for range time.Tick(5 * time.Second) {
+			st := db.Stats()
+			if st.WaitCount > 0 || st.InUse > 0 {
+				fmt.Fprintf(os.Stderr, "dbstats open=%d inuse=%d idle=%d wait=%d waitdur=%s pool=%s\n", st.OpenConnections, st.InUse, st.Idle, st.WaitCount, st.WaitDuration, name)
+			}
+		}
+	}()
+}
+
 // registerRoutes は API のルートを登録する。テスト (roundtrip_routes_test.go) も同じ表を使う。
-func registerRoutes(e *echo.Echo, h *HandlerContext, control *sqlx.DB) {
+func registerRoutes(e *echo.Echo, h, reads *HandlerContext, control *sqlx.DB) {
 	e.POST("/api/initialize", initializeHandler(h))
 	e.POST("/api/auth/register", registerHandler(h))
 	e.POST("/api/auth/login", loginHandler(h))
 	e.POST("/api/auth/logout", logoutHandler(h), SessionMiddleware(h, true))
 	e.GET("/api/users", searchUsersHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/users/:userId", getUserHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/me/export", exportPostsHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/me", getMeHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/users/:userId", getUserHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
+	e.GET("/api/me/export", exportPostsHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
+	e.GET("/api/me", getMeHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.PATCH("/api/me", updateMeHandler(h), SessionMiddleware(h, true))
 	e.PUT("/api/me/profile-image", putProfileImageHandler(h), SessionMiddleware(h, true))
 	e.DELETE("/api/me/profile-image", deleteProfileImageHandler(h), SessionMiddleware(h, true))
 	e.POST("/api/me/account-deletion", deleteAccountHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	e.POST("/api/posts", createPostHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/posting-window/current", getCurrentPostingWindowHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/posts/me/current", getMyCurrentPostHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/posts/:postId", getPostHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/posting-window/current", getCurrentPostingWindowHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
+	e.GET("/api/posts/me/current", getMyCurrentPostHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
+	e.GET("/api/posts/:postId", getPostHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.PATCH("/api/posts/:postId", updatePostHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	e.DELETE("/api/posts/:postId", deletePostHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/feeds/:feed", getFeedHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/memories", getMemoriesHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/memories/:date", getMemoriesByDateHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/feeds/:feed", getFeedHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
+	e.GET("/api/memories", getMemoriesHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
+	e.GET("/api/memories/:date", getMemoriesByDateHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.POST("/api/posts/:postId/comments", createCommentHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/posts/:postId/comments", getCommentsHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/posts/:postId/comments", getCommentsHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.DELETE("/api/comments/:commentId", deleteCommentHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	e.POST("/api/posts/:postId/realmojis", replaceRealMojiHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/posts/:postId/realmojis", getRealMojisHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/posts/:postId/realmojis", getRealMojisHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.DELETE("/api/realmojis/:realMojiId", deleteRealMojiHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/images/:imageId", getImageHandler(h))
-	e.GET("/api/notifications", getNotificationsHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/images/:imageId", getImageHandler(reads))
+	e.GET("/api/notifications", getNotificationsHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.POST("/api/friend-requests", createFriendRequestHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	e.POST("/api/friend-requests/:requestId/:action", transitionFriendRequestHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
-	e.GET("/api/relationships/:kind", getRelationshipsHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
+	e.GET("/api/relationships/:kind", getRelationshipsHandler(reads), SessionMiddleware(reads, true), RegionMiddleware(reads))
 	e.DELETE("/api/friendships/:userId", deleteFriendshipHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	e.PUT("/api/follows/:userId", followHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))
 	e.DELETE("/api/follows/:userId", unfollowHandler(h), SessionMiddleware(h, true), RegionMiddleware(h))

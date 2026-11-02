@@ -17,17 +17,17 @@ func TestRequestPoolKeepsSessionConnectionsOnPrimary(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer primary.Close()
-			direct, control, err := openRequestDBs(cfg, primary, "")
-			if err != nil || direct != primary || control != primary || direct.Stats().MaxOpenConnections != dbMaxConns(region) {
+			direct, reads, control, err := openRequestDBs(cfg, primary, "", "")
+			if err != nil || direct != primary || reads != primary || control != primary || direct.Stats().MaxOpenConnections != dbMaxConns(region) {
 				t.Fatalf("direct pool changed: %v", err)
 			}
-			pooled, control, err := openRequestDBs(cfg, primary, "127.0.0.2:6432")
+			pooled, reads, control, err := openRequestDBs(cfg, primary, "127.0.0.2:6432", "")
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer pooled.Close()
 			defer control.Close()
-			if pooled == primary || control == primary || control == pooled || pooled.Stats().MaxOpenConnections != want || primary.Stats().MaxOpenConnections != 2 || control.Stats().MaxOpenConnections != 2 {
+			if pooled == primary || reads != pooled || control == primary || control == pooled || pooled.Stats().MaxOpenConnections != want || primary.Stats().MaxOpenConnections != 2 || control.Stats().MaxOpenConnections != 2 {
 				t.Fatalf("unexpected limits: app %d, watcher %d, control %d", pooled.Stats().MaxOpenConnections, primary.Stats().MaxOpenConnections, control.Stats().MaxOpenConnections)
 			}
 			if cfg.DBHost != "127.0.0.1" || cfg.DBPort != "5432" {
