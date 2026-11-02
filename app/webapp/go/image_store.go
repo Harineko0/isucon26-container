@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -134,6 +135,12 @@ func writeImageFileDurable(path string, data []byte) error {
 }
 
 const maxPeerImageBytes = 64 << 20
+
+// The origin has already synced the original before posting its metadata.
+// Bound the per-transfer allocation as well as the resident byte cache.
+const maxRAMReplicaBytes = min(2<<20, imageDataMaxEntryBytes)
+
+var replicaPushBytesInRAM = expvar.NewInt("image_replica_push_bytes_in_ram")
 
 var errInvalidImageBody = errors.New("invalid image body")
 
@@ -320,15 +327,18 @@ func fetchAndCacheImage(id, storedRegion, selfRegion string) ([]byte, error) {
 	imageFetchCalls[id] = call
 	imageFetchMu.Unlock()
 
+	version := imageDataStore.version()
 	call.data, call.err = fetchImageFromPeers(id, storedRegion, selfRegion)
 	if call.err == nil {
-		imageDataStore.put(id, call.data)
+		imageDataStore.putReplica(id, call.data, version)
 	}
 	imageFetchMu.Lock()
 	delete(imageFetchCalls, id)
 	imageFetchMu.Unlock()
 	close(call.done)
-	if call.err == nil {
+	// Always repair a missing authoritative copy. A small remote replica can
+	// be fetched again from its durable origin after eviction or restart.
+	if call.err == nil && (selfRegion == storedRegion || len(call.data) > maxRAMReplicaBytes) {
 		data := call.data
 		imageTransfers.jobs.Go(func() {
 			if path, ok := imageStorePath(id); ok {
@@ -428,6 +438,16 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 				}
 				if r.ContentLength > maxPeerImageBytes {
 					return c.NoContent(http.StatusBadRequest)
+				}
+				if r.ContentLength > 0 && r.ContentLength <= maxRAMReplicaBytes {
+					version := imageDataStore.version()
+					data, err := readUpload(io.LimitReader(r.Body, r.ContentLength+1), r.ContentLength)
+					if err != nil || int64(len(data)) != r.ContentLength {
+						return c.NoContent(http.StatusBadRequest)
+					}
+					imageDataStore.putReplica(id, data, version)
+					replicaPushBytesInRAM.Add(int64(len(data)))
+					return c.NoContent(http.StatusNoContent)
 				}
 				body := http.MaxBytesReader(nil, r.Body, maxPeerImageBytes)
 				if err := writeImageFileDurableFrom(dst, peerImageBody{body}); err != nil {

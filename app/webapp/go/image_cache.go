@@ -244,6 +244,7 @@ type imageDataCache struct {
 	current      map[string][]byte
 	previous     map[string][]byte
 	currentBytes int
+	resetVersion uint64
 }
 
 var imageDataStore = newImageDataCache()
@@ -278,11 +279,30 @@ func (c *imageDataCache) get(id string) ([]byte, bool) {
 }
 
 func (c *imageDataCache) put(id string, data []byte) {
-	if data == nil || len(data) > imageDataMaxEntryBytes {
-		return
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.putLocked(id, data)
+}
+
+func (c *imageDataCache) version() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.resetVersion
+}
+
+// A transfer which started before initialize must not refill the cleared cache.
+func (c *imageDataCache) putReplica(id string, data []byte, version uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.resetVersion == version {
+		c.putLocked(id, data)
+	}
+}
+
+func (c *imageDataCache) putLocked(id string, data []byte) {
+	if len(data) == 0 || len(data) > imageDataMaxEntryBytes {
+		return
+	}
 	if _, ok := c.current[id]; ok {
 		return
 	}
@@ -301,4 +321,5 @@ func (c *imageDataCache) reset() {
 	c.current = map[string][]byte{}
 	c.previous = map[string][]byte{}
 	c.currentBytes = 0
+	c.resetVersion++
 }

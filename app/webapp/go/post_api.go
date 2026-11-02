@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"expvar"
 	"image/jpeg"
 	"mime/multipart"
 	"net/http"
@@ -111,6 +112,9 @@ const createPostCall = `isureal_create_post({user}, $1, $2, $3, $4, $5, $6, $7, 
 
 var createPostSQL = deferredMutationSQL("r.*", createPostCall, 10)
 
+// Cumulative wall time of successful posts, sampled through the local debug listener.
+var postCreateMicros = expvar.NewMap("post_create_micros")
+
 func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return createPostHandlerWithQueue(h, &writeQueue[createPostRow]{db: h.DB, sql: createPostSQL})
 }
@@ -118,6 +122,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPostRow]) echo.HandlerFunc {
 	gate := newCreatePostGate(h.Config.Region)
 	return func(c *echo.Context) error {
+		started := time.Now()
 		var input createPostRequest
 		formImage, err := bindImageForm(c, &input)
 		if err != nil {
@@ -144,6 +149,7 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		}
 		// Both checks give the same 400, so reject oversized images from the
 		// header before validating the whole entropy-coded stream.
+		bound := time.Now()
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
@@ -154,15 +160,18 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		// 投稿時刻 (posted_at) は isureal_create_post の中で DB の時計から決まり、o_posted_at で返る
 		// (投稿期間の starts_at / ended_at と同じ時計にそろえる。アプリの時計で先に決めると、
 		// 期間の切り替えを待った投稿が starts_at より前の時刻になり 409 になっていた)。
+		validated := time.Now()
 		imageID := newImageID(h.Config.Region)
 		postID := newTimeID()
 		// 本体はこのサーバーのディスクに fsync してから、DB にはメタデータだけを入れる (image_store.go)。
 		// ディスクへの書き込みは gate の外で済ませ、gate では DB の呼び出しだけを絞る。
 		dbImageData, storedRegion := storeUploadedImage(imageID, imageData, h.Config.Region)
+		stored := time.Now()
 		if err := gate.acquire(c.Request().Context()); err != nil {
 			discardUploadedImage(imageID, storedRegion)
 			return err
 		}
+		acquired := time.Now()
 		proofs := committedPostImages.Load()
 		var row createPostRow
 		args := []any{imageID, postID, dbImageData, input.Caption, input.Visibility,
@@ -175,6 +184,7 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 			err = callWithSession(c, h, &row, func() *string { return row.SessRegion }, createPostCall, args...)
 		}
 		gate.release()
+		committed := time.Now()
 		if err != nil {
 			return err
 		}
@@ -207,7 +217,17 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		proofs.Store(imageID, postImageProof{postID: postID, ownerID: user.ID})
 		imageDataStore.put(imageID, imageData)
 		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
-		return c.JSON(http.StatusCreated, newPostResponse(post, user))
+		err = c.JSON(http.StatusCreated, newPostResponse(post, user))
+		if err == nil {
+			postCreateMicros.Add("count", 1)
+			postCreateMicros.Add("bind", bound.Sub(started).Microseconds())
+			postCreateMicros.Add("jpeg", validated.Sub(bound).Microseconds())
+			postCreateMicros.Add("store", stored.Sub(validated).Microseconds())
+			postCreateMicros.Add("gate", acquired.Sub(stored).Microseconds())
+			postCreateMicros.Add("db", committed.Sub(acquired).Microseconds())
+			postCreateMicros.Add("response", time.Since(committed).Microseconds())
+		}
+		return err
 	}
 }
 

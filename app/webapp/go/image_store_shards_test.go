@@ -156,6 +156,9 @@ func TestPeerImageTransferUsesShardedStoreAndReadsLegacy(t *testing.T) {
 	for _, legacy := range []bool{false, true} {
 		id := newImageID("america")
 		data := []byte(fmt.Sprintf("peer bytes legacy=%t", legacy))
+		if !legacy {
+			data = bytes.Repeat([]byte{0xac}, maxRAMReplicaBytes+1) // streamed disk replica
+		}
 		if legacy {
 			if err := writeImageFileDurable(filepath.Join(imageStoreDir, id[:2], id), data); err != nil {
 				t.Fatal(err)
