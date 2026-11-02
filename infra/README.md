@@ -32,3 +32,5 @@ infra/pull.sh asia2 /etc/foo.conf    # 新しいファイルを管理対象に�
 CI は先に asia2 にプーラーを配り、アプリと同じ資格情報で SELECT が通ってから 3 台のアプリを更新する。初回は `pgbouncer/Dockerfile` から静的バイナリをビルドする。`isureal-db-pool.service` は起動のたびに PostgreSQL から SCRAM 検証子を専用のランタイムディレクトリへ読み込む。サービスは OS の起動時にも立ち上がり、DB の準備に失敗した場合は systemd が再試行する。
 
 プーラー用の `/usr/local/lib/isureal` とバイナリは CI が `0755` にそろえる。以前の asia1 版へ戻す場合は、CI で全アプリの接続先を戻してから asia2 の `isureal-db-pool.service` を停止し、自動起動を解除する。
+
+asia1 の JPEG 検証枠が埋まったときは、64 KiB〜2 MiB の画像を同じリージョンの asia2 にも振り分ける。CI が同じコミットから検証器をビルドし、`isureal-jpeg-worker.service` として private IP の 6433 番で起動する。処理は 1 CPU に制限し、PostgreSQL より低い優先度で動かす。通信や検証サービスに障害があればアプリ内で検証する。画像の原本は受付リージョンで永続化する。

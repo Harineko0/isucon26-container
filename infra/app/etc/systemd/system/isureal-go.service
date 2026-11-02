@@ -13,6 +13,7 @@ EnvironmentFile=/home/isucon/env.sh
 Environment=GOMEMLIMIT=2GiB
 Environment=ISUREAL_LISTEN_HOST=127.0.0.1
 Environment=ISUREAL_APP_DB_POOL=192.168.4.10:6432
+Environment=ISUREAL_ASIA_JPEG_WORKER=http://192.168.4.10:6433
 Environment=ISUREAL_APP_DB_READ_NAME=isureal_reads
 ExecStart=/home/isucon/webapp/go/isureal
 Restart=on-failure

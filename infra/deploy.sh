@@ -24,6 +24,12 @@ if [ -z "$DRY" ] && [[ " $HOSTS " == *" asia2 "* ]] &&
     --output "type=local,dest=$INFRA_DIR/hosts/asia2/usr/local/lib/isureal" "$INFRA_DIR/pgbouncer"
 fi
 
+if [ -z "$DRY" ] && [[ " $HOSTS " == *" asia2 "* ]]; then
+  worker="$INFRA_DIR/hosts/asia2/usr/local/lib/isureal/jpegworker"
+  mkdir -p "$(dirname "$worker")"
+  (cd "$INFRA_DIR/../app/webapp/go" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 go build -trimpath -o "$worker" ./cmd/jpegworker)
+fi
+
 # -a は使わない（/ や /etc の所有者・権限が手元のものに置き換わる）。
 # 既存ファイルの所有者と権限はそのまま、新規ファイルは root 所有になる。
 RSYNC_OPTS=(-rlc --no-perms --no-owner --no-group --omit-dir-times
@@ -78,6 +84,13 @@ deploy_host() {
     else
       cmds+=("sudo systemctl start isureal-db-pool.service")
     fi
+    cmds+=("sudo systemctl enable isureal-jpeg-worker.service")
+    if grep -Eq '^(etc/systemd/system/isureal-jpeg-worker.service$|usr/local/lib/isureal/jpegworker$)' <<<"$changed"; then
+      cmds+=("sudo systemctl restart isureal-jpeg-worker.service")
+    else
+      cmds+=("sudo systemctl start isureal-jpeg-worker.service")
+    fi
+    cmds+=("curl -fsS --retry 10 --retry-connrefused --retry-delay 1 --max-time 3 http://192.168.4.10:6433/ready")
     cmds+=('. /home/isucon/env.sh' 'export PGPASSWORD="$ISUREAL_DB_PASSWORD" PGCONNECT_TIMEOUT=2'
       'for db in "$ISUREAL_DB_NAME" isureal_reads; do
          for i in {1..15}; do
