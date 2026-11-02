@@ -9,6 +9,12 @@ cd "$B/../.."
 if [ ! -s "$STATE_DIR/job.json" ] && [ -s "$STATE_DIR/job_id" ]; then
   python3 "$B/portal.py" show "$(cat "$STATE_DIR/job_id")" >"$STATE_DIR/job.json" || rm -f "$STATE_DIR/job.json"
 fi
+# 自作ベンチが走り始めたあとに run が落ちた・キャンセルされた場合（replica/ に bench.log がある）
+if [ ! -s "$STATE_DIR/job.json" ] && [ -s "$STATE_DIR/replica/bench.log" ]; then
+  python3 "$B/replica_job.py" "$STATE_DIR/replica" >"$STATE_DIR/job.json" || rm -f "$STATE_DIR/job.json"
+fi
+# 複製スタックのロックを返す（取っていなければ何もしない）
+"$B/stacklock.sh" release || echo "warn: stack lock release failed"
 
 if [ -s "$STATE_DIR/job.json" ]; then
   line=$(python3 "$B/report.py" record)
@@ -24,7 +30,7 @@ if [ -s "$STATE_DIR/job.json" ]; then
     echo "$line" >>"$tmp/results.jsonl"
     git -C "$tmp" add results.jsonl
     git -C "$tmp" -c user.name=isucon-bench -c user.email=bench@users.noreply.github.com \
-      commit -qm "bench #$(jq -r .id "$STATE_DIR/job.json"): $(jq -r .score "$STATE_DIR/job.json")"
+      commit -qm "bench $(jq -r '(.bench // "official") + " #" + (.id | tostring)' "$STATE_DIR/job.json"): $(jq -r .score "$STATE_DIR/job.json")"
     git -C "$tmp" push -q origin HEAD:refs/heads/bench-results && ok=1
     git worktree remove -f "$tmp"
     [ -n "${ok:-}" ] && break

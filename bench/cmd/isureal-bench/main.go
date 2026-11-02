@@ -34,7 +34,7 @@ func main() {
 		initTO   = flag.Duration("initialize-timeout", 60*time.Second, "初期化のタイムアウト")
 		skipInit = flag.Bool("skip-initialize", false, "POST /api/initialize を省く (開発用)")
 		skipPre  = flag.Bool("skip-precheck", false, "整合性チェックを省く (開発用)")
-		start    = flag.String("start-date", time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"), "manifest が無いときの最初の投稿期間の localDate")
+		start    = flag.String("start-date", "", "manifest が無いときの最初の投稿期間の localDate (空なら自動: 今開いている投稿期間の翌日。409 なら先の日付を探す)")
 		adminU   = flag.String("admin-user", "admin", "管理者のユーザー名")
 		adminP   = flag.String("admin-password", "password1234", "管理者のパスワード")
 		level    = flag.String("log-level", "info", "ログレベル (debug/info/warn/error)")

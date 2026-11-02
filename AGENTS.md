@@ -22,9 +22,10 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 ## ベンチとデプロイは CI だけ（[ci/README.md](ci/README.md)）
 
 - **PR は isucon26-container に作る。ベンチは PR に `/bench [メモ]` とコメントしたときだけ走る**（PR の open では走らない。測り直しも同じ）（`/bench` は GitHub の PR コメントで、コマンドではない）。このリポジトリは monorepo で、app のコード（`app/`）も設定（`infra/`）もこのリポジトリのブランチで直して 1 つの PR にする。CI は PR の head をそのままデプロイする。main の基準値は自動では測り直されない。マージ後に測るときは `gh workflow run bench.yml -R Harineko0/isucon26-container`（または Actions の Run workflow ボタン）。
-- ベンチ枠は 1 本ずつしかないので、測る価値のある状態になってから `/bench` する。
-- CI が到着順に 1 本ずつ「デプロイ → initialize 確認 → ベンチ → 改変チェック」を行い、結果を PR コメント、PR の status check `Benchmark`（スコアと、同じ PR の前回との差が出る。初回は main との差）、`bench-results` ブランチの `results.jsonl` に残す。
-- 手元から `deploy.sh` / `infra/deploy.sh` / `smoke.sh` を実行しない、ポータルの Enqueue を押さない、サーバで再起動・設定変更・DB 書き込みをしない。他の人のベンチ中にサーバが変わると、どの変更でスコアが動いたか分からなくなる。スクリプトのガードと Claude Code の hook（`.claude/hooks/guard-bench.py`）が止める。
+- **PR の `/bench` は複製スタック（`ci/stacks/<name>.env`、本番と同じテンプレートで作った別スタック）に PR をデプロイして自作ベンチ（`bench/`、load-only）を走らせる。main と `workflow_dispatch` と `/bench --official` だけが本番 `isucon-prod-2` + ポータルの公式ベンチ**。複製スタックが設定されていなければ（Variables `BENCH_REPLICA_STACKS` が空）PR も公式。自作の点は本番と一致しないので、同じ種類どうしで比べ、同じ commit を両方で測った比（較正）をコメントと `results.jsonl` に残す。複製スタックの作成・削除は人がやる（`ci/stacks/create.sh` / `delete.sh`。hook が止める）。**競技終了時にポータルのサーバリストに複製が混ざっていると失格**なので、16:15 までに消す（[docs/final-runbook.md](docs/final-runbook.md) §0）。
+- 公式ベンチの枠は 1 本ずつしかないので、`--official` と main は測る価値のある状態になってから。複製の自作ベンチはスタックの数だけ並列に走る。
+- CI が「デプロイ → initialize 確認 → ベンチ → 改変チェック」を行い、結果を PR コメント、PR の status check `Benchmark`（公式）/ `Benchmark (isureal-bench)`（自作）（スコアと、同じ PR の前回との差が出る。初回は main との差）、`bench-results` ブランチの `results.jsonl` に残す。
+- 手元から `deploy.sh` / `infra/deploy.sh` / `smoke.sh` を実行しない、ポータルの Enqueue を押さない、サーバで再起動・設定変更・DB 書き込みをしない。他の人のベンチ中にサーバが変わると、どの変更でスコアが動いたか分からなくなる。複製スタックのサーバも同じ（CI のベンチ中）。スクリプトのガードと Claude Code の hook（`.claude/hooks/guard-bench.py`。`ci/stacks/*.env` の IP を読む）が止める。
 - 読み取り（ssh での `journalctl` / `top` / `cat`、DB への `SELECT` / `EXPLAIN`、ルーターへの GET、`infra/deploy.sh -n`）は自由。ただし **asia2 の重い読み取りはベンチを汚す**（#84）: ポータルに PENDING / RUNNING のジョブがある間は、大きい表（realmojis・notifications・comments・posts・image_objects）の全件 `count(*)` / `GROUP BY` / `ORDER BY`、`EXPLAIN ANALYZE`、PostgreSQL ログ（`/var/log/postgresql/*.log`、数 GB）の `grep` / `less` をしない。件数は `pg_stat_user_tables.n_live_tup` か `pg_class.reltuples`、計画は `EXPLAIN`（ANALYZE なし）、ログは `tail -n` で見る。hook が全件 count / GROUP BY とログの全読みを止める。
 - 17:30 以降は main 以外のベンチを CI が拒否する。
 - PR コメントの「計測」に、その run だけの pg_stat_statements・alp・vmstat・DB wait が載る（統計のリセットは CI がベンチ直前に行う。手元からリセットしない）。
@@ -34,7 +35,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 ## 手元のベンチ（[bench/README.md](bench/README.md)）
 
 - `bench/` に公式ベンチマーカーを再現した `isureal-bench`、初期データ生成 `isureal-datagen`、ルーター再現 `isureal-router` と、docker compose でアプリ 3 台 + DB + ルーターを立てる `bench/local/` がある。`bench/local/run.sh` で 1 本、`bench/local/parallel.sh REF...` で複数の版を同時に測れる。
-- 手元のスコアは本番と比べられない（同じマシンで同時に測った版同士の差を見る）。本番の計測は従来どおり CI の `/bench`。
+- 手元のスコアは本番と比べられない（同じマシンで同時に測った版同士の差を見る）。PR の CI の `/bench` も同じ `isureal-bench` を複製スタック（本番と同じ構成の EC2）に向けて走らせる（`ci/bench/replica.sh`）。本番の公式ベンチは main と `/bench --official`。
 
 ## 環境（CloudFormation スタック `isucon-prod-2`、ap-northeast-1）
 
@@ -46,7 +47,7 @@ ISUCON2026（2026-10-31、お題アプリ「ISUReal」）用の作業リポジ�
 | asia2 | DatabasePublicIP | 3.115.193.33 | 192.168.4.10 | c5.large | 共有 PostgreSQL 16 |
 | ルーター | RouterPublicIP | 35.73.68.236 | — | — | 国別転送・遅延/帯域制限。**ログイン・設定変更禁止** |
 
-- チーム ID: 120107。ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）の 4 台と上表の IP が一致していることを確認済み（2026-10-31 時点で全台 RUNNING）。
+- チーム ID: 120107。ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）の 4 台と上表の IP が一致していることを確認済み（2026-10-31 時点で全台 RUNNING）。上表は `ci/stacks/isucon-prod-2.env` と同じ。複製スタック（PR のベンチ用）の IP は `ci/stacks/<name>.env`。スクリプトは `STACK=<name>` で複製に向く（`infra/deploy.sh -n`、`check-imgcache.sh` など）。
 - 表示確認用 URL（ルーター経由）: <http://35.73.68.236:8080>
 - BenchmarkHost: `app.team120107-aws.127.0.0.1.nip.io`
 - AWS CLI が使える。競技アカウント（573111099202）には **`--profile AdministratorAccess-573111099202`** を付ける（default プロファイルの認証情報は無効で `InvalidClientTokenId` になる）。リージョンは ap-northeast-1。SSO のセッションが切れたら `aws sso login --profile AdministratorAccess-573111099202` をユーザーに頼む。

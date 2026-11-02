@@ -1,0 +1,85 @@
+# 複製スタック（PR の自作ベンチ用）の消し忘れを検知する。
+#
+# 競技終了時にポータルのサーバリストに別スタックのサーバが混ざっていると失格（manual.md「複数スタックの問題」）。
+# 30 分ごとに CloudFormation のスタック一覧を見て、本番（isucon-prod-2）以外が残っていれば
+#   - 常に: run を失敗にして Summary に一覧を出す
+#   - REPLICA_WARN_FROM（既定: 競技日の 16:00 JST）以降なら: Slack（SLACK_WEBHOOK_URL）に投げ、Issue「[P0][Ops] 複製スタックが残っている」を立てる/更新する
+# 手元で同じ確認: ci/stacks/check.sh。ポータルのサーバリストの IP が本番 4 台だけかは人がブラウザで見る（docs/final-runbook.md §0, §3）。
+#
+# 必要なもの: secrets.AWS_ROLE_ARN（GitHub OIDC で assume できる、cloudformation:ListStacks と ec2:DescribeInstances を持つロール）。
+# 無ければ何もしないで終わる（手元の ci/stacks/check.sh で代用）。
+name: replica-check
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      PROD_STACK: ${{ vars.PROD_STACK || 'isucon-prod-2' }}
+      REPLICA_WARN_FROM: ${{ vars.REPLICA_WARN_FROM || '2026-10-31T16:00:00+09:00' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip without AWS role
+        if: env.AWS_ROLE_ARN == ''
+        run: echo "::notice::secrets.AWS_ROLE_ARN が無いので CloudFormation を見ません。手元で ci/stacks/check.sh を実行してください"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: env.AWS_ROLE_ARN != ''
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-1
+
+      - name: List stacks
+        id: check
+        if: env.AWS_ROLE_ARN != ''
+        run: |
+          set +e
+          ci/stacks/check.sh | tee "$RUNNER_TEMP/check.txt"
+          rc=${PIPESTATUS[0]}
+          {
+            echo '### 複製スタックの確認'
+            echo '```'
+            cat "$RUNNER_TEMP/check.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "leftover=$([ "$rc" = 0 ] && echo false || echo true)" >>"$GITHUB_OUTPUT"
+          if [ "$(date +%s)" -ge "$(date -d "$REPLICA_WARN_FROM" +%s)" ]; then echo "alert=true" >>"$GITHUB_OUTPUT"; else echo "alert=false" >>"$GITHUB_OUTPUT"; fi
+
+      - name: Notify (Slack + Issue)
+        if: steps.check.outputs.leftover == 'true' && steps.check.outputs.alert == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          body=$(cat "$RUNNER_TEMP/check.txt")
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          msg=":rotating_light: 複製スタックが残っています（本番 $PROD_STACK 以外）。16:30 の再起動リハーサル前に ci/stacks/delete.sh で消し、ポータルのサーバリストを確認してください。 $url"
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -n --arg text "$msg" '{text: $text}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" || echo "warn: slack failed"
+          fi
+          title="[P0][Ops] 複製スタックが残っている（競技終了前に削除）"
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          text=$(printf '%s\n\n```\n%s\n```\n\n消し方: `ALLOW_STACK_CHANGE=1 ci/stacks/delete.sh <name>`（人が実行）。消したあと、ポータルのサーバリストが本番 4 台だけか確かめる（docs/final-runbook.md §0）。\n[run](%s)' "$msg" "$body" "$url")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$text" >/dev/null
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$text" >/dev/null
+          fi
+
+      - name: Fail if leftover
+        if: steps.check.outputs.leftover == 'true'
+        run: |
+          echo "::error::本番 ($PROD_STACK) 以外の CloudFormation スタックが残っている（Summary を見る）"
+          exit 1

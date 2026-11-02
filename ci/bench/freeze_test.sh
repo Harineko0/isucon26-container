@@ -20,11 +20,11 @@ PAST=2000-01-01T00:00:00+09:00
 FUTURE=2099-01-01T00:00:00+09:00
 fails=0
 
-# check <name> <want_rc> <want_stage_glob> <FREEZE_AT> <LABEL>（stage が無いことを期待するときは glob に "" ）
+# check <name> <want_rc> <want_stage_glob> <FREEZE_AT> <LABEL> [BENCH_KIND] [REPLICA_UNTIL]（stage が無いことを期待するときは glob に "" ）
 check() {
   local name=$1 want_rc=$2 want_stage=$3 rc stage
   rm -f "$T/stage"
-  FREEZE_AT=$4 LABEL=$5 "$FREEZE_CHECK" >/dev/null 2>&1
+  FREEZE_AT=$4 LABEL=$5 BENCH_KIND=${6:-official} REPLICA_UNTIL=${7:-} "$FREEZE_CHECK" >/dev/null 2>&1
   rc=$?
   stage=$(cat "$T/stage" 2>/dev/null || true)
   local stage_ok=
@@ -46,6 +46,12 @@ check "past + #12 -> rejected" 1 'rejected:*' "$PAST" '#12'
 check "past + main -> allowed" 0 '' "$PAST" main
 check "future + #12 -> allowed" 0 '' "$FUTURE" '#12'
 check "future + main -> allowed" 0 '' "$FUTURE" main
+# 複製スタックの自作ベンチは REPLICA_UNTIL 以降も拒否（公式は影響なし。REPLICA_UNTIL 無しなら判定しない）
+check "replica + REPLICA_UNTIL past -> rejected" 1 'rejected:*' "$FUTURE" '#12' replica "$PAST"
+check "replica + REPLICA_UNTIL future -> allowed" 0 '' "$FUTURE" '#12' replica "$FUTURE"
+check "replica + no REPLICA_UNTIL -> allowed" 0 '' "$FUTURE" '#12' replica ""
+check "official + REPLICA_UNTIL past -> allowed" 0 '' "$FUTURE" '#12' official "$PAST"
+check "replica main + REPLICA_UNTIL past -> rejected (main too)" 1 'rejected:*' "$FUTURE" main replica "$PAST"
 
 # run.sh と同じ呼び方: set -euo pipefail + ERR trap の下で `|| exit 1` しても stage は rejected:* のまま
 rm -f "$T/stage"

@@ -12,13 +12,46 @@
 
 | 時刻 | やること |
 |---|---|
-| 16:15 | 機能凍結。最終候補を main にマージし終える。main の自動ベンチが PASS したことを確認する |
-| 16:30–17:00 | 再起動リハーサル（下の §1） |
+| 朝 | `gh variable set BENCH_REPLICA_UNTIL -R Harineko0/isucon26-container -b 2026-10-31T16:15:00+09:00`（複製スタックの自作ベンチを 16:15 で止める。日付は競技日） |
+| 16:00 | 複製スタックの削除を始める（§0）。PR の `/bench` はここから `--official` だけ |
+| 16:15 | 機能凍結。最終候補を main にマージし終える。main の公式ベンチ（`gh workflow run bench.yml`）が PASS したことを確認する。**複製スタックが全部消えていること**（§0） |
+| 16:30–17:00 | 再起動リハーサル（下の §1）。本番 4 台が再起動でポータルに再登録するので、終わったらサーバリストが本番 4 台だけか見る（§0-3） |
 | 17:00 | リーダーボード凍結（手順に影響なし） |
 | 17:00–17:30 | リハーサルで見つかった問題の修正だけ。修正したら main で再ベンチ |
 | 17:30– | CI は main 以外を拒否する。§2 の最終ベンチ |
 | 17:50 | 最後のベンチ投入の締め切り（CI の 1 run はデプロイ込みで約 4 分） |
 | 17:55 | §3 の終了時チェック |
+
+## §0 複製スタックを消す（16:00–16:15、オペレーター + 確認係）
+
+PR の `/bench` は複製スタック（本番と同じテンプレートで作った別スタック。[ci/README.md](../ci/README.md)「複製スタック」）で自作ベンチを走らせる。複製の 4 台も起動時にポータルへ自己登録するので、**競技終了時点でポータルのサーバリストに本番以外のサーバが混ざっていると失格**（manual.md「複数スタックの問題」）。再起動リハーサルの前に全部消す。
+
+### 0-1. 自作ベンチを止める（オペレーター）
+
+```bash
+# 複製で走っている・待っている run（run-name が "replica" で終わる）が無いこと。あれば終わるのを待つ（キャンセルしてもよい: Actions の Cancel）
+gh run list -R Harineko0/isucon26-container -w bench --status in_progress --json displayTitle,url --jq '.[] | select(.displayTitle | endswith(" replica")) | .url'
+# 以後の /bench（複製）を CI が拒否することを確認（朝に設定済みのはず）
+gh variable get BENCH_REPLICA_UNTIL -R Harineko0/isucon26-container
+```
+
+### 0-2. 複製スタックを消す（オペレーター）
+
+```bash
+ci/stacks/check.sh                                        # 残っているスタックの一覧（読み取り）
+ALLOW_STACK_CHANGE=1 ci/stacks/delete.sh isucon-replica-1  # 複製ごとに（数分。本番 isucon-prod-2 は拒否される）
+ci/stacks/check.sh                                        # 「OK: スタックは isucon-prod-2 だけ」になること
+gh variable set BENCH_REPLICA_STACKS -R Harineko0/isucon26-container -b ""   # PR の /bench を公式に戻す（複製が無いので自動でも公式になる）
+```
+
+`ci/stacks/<name>.env` を `git rm` して main に入れる（急がなくてよい。`.env` が残っていても CI は `BENCH_REPLICA_STACKS` に無いスタックを使わない）。
+
+### 0-3. ポータルのサーバリストを確認する（確認係）
+
+Chrome で <https://portal.isucon.net/contestant/contestant_instances> を開き、4 台の IP が **13.159.52.104 / 52.199.206.161 / 52.197.40.86 / 3.115.193.33**（`ci/stacks/isucon-prod-2.env`）だけであること。複製の IP が残っていたら、§1-3 の再起動で本番 4 台が再登録して上書きされるので、§1-4 のあとにもう一度見る。それでも残っていれば `aws ec2 describe-instances` で複製が本当に消えているか確かめ（`ci/stacks/check.sh`）、運営に相談する。
+
+- 記録: 複製を消した時刻と、サーバリストが本番だけになった時刻を issue #24 に書く。
+- `.github/workflows/replica-check.yml` も 30 分ごとに見ていて、残っていれば Slack と Issue `[P0][Ops] 複製スタックが残っている` に出す（`AWS_ROLE_ARN` を設定している場合）。
 
 ## §1 再起動リハーサル（16:30 頃、約 30 分）
 
@@ -114,11 +147,11 @@ CI は app を配り直して isureal-go を再起動するが、PostgreSQL は�
 # 4 台とルーターが running（停止したまま終わると追試できず失格）
 aws ec2 describe-instances $P --instance-ids i-0f626866418d74974 i-0cb8d3965b54de263 i-048c33eadb020d481 i-0079df54c53c2ae0b i-0fbc3e17d2804b6a1 \
   --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]' --output text
-# 別のスタックが無いこと（isucon-prod-2 だけ）
-aws cloudformation list-stacks $P --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE --query 'StackSummaries[].StackName' --output text
+# 別のスタックが無いこと（isucon-prod-2 だけ。複製スタックは §0 で消した）
+ci/stacks/check.sh   # = aws cloudformation list-stacks + 各スタックの EC2 の public IP。本番以外があれば WARNING で exit 1
 # envcheck（§1-4 のループをもう一度）
 ```
 
-- ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）に、**この 4 台の IP（13.159.52.104 / 52.199.206.161 / 52.197.40.86 / 3.115.193.33）だけ**が出ていること（別スタックのサーバが混ざったまま終わると失格）。
+- ポータルのサーバリスト（<https://portal.isucon.net/contestant/contestant_instances>）に、**この 4 台の IP（13.159.52.104 / 52.199.206.161 / 52.197.40.86 / 3.115.193.33）だけ**が出ていること（別スタックのサーバが混ざったまま終わると失格。複製スタックの IP は `git show origin/main:ci/stacks/<name>.env` で分かる）。
 - 最後のベンチが PASS で、その `/api/initialize` の `language` が `go` であること（CI の run ログに出る）。
 - 18:00 以降は、運営のアナウンスまでサーバに接続しない・操作しない。

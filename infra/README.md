@@ -11,6 +11,12 @@
 
 反映（`infra/deploy.sh` の実行）は CI だけが行う。PR に `/bench` とコメントする（[ci/README.md](../ci/README.md)）。手元では `-n` の差分表示と `pull.sh` だけを使う。
 
+配る先のスタックは `STACK`（既定 `isucon-prod-2` = 本番）で選ぶ。IP は `ci/stacks/<name>.env` から読む（`lib.sh` → `ci/stacks/lib.sh`）。PR の `/bench` は複製スタックに配る。プライベート IP はどのスタックも同じなので、ここの設定ファイルはスタックで変えない。
+
+```bash
+STACK=isucon-replica-1 infra/deploy.sh -n   # 複製スタックとの差分を見る
+```
+
 ```bash
 infra/pull.sh -n                     # リポジトリとサーバの差分を見る（全台）
 infra/deploy.sh -n                   # 配ると変わるファイルを見る

@@ -42,7 +42,9 @@ cd bench && go build -o /tmp/isureal-bench ./cmd/isureal-bench
 /tmp/isureal-bench -target http://127.0.0.1:28080 -manifest local/work/bench/manifest.json -out /tmp/result.json
 ```
 
-`-manifest` を省くと初期データの検証を飛ばし、日 1 の利用者を `-initial-users` の人数だけ登録して走る (初期ユーザーの SecretKey が分からない環境向け)。
+`-manifest` を省くと初期データの検証を飛ばし、日 1 の利用者を `-initial-users` の人数だけ登録して走る (初期ユーザーの SecretKey が分からない環境向け)。このとき `-start-date` も省けば、今開いている投稿期間の翌日から始め、初期データがもっと先の日付の投稿期間を持っていれば (409) 1, 2, 4, … 日と先の日付を探す。
+
+CI の PR の `/bench` は、この load-only の形で `isureal-bench` を**複製スタック** (本番と同じ CloudFormation テンプレートの別スタック) のルーターに向けて東京の EC2 から走らせる (`ci/bench/replica.sh`、[ci/README.md](../ci/README.md))。
 
 ## 公式ベンチの何を再現しているか
 

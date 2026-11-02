@@ -241,6 +241,13 @@ func (w *World) loadManifestUsers(ctx context.Context, startDate string) error {
 				continue
 			}
 		}
+		if startDate == "" {
+			// 自動: 今日から始め、prepareSeedUsers で今開いている投稿期間の翌日に進める。
+			// それでも 409 (本番の初期データは先の日付まで投稿期間を持つ) なら runDay が先の日付を探す。
+			rs.lastLocalDate = time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
+			rs.autoDate = true
+			continue
+		}
 		t, err := time.Parse("2006-01-02", startDate)
 		if err != nil {
 			return fmt.Errorf("start-date %q: %w", startDate, err)
@@ -561,6 +568,24 @@ func (w *World) prepareSeedUsers(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
+	// -start-date が無ければ、今開いている投稿期間の localDate を聞いて、その翌日から始める
+	for _, r := range api.Regions {
+		rs := w.regions[r]
+		if !rs.autoDate || len(seeds[r]) == 0 {
+			continue
+		}
+		var cur api.CurrentPostingWindowResponse
+		_, err := w.client.JSON(ctx, seeds[r][0].Session(), http.MethodGet, "/api/posting-window/current", "GET /api/posting-window/current", nil, http.StatusOK, &cur)
+		if err != nil || cur.Window == nil {
+			continue
+		}
+		if t, err := time.Parse("2006-01-02", cur.Window.LocalDate); err == nil && t.After(rs.lastLocalDate) {
+			rs.mu.Lock()
+			rs.lastLocalDate = t
+			rs.mu.Unlock()
+			w.log.Info("投稿期間の開始日を決めました", "region", r, "current", cur.Window.LocalDate, "first", t.AddDate(0, 0, 1).Format("2006-01-02"))
+		}
+	}
 	// 別リージョンの利用者とも友達に (リージョンをまたぐ read-after-write を検証するため)
 	all := w.allActiveUsers()
 	for _, u := range all {
