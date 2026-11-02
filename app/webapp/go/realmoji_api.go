@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -58,7 +57,10 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > 512 || cfg.Height > 512 {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
-		if _, _, err := jpegcheck.ValidateBytes(data); err != nil {
+		if _, _, err := validateJPEGBytes(c.Request().Context(), data); err != nil {
+			if c.Request().Context().Err() != nil {
+				return err
+			}
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 
@@ -78,8 +80,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		imageDataStore.put(imageID, data)
-		enqueueImagePush(imageID, data, storedRegion, h.Config.Region)
+		publishUploadedImage(imageID, data, storedRegion, h.Config.Region)
 		reaction := RealMoji{ID: id, PostID: input.PostID, ReactorID: user.ID, ImageID: imageID, ReactionType: input.ReactionType, CreatedAt: *row.CreatedAt}
 		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))
 	}

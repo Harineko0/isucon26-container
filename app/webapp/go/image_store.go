@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -389,12 +390,22 @@ func fetchImageFromPeer(region, id string, timeout time.Duration) ([]byte, error
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch image %s from %s: status %d", id, region, resp.StatusCode)
+	}
+	var data []byte
+	if n := resp.ContentLength; n > 0 && n <= maxPeerImageBytes {
+		data = make([]byte, n)
+		_, err = io.ReadFull(resp.Body, data)
+	} else {
+		// Older peers can send a chunked response.
+		data, err = io.ReadAll(resp.Body)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK || len(data) == 0 {
-		return nil, fmt.Errorf("fetch image %s from %s: status %d", id, region, resp.StatusCode)
+	if len(data) == 0 {
+		return nil, fmt.Errorf("fetch image %s from %s: empty body", id, region)
 	}
 	return data, nil
 }
@@ -438,16 +449,31 @@ func InternalMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 				}
 				return c.NoContent(http.StatusNoContent)
 			case r.Method == http.MethodGet && strings.HasPrefix(path, "images/"):
-				// 手元 (メモリ・ディスク) にあるものだけを返す。ここからさらに他のサーバーへは取りに行かない。
-				data, ok := imageDataStore.get(strings.TrimPrefix(path, "images/"))
-				if !ok {
-					return c.NoContent(http.StatusNotFound)
-				}
-				return c.Blob(http.StatusOK, "application/octet-stream", data)
+				return servePeerImage(c, strings.TrimPrefix(path, "images/"))
 			}
 			return next(c)
 		}
 	}
+}
+
+// Serve only local bytes. An open file stays valid across a store rotation,
+// and lets the receiver allocate exactly once for the declared length.
+func servePeerImage(c *echo.Context, id string) error {
+	if path, ok := storedImagePath(id); ok {
+		f, err := os.Open(path)
+		if err == nil {
+			defer f.Close()
+			if st, err := f.Stat(); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
+				c.Response().Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
+				return c.Stream(http.StatusOK, "application/octet-stream", f)
+			}
+		}
+	}
+	data, ok := imageDataStore.get(id)
+	if !ok {
+		return c.NoContent(http.StatusNotFound)
+	}
+	return c.Blob(http.StatusOK, "application/octet-stream", data)
 }
 
 // 新しい画像の id の末尾 2 文字に置き場のリージョンを入れておき、DB の応答を待たずに取りに行く手がかりにする。
@@ -487,10 +513,11 @@ func prefetchStoredImage(id, selfRegion string) {
 	}
 }
 
-// 閲覧の大半はアジアなので、ヨーロッパ・アメリカで受け付けた画像はアジアのサーバーへ裏で複製しておく
-// (今まで DB (asia2) へ同期で送っていたのと同じ量を、応答の後に送る)。複製が間に合わなければ、
-// アジアは従来どおり置き場から取りに行く。キューがあふれたら捨てる。
+// Eager replicas are for small, cheap-to-send images. With 1024 queue
+// slots, this bounds queued image bytes to 64 MiB per sending region.
+// Larger originals are pulled on first use, including by exports.
 const imageReplicaRegion = "asia"
+const maxEagerReplicaBytes = 64 << 10
 
 type imagePush struct {
 	id   string
@@ -541,7 +568,16 @@ func startImagePushers(selfRegion string) {
 	}
 }
 
-func enqueueImagePush(id string, data []byte, storedRegion *string, selfRegion string) {
+func publishUploadedImage(id string, data []byte, storedRegion *string, selfRegion string) {
+	if storedRegion != nil && len(data) > maxEagerReplicaBytes {
+		// nginx can serve the durable file directly. A standalone Go
+		// server can still keep the original hot in its own byte cache.
+		if !imageAccelEnabled {
+			imageDataStore.put(id, data)
+		}
+		return
+	}
+	imageDataStore.put(id, data)
 	if storedRegion == nil || selfRegion == imageReplicaRegion {
 		return
 	}

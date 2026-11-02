@@ -18,7 +18,7 @@ func TestRegisterPipelineOnPostgres(t *testing.T) {
 	db := loginTestDB(t)
 	db.MustExec(`CREATE UNIQUE INDEX users_username_key ON users(username);
 		ALTER TABLE users ADD CHECK (username <> 'force-failure')`)
-	queue := &writeQueue[sessionUserRow]{db: db, sql: registerSQL}
+	queue := &writeQueue[sessionUserRow]{db: db, sql: registerSQL, accountBatchSQL: registerBatchSQL}
 	indexed := make(chan User, 4)
 	e := echo.New()
 	e.HTTPErrorHandler = APIErrorHandler

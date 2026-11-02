@@ -165,7 +165,7 @@ func TestPeerImageTransferUsesShardedStoreAndReadsLegacy(t *testing.T) {
 		}
 		imageDataStore = newImageDataCache()
 		w := request(http.MethodGet, id, nil)
-		if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), data) {
+		if w.Code != http.StatusOK || w.Result().ContentLength != int64(len(data)) || !bytes.Equal(w.Body.Bytes(), data) {
 			t.Fatalf("peer cold GET: %d %q", w.Code, w.Body.Bytes())
 		}
 	}
@@ -175,7 +175,7 @@ func TestInitializeDrainsImageTransfers(t *testing.T) {
 	// No push worker is running here. The pending replica is disposable, but a
 	// transfer already owned by a worker must finish before the store rotates.
 	region := "europe"
-	enqueueImagePush(newImageID(region), []byte("old replica"), &region, region)
+	publishUploadedImage(newImageID(region), []byte("old replica"), &region, region)
 	beginImageTransfer()
 	drained := make(chan struct{})
 	go func() {
@@ -197,5 +197,50 @@ func TestInitializeDrainsImageTransfers(t *testing.T) {
 	case <-drained:
 	case <-ctx.Done():
 		t.Fatal("reset did not finish after the in-flight transfer")
+	}
+}
+
+func TestUploadReplicaPolicy(t *testing.T) {
+	setupShardedStore(t)
+	region := "europe"
+	for _, tc := range []struct {
+		name              string
+		size              int
+		disk, accel, push bool
+	}{
+		{"small", maxEagerReplicaBytes, true, true, true},
+		{"large", maxEagerReplicaBytes + 1, true, true, false},
+		{"standalone", maxEagerReplicaBytes + 1, true, false, false},
+		{"db_fallback", maxEagerReplicaBytes + 1, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			imageAccelEnabled = tc.accel
+			id := newImageID(region)
+			data := bytes.Repeat([]byte{0xa5}, tc.size)
+			var stored *string
+			if tc.disk {
+				_, stored = storeUploadedImage(id, data, region)
+				if stored == nil {
+					t.Fatal("missing durable original")
+				}
+			}
+			publishUploadedImage(id, data, stored, region)
+			select {
+			case push := <-imagePushQueue:
+				imageTransfers.jobs.Done()
+				if !tc.push || push.id != id || !bytes.Equal(push.data, data) {
+					t.Fatal("unexpected eager replica")
+				}
+			default:
+				if tc.push {
+					t.Fatal("missing eager replica")
+				}
+			}
+			body, uri, found := imageDataStore.locate(id)
+			wantFile := tc.disk && tc.accel && tc.size > maxEagerReplicaBytes
+			if !found || (uri != "") != wantFile || (!wantFile && !bytes.Equal(body, data)) {
+				t.Fatalf("origin lookup returned %d bytes, uri %q, found %t", len(body), uri, found)
+			}
+		})
 	}
 }

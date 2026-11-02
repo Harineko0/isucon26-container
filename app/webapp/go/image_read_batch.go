@@ -22,6 +22,7 @@ type imageObject struct {
 }
 
 type imageReadRequest struct {
+	rel     string
 	post    postImageProof
 	id      string
 	hasData bool
@@ -163,6 +164,15 @@ func loadImageReadBatch(ctx context.Context, h *HandlerContext, rel string, take
 	}
 	imageReadStats.Add("requests", int64(len(ids)))
 	imageReadStats.Add("queries", 1)
+	if rel == diskImageBatchKey {
+		rel = requests[indices[0]].rel
+		for _, idx := range indices[1:] {
+			if requests[idx].rel != rel {
+				readMultipleImageLeaves(ctx, conn, requests, indices, results)
+				return results
+			}
+		}
+	}
 	if rel == postImageBatchKey {
 		loadCommittedPostImages(ctx, conn, requests, indices, results)
 		return results
@@ -202,7 +212,8 @@ func readImageObject(ctx context.Context, h *HandlerContext, rel string, request
 	// Batch metadata only. A cache miss can return up to 32 MiB of bytea;
 	// grouping those bodies would multiply the memory held by one DB connection.
 	if h.imageReads != nil && request.hasData {
-		return h.imageReads.get(ctx, rel, request)
+		request.rel = rel
+		return h.imageReads.get(ctx, diskImageBatchKey, request)
 	}
 	// Keep standalone handlers usable without starting a background batcher.
 	conn, err := h.IPBans.connUnlessBanned(ctx, h.DB, request.ip)

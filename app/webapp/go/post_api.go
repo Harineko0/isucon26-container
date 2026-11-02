@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"example.com/isureal-company/isureal/internal/jpegcheck"
 	"github.com/labstack/echo/v5"
 )
 
@@ -147,7 +146,10 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(imageData)); err != nil || cfg.Width > 4096 || cfg.Height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if _, _, err := jpegcheck.ValidateBytes(imageData); err != nil {
+		if _, _, err := validateJPEGBytes(c.Request().Context(), imageData); err != nil {
+			if c.Request().Context().Err() != nil {
+				return err
+			}
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
@@ -205,8 +207,7 @@ func createPostHandlerWithQueue(h *HandlerContext, writes *writeQueue[createPost
 		}
 		// The same committed SQL statement created the JPEG object and its post.
 		proofs.Store(imageID, postImageProof{postID: postID, ownerID: user.ID})
-		imageDataStore.put(imageID, imageData)
-		enqueueImagePush(imageID, imageData, storedRegion, h.Config.Region)
+		publishUploadedImage(imageID, imageData, storedRegion, h.Config.Region)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
 }

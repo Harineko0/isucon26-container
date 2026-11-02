@@ -34,7 +34,7 @@ func NewServer(config *Config) *echo.Echo {
 	startImagePushers(config.Region)
 
 	ipBans := newIPBanList()
-	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, ipBans.observeActionLog))
+	e.Use(ActionLogMiddleware(config.LogLevel, &actionLogWriter{output: os.Stdout}, ipBans.observeActionLog))
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
